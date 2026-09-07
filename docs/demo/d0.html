@@ -5,99 +5,141 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SWS D0 — column rain</title>
   <style>
-    :root { color-scheme: dark; --bg:#12141a; --card:#1c2028; --ink:#e8eaef; --muted:#9aa3b2; --pond:#5b9fd6; --soil:#c4a574; --pore:#3d4a3a; --acc:#7dcea0; }
+    :root { color-scheme: dark; --bg:#12141a; --card:#1c2028; --ink:#e8eaef; --muted:#9aa3b2; --pond:#5b9fd6; --soil:#c4a574; --pore:#3d4a3a; }
     * { box-sizing: border-box; }
     body { margin: 0; font: 16px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--ink); padding: 1rem; max-width: 42rem; margin-inline: auto; }
-    h1 { font-size: 1.15rem; margin: 0 0 .25rem; }
-    .sub { color: var(--muted); font-size: .85rem; margin-bottom: 1rem; }
-    .warn { background: #3a2a18; border: 1px solid #7a5a28; padding: .6rem .75rem; border-radius: 8px; font-size: .8rem; color: #f0d9a8; margin-bottom: 1rem; }
+    h1 { font-size: 1.15rem; margin: 0 0 .35rem; }
+    .sub, .warn { font-size: .85rem; color: var(--muted); margin: 0 0 .75rem; }
+    .warn { background: #3a2a18; border: 1px solid #7a5a28; padding: .6rem .75rem; border-radius: 8px; color: #f0d9a8; }
     .card { background: var(--card); border-radius: 12px; padding: .9rem; margin-bottom: .75rem; }
-    label { display: flex; justify-content: space-between; gap: 1rem; font-size: .85rem; margin: .35rem 0; }
-    input[type=range] { width: 55%; }
+    label { display: flex; align-items: center; justify-content: space-between; gap: .6rem; font-size: .85rem; margin: .4rem 0; }
+    label span.val { min-width: 3rem; text-align: right; font-variant-numeric: tabular-nums; }
+    input[type=range] { flex: 1; }
     .row { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .6rem; }
     button { appearance: none; border: 0; border-radius: 8px; padding: .55rem .8rem; font: inherit; background: #2c3544; color: var(--ink); }
     button.pri { background: #2e5a3c; }
-    .bars { height: 220px; display: flex; gap: 1.2rem; align-items: flex-end; justify-content: center; }
-    .col { width: 42%; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; background: #0e1014; border-radius: 8px; overflow: hidden; border: 1px solid #2a303a; }
-    .pond { background: var(--pond); width: 100%; }
-    .layer { width: 100%; display: flex; }
+    .bars { height: 220px; }
+    .stack { width: 46%; height: 200px; margin: 0 auto; display: flex; flex-direction: column; justify-content: flex-end; background: #0e1014; border-radius: 8px; overflow: hidden; border: 1px solid #2a303a; }
+    .pond { background: var(--pond); width: 100%; min-height: 0; }
+    .layer { width: 100%; display: flex; min-height: 24px; }
     .wet { background: var(--soil); }
     .empty { background: var(--pore); }
-    pre { background: #0e1014; padding: .7rem; border-radius: 8px; overflow: auto; font-size: .78rem; }
+    pre { background: #0e1014; padding: .7rem; border-radius: 8px; font-size: .78rem; white-space: pre-wrap; }
   </style>
 </head>
 <body>
   <h1>D0 column rain</h1>
-  <p class="sub">Critic instrument for Sprint 1. Same capacity-step as SPEC.</p>
-  <p class="warn">Live kernel is Rust sim-core. This page copies the S01 rule for a phone. If it disagrees with cargo test, the test wins.</p>
+  <p class="sub">Critic instrument. Same S01 capacity-step as SPEC. cargo test wins if they disagree.</p>
+  <p class="warn">Open this file as a live page (htmlpreview or raw.githack), not GitHub’s source view — source view does not run script.</p>
   <div class="card">
-    <label>Porosity φ <span id="phiV"></span><input id="phi" type="range" min="0.2" max="0.6" step="0.01" value="0.4"></label>
-    <label>Initial θ <span id="thV"></span><input id="th" type="range" min="0" max="0.6" step="0.01" value="0.1"></label>
-    <label>Layer L (m) <span id="lV"></span><input id="L" type="range" min="0.1" max="1" step="0.05" value="0.4"></label>
-    <label>Rain R (m) <span id="R" type="range" min="0" max="0.5" step="0.01" value="0.08"></label>
+    <label>Porosity φ <span class="val" id="phiV">0.40</span><input id="phi" type="range" min="0.20" max="0.60" step="0.01" value="0.40"></label>
+    <label>Initial θ <span class="val" id="thV">0.10</span><input id="th" type="range" min="0" max="0.60" step="0.01" value="0.10"></label>
+    <label>Layer L (m) <span class="val" id="lV">0.40</span><input id="L" type="range" min="0.10" max="1.00" step="0.05" value="0.40"></label>
+    <label>Rain R (m) <span class="val" id="rV">0.08</span><input id="R" type="range" min="0" max="0.50" step="0.01" value="0.08"></label>
     <div class="row">
-      <button class="pri" id="rain">Add rain + infiltrate</button>
-      <button id="a">Script A (fits)</button>
-      <button id="b">Script B (ponds)</button>
-      <button id="reset">Reset</button>
+      <button class="pri" type="button" id="rain">Add rain + infiltrate</button>
+      <button type="button" id="a">Script A (fits)</button>
+      <button type="button" id="b">Script B (ponds)</button>
+      <button type="button" id="reset">Reset</button>
     </div>
   </div>
-  <div class="card bars" id="bars"></div>
-  <pre id="out"></pre>
+  <div class="card bars"><div class="stack" id="stack"></div></div>
+  <pre id="out">loading…</pre>
 <script>
-const EPS = 1e-9;
-const layersN = 2;
-let col = null;
-function el(id){ return document.getElementById(id); }
-function num(id){ return parseFloat(el(id).value); }
-function makeCol(theta, phi, L, h) {
-  return { h: h || 0, layers: Array.from({length: layersN}, () => ({ L, theta, phi })) };
-}
-function mass(c) {
-  return c.h + c.layers.reduce((s, ly) => s + ly.theta * ly.L, 0);
-}
-function pore(c) {
-  return c.layers.reduce((s, ly) => s + Math.max(0, ly.phi - ly.theta) * ly.L, 0);
-}
-function infiltrate(c) {
-  let rem = c.h;
-  for (const ly of c.layers) {
-    if (rem <= 0) break;
-    const cap = Math.max(0, ly.phi - ly.theta) * ly.L;
-    const fill = Math.min(rem, cap);
-    if (ly.L > 0) ly.theta += fill / ly.L;
-    rem -= fill;
+(function () {
+  var EPS = 1e-9;
+  var col = null;
+  function $(id) { return document.getElementById(id); }
+  function val(id) { return parseFloat($(id).value); }
+  function setLabel(id, n) { $(id).textContent = n.toFixed(2); }
+  function poreOf(c) {
+    var s = 0, i;
+    for (i = 0; i < c.layers.length; i++) {
+      var ly = c.layers[i];
+      s += Math.max(0, ly.phi - ly.theta) * ly.L;
+    }
+    return s;
   }
-  c.h = rem;
-}
-function draw() {
-  el('phiV').textContent = num('phi').toFixed(2);
-  el('thV').textContent = num('th').toFixed(2);
-  el('lV').textContent = num('L').toFixed(2);
-  el('rV').textContent = num('R').toFixed(2);
-  const pondH = Math.min(100, (col.h / 0.5) * 45);
-  const layersHtml = col.layers.map(ly => {
-    const wet = (ly.theta / ly.phi) * 100;
-    return '<div class="layer" style="height:' + ((ly.L/1)*40) + '%"><div class="wet" style="width:' + wet + '%"></div><div class="empty" style="width:' + (100-wet) + '%"></div></div>';
-  }).join('');
-  el('bars').innerHTML = '<div class="col"><div class="pond" style="height:' + pondH + '%"></div>' + layersHtml + '</div>';
-  el('out').textContent =
-    'h_surf = ' + col.h.toFixed(4) + ' m\n' +
-    col.layers.map((ly,i) => 'layer ' + i + ': θ=' + ly.theta.toFixed(4) + '  φ=' + ly.phi + '  L=' + ly.L).join('\n') +
-    '\nM = ' + mass(col).toFixed(6) +
-    '\nremaining pore = ' + pore(col).toFixed(4) + '\n' +
-    (col.h > EPS ? 'POND — dirt did not eat all the rain.\n' : 'Surface dry.\n');
-}
-function reset() {
-  const phi = num('phi'), th = Math.min(num('th'), phi), L = num('L');
-  col = makeCol(th, phi, L, 0);
-  draw();
-}
-el('rain').onclick = () => { col.h += num('R'); infiltrate(col); draw(); };
-el('reset').onclick = reset;
-el('a').onclick = () => { reset(); const r = pore(col) * 0.5; el('R').value = r.toFixed(2); col.h += r; infiltrate(col); draw(); };
-el('b').onclick = () => { reset(); const r = pore(col) + 0.15; el('R').value = Math.min(0.5, r).toFixed(2); col.h += r; infiltrate(col); draw(); };
-reset();
+  function massOf(c) {
+    var s = c.h, i;
+    for (i = 0; i < c.layers.length; i++) s += c.layers[i].theta * c.layers[i].L;
+    return s;
+  }
+  function infiltrate(c) {
+    var rem = c.h, i;
+    for (i = 0; i < c.layers.length; i++) {
+      if (rem <= 0) break;
+      var ly = c.layers[i];
+      var cap = Math.max(0, ly.phi - ly.theta) * ly.L;
+      var fill = Math.min(rem, cap);
+      if (ly.L > 0) ly.theta += fill / ly.L;
+      rem -= fill;
+    }
+    c.h = rem;
+  }
+  function fresh() {
+    var phi = val('phi');
+    var th = Math.min(val('th'), phi);
+    var L = val('L');
+    return {
+      h: 0,
+      layers: [
+        { L: L, theta: th, phi: phi },
+        { L: L, theta: th, phi: phi }
+      ]
+    };
+  }
+  function draw() {
+    setLabel('phiV', val('phi'));
+    setLabel('thV', val('th'));
+    setLabel('lV', val('L'));
+    setLabel('rV', val('R'));
+    var html = '';
+    var pondPct = Math.min(50, (col.h / 0.5) * 50);
+    html += '<div class="pond" style="height:' + pondPct + '%"></div>';
+    var i;
+    for (i = 0; i < col.layers.length; i++) {
+      var ly = col.layers[i];
+      var wet = ly.phi > 0 ? (ly.theta / ly.phi) * 100 : 0;
+      html += '<div class="layer" style="height:25%"><div class="wet" style="width:' + wet + '%"></div><div class="empty" style="width:' + (100 - wet) + '%"></div></div>';
+    }
+    $('stack').innerHTML = html;
+    var lines = [];
+    lines.push('h_surf = ' + col.h.toFixed(4) + ' m');
+    for (i = 0; i < col.layers.length; i++) {
+      var ly2 = col.layers[i];
+      lines.push('layer ' + i + ': theta=' + ly2.theta.toFixed(4) + '  phi=' + ly2.phi.toFixed(2) + '  L=' + ly2.L.toFixed(2));
+    }
+    lines.push('M = ' + massOf(col).toFixed(6));
+    lines.push('remaining pore = ' + poreOf(col).toFixed(4));
+    lines.push(col.h > EPS ? 'POND — dirt did not eat all the rain.' : 'Surface dry.');
+    $('out').textContent = lines.join('\n');
+  }
+  function reset() { col = fresh(); draw(); }
+  $('rain').onclick = function () { col.h += val('R'); infiltrate(col); draw(); };
+  $('reset').onclick = reset;
+  $('a').onclick = function () {
+    reset();
+    var r = poreOf(col) * 0.5;
+    $('R').value = r.toFixed(2);
+    col.h += r;
+    infiltrate(col);
+    draw();
+  };
+  $('b').onclick = function () {
+    reset();
+    var r = poreOf(col) + 0.15;
+    $('R').value = Math.min(0.5, r).toFixed(2);
+    col.h += r;
+    infiltrate(col);
+    draw();
+  };
+  ['phi', 'th', 'L'].forEach(function (id) {
+    $(id).addEventListener('input', reset);
+  });
+  $('R').addEventListener('input', draw);
+  reset();
+})();
 </script>
 </body>
 </html>
