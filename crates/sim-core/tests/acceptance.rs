@@ -1,7 +1,8 @@
-//! Sprint 1 acceptance tests — named contracts from docs/spec/ACCEPTANCE.md.
+//! Acceptance tests — named contracts from docs/spec/ACCEPTANCE.md.
 //!
 //! ε: 1e-9 relative on f64 water mass (MASS_EPSILON from sim_core).
 //! Cell area A = 1. Column water mass M = h_surf + sum(theta_i * L_i).
+//! Grid mass: sum of column M.
 
 use sim_core::{Column, SoilLayer, World, MASS_EPSILON};
 
@@ -33,6 +34,23 @@ fn default_column(theta: f64, porosity: f64) -> Column {
         ],
     )
 }
+
+/// Saturated soil so pond stays on the surface for runoff tests.
+fn saturated_column(elevation_m: f64, surface_water_m: f64) -> Column {
+    let phi = 0.4;
+    Column::new(
+        elevation_m,
+        surface_water_m,
+        vec![
+            SoilLayer::new(0.3, phi, phi),
+            SoilLayer::new(0.5, phi, phi),
+        ],
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 1 — D0 / I1 I2 I5 I6 (unchanged names and intent)
+// ---------------------------------------------------------------------------
 
 /// I1: after any legal tick, h_surf >= 0 and 0 <= theta_i <= phi_i; no silent clamp that destroys mass.
 #[test]
@@ -180,4 +198,136 @@ fn d0_novice_all_rain_vanishes_is_false() {
         "excess must pond — proves rain did not all vanish into dirt"
     );
     assert_mass_close(m_final, m0 + r);
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 2 — D1 slope_runoff / I3 I4
+// ε: 1e-9 relative on f64 water mass (MASS_EPSILON).
+// ---------------------------------------------------------------------------
+
+/// I3: closed grid, no sink — rain on one cell; infiltrate+runoff; sum M constant ±ε.
+#[test]
+fn i3_closed_grid_mass_conserved() {
+    // 1×2 closed grid; rain on x=0.
+    let cols = vec![
+        saturated_column(10.0, 0.0),
+        saturated_column(5.0, 0.0),
+    ];
+    let mut world = World::grid(11, 2, 1, cols);
+    let r = 0.3;
+    world.add_rain_at(0, 0, r);
+    let m0 = world.grid_water_mass();
+
+    for _ in 0..8 {
+        world.tick(); // infiltrate all + runoff
+        assert_mass_close(world.grid_water_mass(), m0);
+    }
+    assert_mass_close(world.grid_water_mass(), m0);
+}
+
+/// I4: high+low connected pair plus isolated dry column; isolated M unchanged.
+#[test]
+fn i4_disconnected_dry_stays_dry() {
+    // 1×3: elevations [10, 5, 100]; rain on x=0 → runoff 0→1; x=2 stays dry.
+    let cols = vec![
+        saturated_column(10.0, 0.0),
+        saturated_column(5.0, 0.0),
+        saturated_column(100.0, 0.0),
+    ];
+    let mut world = World::grid(13, 3, 1, cols);
+    let m_isolated0 = world.water_mass_at(2, 0);
+    assert_approx_eq(m_isolated0, world.water_mass_at(2, 0), "baseline");
+    assert!(world.surface_water_m_at(2, 0) <= MASS_EPSILON);
+
+    world.add_rain_at(0, 0, 0.4);
+    for _ in 0..8 {
+        world.tick();
+    }
+
+    // Isolated cell: no inflow, started dry → M unchanged (I4).
+    assert_mass_close(world.water_mass_at(2, 0), m_isolated0);
+    assert!(
+        world.surface_water_m_at(2, 0) <= MASS_EPSILON,
+        "isolated cell must stay dry"
+    );
+    // Pair did move water: low cell gained mass.
+    assert!(
+        world.water_mass_at(1, 0) > m_isolated0 + MASS_EPSILON
+            || world.surface_water_m_at(1, 0) > MASS_EPSILON
+            || world.water_mass_at(0, 0) < world.grid_water_mass(),
+        "runoff should have acted on the high→low pair"
+    );
+}
+
+/// D1: z_high > z_low; pond on high; after ticks high surface down and low M up.
+#[test]
+fn d1_pond_leaves_high_appears_low() {
+    let pond = 0.5;
+    let cols = vec![
+        saturated_column(10.0, pond), // high
+        saturated_column(5.0, 0.0),   // low
+    ];
+    let mut world = World::grid(17, 2, 1, cols);
+    let m_low0 = world.water_mass_at(1, 0);
+    let h_high0 = world.surface_water_m_at(0, 0);
+    assert!(h_high0 > MASS_EPSILON);
+
+    for _ in 0..8 {
+        world.tick();
+    }
+
+    let h_high = world.surface_water_m_at(0, 0);
+    let m_low = world.water_mass_at(1, 0);
+    assert!(
+        h_high < h_high0 - MASS_EPSILON,
+        "pond should leave high: was {h_high0}, now {h_high}"
+    );
+    assert!(
+        m_low > m_low0 + MASS_EPSILON,
+        "water should appear on low: was {m_low0}, now {m_low}"
+    );
+}
+
+/// D1: pond only on the low cell; high stays dry (no uphill creation).
+#[test]
+fn d1_no_uphill_creation() {
+    let cols = vec![
+        saturated_column(10.0, 0.0), // high dry
+        saturated_column(5.0, 0.4),  // low with pond
+    ];
+    let mut world = World::grid(19, 2, 1, cols);
+    let m_high0 = world.water_mass_at(0, 0);
+
+    for _ in 0..8 {
+        world.tick();
+    }
+
+    assert_mass_close(world.water_mass_at(0, 0), m_high0);
+    assert!(
+        world.surface_water_m_at(0, 0) <= MASS_EPSILON,
+        "high must stay dry — no uphill creation"
+    );
+}
+
+/// D1: same z and same h; equal H ⇒ no net transfer.
+#[test]
+#[allow(non_snake_case)]
+fn d1_flat_equal_H_no_net_drain() {
+    let h = 0.2;
+    let z = 7.0;
+    let cols = vec![saturated_column(z, h), saturated_column(z, h)];
+    let mut world = World::grid(23, 2, 1, cols);
+    let m0_a = world.water_mass_at(0, 0);
+    let m0_b = world.water_mass_at(1, 0);
+    let surf0_a = world.surface_water_m_at(0, 0);
+    let surf0_b = world.surface_water_m_at(1, 0);
+
+    for _ in 0..8 {
+        world.tick();
+    }
+
+    assert_mass_close(world.water_mass_at(0, 0), m0_a);
+    assert_mass_close(world.water_mass_at(1, 0), m0_b);
+    assert_approx_eq(world.surface_water_m_at(0, 0), surf0_a, "no net drain A");
+    assert_approx_eq(world.surface_water_m_at(1, 0), surf0_b, "no net drain B");
 }
