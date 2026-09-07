@@ -1,23 +1,21 @@
 # SPEC – Named invariants and demo predicates
 
-**Version:** 0.2
+**Version:** 0.3
 **Date:** 2026-09-07
 **Status:** Fast-clock input. Oracle implements what is named here. Oracle does not edit this file.
-**Path:** `docs/spec/SPEC.md` on https://github.com/stem-world-sim/stem-world-sim
 
-ε is a test tolerance, not a physical fudge. Suggested `1e-9` relative for f64 mass. Document ε in the test.
+ε suggested 1e-9 relative for f64 mass. Document ε in the test. A = 1.
 
 ## Active slice
 
-Sprint 1 only (see `docs/sprints/CURRENT.md`). D1–D3 are scheduled, not active.
+Sprint 2 (see `docs/sprints/CURRENT.md`). D2–D3 scheduled, not active.
 
-### Shared quantities (oracle must create these types)
+### Shared quantities
 
-- Column: `elevation_m`, `surface_water_m`, ordered soil layers with volumetric moisture and thickness.
-- Optional in Sprint 1: a 1-column world + deterministic clock.
-- Water mass of a column, A = 1:
-
-  M = h_surf + sum theta_i * L_i
+- Grid of columns. Each column: elevation_m, surface_water_m, soil layers (theta, L, phi).
+- Column mass M = h_surf + sum theta_i * L_i
+- Grid mass = sum of column M
+- Head H = elevation_m + surface_water_m
 
 ### Invariants (do not weaken)
 
@@ -25,9 +23,9 @@ Sprint 1 only (see `docs/sprints/CURRENT.md`). D1–D3 are scheduled, not active
 
 **I2** Isolated column, no lateral flux, no sink: rain R + initial M = final M ±ε.
 
-**I3** Isolated grid mass conservation under infiltration and runoff. (Sprint 2+)
+**I3** Closed grid, no sink: sum M conserved under infiltration and runoff.
 
-**I4** No spontaneous water. (Sprint 2+)
+**I4** A cell does not gain water without rain, lateral inflow, or a documented command.
 
 **I5** Same seed + same command script => same moisture and surface fields.
 
@@ -39,6 +37,8 @@ Evapotranspiration, aquifers, Navier-Stokes, plant genetics, orbits, stoichiomet
 
 ## Demo predicates
 
-**D0 column_rain** — Sprint 1. See ACCEPTANCE.md and S01-column-rain.md.
+**D0 column_rain** — S01, still must pass.
 
-**D1–D3** — after D0 is green on main.
+**D1 slope_runoff** — S02. Surface water follows lower H. See ACCEPTANCE.md and S02-slope-runoff.md.
+
+**D2 plant_thirst**, **D3 proxy_farm** — later.
