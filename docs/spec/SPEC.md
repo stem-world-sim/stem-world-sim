@@ -1,50 +1,39 @@
 # SPEC – Named invariants and demo predicates
 
-**Version:** 0.4
+**Version:** 0.5
 **Date:** 2026-09-08
 **Status:** Fast-clock input. Oracle implements what is named here. Oracle does not edit this file.
 
-ε suggested 1e-9 relative for f64 mass. A = 1.
+ε = 1e-9 relative on f64 mass. A = 1.
 
 ## Active slice
 
-Sprint 2.1 (see `docs/sprints/CURRENT.md`).
+Sprint 3 — `docs/sprints/CURRENT.md`.
 
-### Shared quantities
+### Stores
 
-- Grid of columns. Each column: elevation_m, surface_water_m, soil layers (theta, L, phi).
-- Column mass M = h_surf + sum theta_i * L_i
-- Grid mass = sum of column M
-- Head H = elevation_m + surface_water_m
+- Pond h_surf (fast lateral).
+- Soil θ in layers. Mobile only if θ > θ_fc. Capillary θ ≤ θ_fc does not leave the column.
+- M = h_surf + sum θ_i L_i. Grid mass = sum M.
+- H_pond = z + h_surf (surface routing only).
 
-### Invariants (do not weaken)
+### Invariants
 
-**I1** After any legal tick: h_surf >= 0 and 0 <= theta_i <= phi_i. No silent clamp that destroys mass.
+**I1** h_surf ≥ 0 and 0 ≤ θ_i ≤ φ_i. No silent clamp that destroys mass.
+**I2** Isolated column (1×1, no neighbor): rain R + M_0 = M_final ±ε.
+**I3** Closed grid: sum M conserved under infiltrate, pond runoff, and soil drain.
+**I4** No spontaneous water. No uphill pond. No uphill soil drain.
+**I5** Same seed + same script => same fields.
+**I6** Win/fail numbers from kernel queries only.
 
-**I2** Isolated column, no lateral flux, no sink: rain R + initial M = final M ±ε.
+### Tick
 
-**I3** Closed grid, no sink: sum M conserved under infiltration and runoff.
+1. Infiltrate ≤ I_max(texture), ≤ remaining pore.
+2. S02.1 pond runoff (half head-drop, split lowest-H neighbors).
+3. Gravity drain of water above θ_fc, ≤ D_max, to strictly lower-z neighbor, onto that neighbor's surface.
 
-**I4** A cell does not gain water without rain, lateral inflow, or a documented command.
-
-**I5** Same seed + same command script => same moisture and surface fields.
-
-**I6** Win/fail numbers come from kernel queries only.
-
-### Surface routing (S02.1)
-
-Tick: infiltrate all columns, then one simultaneous runoff pass. Surface only.
-A cell may send only to 4-neighbors with strictly lower H.
-Among those, take the set T with the lowest H and split
-V = min(h_i, 0.5 * (H_i - H*)) equally across T.
-Closed boundary.
+Texture table lives in S03-water-mechanics.md.
 
 ### Not yet
 
-Evapotranspiration, aquifers, Navier-Stokes, plant genetics, orbits, stoichiometry, heat.
-
-## Demo predicates
-
-**D0 column_rain** — S01, still must pass.
-**D1 slope_runoff** — S02 + S02.1 pooling.
-**D2 plant_thirst**, **D3 proxy_farm** — later.
+Plants, ET, aquifers, Navier-Stokes, orbits, heat.
