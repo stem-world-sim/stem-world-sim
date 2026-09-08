@@ -1,13 +1,13 @@
 # Oracle RUNLOG
 
 ```
-sprint: S06
+sprint: S07
 result: green
-branch: feat/s06-occupants
+branch: feat/s07-shade
 date: 2026-09-08 (PT)
 epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15; H_REST=0.02 m; V_REST=1e-4 m
-constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3
-invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6
+constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25
+invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -63,5 +63,12 @@ tests:
   - d6_extract_in_ledger
   - d6_bare_cell_no_extract
   - d6_cap_eight
-notes: S06 occupants + PlantStub. Per-cell Vec capped at MAX_OCCUPANTS. Sink cadence same as S05 (tick%N_ET==0 after advance): ET then occupants then lake_snap/rest. E_eff=E*(1-clamp(sum_shade,0,1)); shade=0 ⇒ S05-identical. Alive occupants in insert order take min(u*root[k], θ_k*L) per layer (below θ_fc OK); no pond drink; dry_steps→wilt at T_WILT. Books: grid_mass+et_lost+extract_lost. Queries: plant_at, occupant_count, extract_lost, layer_theta_at; add_occupant/clear_occupants. Older mass asserts include extract_lost (0 when bare).
+  - d7_bare_et_unchanged
+  - d7_one_plant_cuts_pond_et
+  - d7_two_sum
+  - d7_shade_cap_one
+  - d7_wilt_no_shade
+  - d7_uptake_unchanged
+  - d7_ledger
+notes: S07 shade scales ET. Before ET: S=clamp(sum(alive.shade),0,1); E_open_eff=E_OPEN*(1-S); E_soil_eff=E_SOIL*(1-S); then S05 pond-first else top. Dead/wilted shade=0. PlantStub default shade 0.25 (was 0). Occupant uptake unchanged. Bare cells S=0 ⇒ S05-identical. Books: grid_mass+et_lost+extract_lost. S06 E_eff path kept; default shade flip activates reduction.
 ```

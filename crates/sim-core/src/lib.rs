@@ -1,4 +1,4 @@
-//! Stem World Sim — Sprint 6 occupants + plant stub (closed basin).
+//! Stem World Sim — Sprint 7 shade scales ET (closed basin).
 //!
 //! Water mass (A = 1): M = h_surf + sum_i (theta_i * L_i)
 //! Grid mass: sum of column M. Closed basin: M + et_lost() + extract_lost() == mass ever added.
@@ -11,7 +11,7 @@
 //! Lake snap: 4-connected components with h > V_REST and intra |ΔH| ≤ H_REST snap to
 //! mean H* with Σh conserved; mark snapped cells at_rest. S04 sleep kept.
 //! ET: pond first (E_OPEN) else top-layer soil (E_SOIL, may go below θ_fc); skip ≤ V_REST.
-//! E_eff = E * (1 - clamp(sum_shade, 0, 1)); shade=0 ⇒ identical to S05.
+//! S = clamp(sum alive shade, 0, 1); E_eff = E * (1 - S). PlantStub shade default 0.25.
 //! Occupants: per-cell list ≤ MAX_OCCUPANTS; PlantStub uptake by root mask; wilt at T_WILT.
 //! Unique-min-H chute revoked. Capillary stays.
 
@@ -108,26 +108,26 @@ pub struct Occupant {
 }
 
 impl Occupant {
-    /// Default PlantStub: root top-only, shade 0, uptake P_MAX, alive.
+    /// Default PlantStub: root top-only, shade 0.25, uptake P_MAX, alive. S07.
     pub fn plant_stub() -> Self {
         Self {
             kind: OccupantKind::PlantStub,
             alive: true,
             uptake_max: P_MAX,
             root: [1.0, 0.0],
-            shade: 0.0,
+            shade: 0.25,
             dry_steps: 0,
         }
     }
 
-    /// PlantStub with an explicit root mask (weights should sum to 1).
+    /// PlantStub with an explicit root mask (weights should sum to 1). Shade 0.25. S07.
     pub fn plant_stub_with_root(root: [f64; N_LAYERS]) -> Self {
         Self {
             kind: OccupantKind::PlantStub,
             alive: true,
             uptake_max: P_MAX,
             root,
-            shade: 0.0,
+            shade: 0.25,
             dry_steps: 0,
         }
     }
@@ -1207,15 +1207,20 @@ impl World {
         }
     }
 
-    /// S05/S06 batched evaporation: one ET-step (E*1). Pond first if h>0, else top soil.
-    /// E_eff = E * (1 - clamp(sum_shade, 0, 1)); shade=0 ⇒ identical to S05.
+    /// S05/S07 batched evaporation: one ET-step (E*1). Pond first if h>0, else top soil.
+    /// S = clamp(sum alive shade, 0, 1); E_eff = E * (1 - S). Dead/wilted shade = 0.
     /// Skip take ≤ V_REST. Wakes cells that lose > V_REST via `busy`.
     fn et_pass(&mut self, busy: &mut [bool]) {
         let n = self.columns.len();
         for i in 0..n {
             let (take, from_pond) = {
                 let col = &self.columns[i];
-                let sum_shade: f64 = col.occupants.iter().map(|o| o.shade).sum();
+                let sum_shade: f64 = col
+                    .occupants
+                    .iter()
+                    .filter(|o| o.alive)
+                    .map(|o| o.shade)
+                    .sum();
                 let shade_factor = 1.0 - sum_shade.clamp(0.0, 1.0);
                 if col.surface_water_m > 0.0 {
                     let e_eff = E_OPEN * shade_factor;
