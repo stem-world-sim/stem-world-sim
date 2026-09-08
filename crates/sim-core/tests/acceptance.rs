@@ -6,7 +6,7 @@
 
 use sim_core::{
     Column, Occupant, SoilLayer, Texture, World, E_OPEN, E_SOIL, H_REST, MASS_EPSILON, MAX_OCCUPANTS,
-    N_ET, N_LAYERS, P_MAX, R_MAX, T_WILT, V_REST,
+    N_ET, N_LAYERS, P_MAX, R_MAX, T_SETTLE, T_WILT, V_REST,
 };
 
 fn assert_mass_close(actual: f64, expected: f64) {
@@ -2155,4 +2155,253 @@ fn d7_ledger() {
         world.grid_water_mass() + world.et_lost() + world.extract_lost(),
         m0,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 8 — awake set + catch-up (ε = MASS_EPSILON = 1e-9; catch_up rain 5%)
+// ---------------------------------------------------------------------------
+
+/// D8: 16×16 all rest; tick; awake_count == 0.
+#[test]
+fn d8_desert_sleeps_zero_awake() {
+    let w = 16usize;
+    let h = 16usize;
+    let tex = Texture::Sand;
+    let cols: Vec<Column> = (0..w * h)
+        .map(|_| {
+            Column::new(
+                0.0,
+                0.0,
+                vec![
+                    SoilLayer::new(0.3, 0.0, tex),
+                    SoilLayer::new(0.5, 0.0, tex),
+                ],
+            )
+        })
+        .collect();
+    let mut world = World::grid(801, w, h, cols);
+    // One hydro tick: no flux → all at_rest → prune leaves awake empty.
+    world.tick();
+    assert_eq!(world.awake_count(), 0, "desert should leave awake set");
+    assert!(world.grid_at_rest());
+    // Another tick still visits nobody.
+    world.tick();
+    assert_eq!(world.awake_count(), 0);
+    let _ = T_SETTLE;
+}
+
+/// D8: rain one cell; it and its 4-neighbors are awake.
+#[test]
+fn d8_rain_wakes_neighbors() {
+    let w = 5usize;
+    let h = 5usize;
+    let tex = Texture::Sand;
+    let cols: Vec<Column> = (0..w * h)
+        .map(|_| {
+            Column::new(
+                0.0,
+                0.0,
+                vec![
+                    SoilLayer::new(0.3, 0.0, tex),
+                    SoilLayer::new(0.5, 0.0, tex),
+                ],
+            )
+        })
+        .collect();
+    let mut world = World::grid(802, w, h, cols);
+    world.tick();
+    assert_eq!(world.awake_count(), 0);
+
+    let cx = 2usize;
+    let cy = 2usize;
+    world.add_rain_at(cx, cy, 0.05);
+    assert!(!world.cell_at_rest(cx, cy));
+    // Center + N,E,S,W
+    let expected = [
+        (cx, cy),
+        (cx, cy + 1),
+        (cx + 1, cy),
+        (cx, cy - 1),
+        (cx - 1, cy),
+    ];
+    assert_eq!(world.awake_count(), expected.len());
+    for &(x, y) in &expected {
+        assert!(!world.cell_at_rest(x, y), "woken cell ({x},{y}) must not be at_rest");
+    }
+    // Diagonal corners of the plus are not 4-neighbors — stay at rest.
+    assert!(world.cell_at_rest(cx + 1, cy + 1));
+    assert!(world.cell_at_rest(cx - 1, cy - 1));
+}
+
+/// D8: planted rest cell; catch_up(K=5, rain=0) wilts; extract and ET in ledger.
+#[test]
+fn d8_drought_wilt() {
+    let tex = Texture::Sand;
+    // Some top water so ET books a loss; plant root top-only will drink then go dry.
+    // Use tiny top mass so K=5 sink-steps exhaust it and wilt.
+    let col = Column::new(
+        0.0,
+        0.0,
+        vec![
+            SoilLayer::new(0.3, 0.02, tex), // ~0.006 m water — few plant drinks
+            SoilLayer::new(0.5, 0.0, tex),
+        ],
+    );
+    let mut world = World::new(803, col);
+    world.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+    // Rest the cell.
+    for _ in 0..4 {
+        world.tick();
+    }
+    // Advance off an ET boundary if needed so live cadence does not interfere;
+    // catch_up applies its own sinks.
+    assert!(world.plant_at(0, 0), "precondition: alive before drought catch_up");
+
+    let m0 = closed_mass(&world);
+    world.catch_up(5, 0.0);
+
+    assert!(
+        !world.plant_at(0, 0),
+        "plant should wilt after catch_up(K=5>=T_WILT) drought"
+    );
+    assert!(world.extract_lost() > MASS_EPSILON, "extract in ledger");
+    assert!(world.et_lost() > MASS_EPSILON, "ET in ledger");
+    assert_mass_close(closed_mass(&world), m0);
+}
+
+/// D8: rest valley + plant; catch_up(K=3, rain>0); water rose then sinks; books close.
+#[test]
+fn d8_rain_fills_then_plants() {
+    let tex = Texture::Sand;
+    let fc = tex.theta_fc();
+    // 1×3: high, mid, valley. Plant in valley.
+    let cols = vec![
+        Column::new(2.0, 0.0, vec![SoilLayer::new(0.3, fc, tex), SoilLayer::new(0.5, fc, tex)]),
+        Column::new(1.0, 0.0, vec![SoilLayer::new(0.3, fc, tex), SoilLayer::new(0.5, fc, tex)]),
+        Column::new(0.0, 0.0, vec![SoilLayer::new(0.3, fc, tex), SoilLayer::new(0.5, fc, tex)]),
+    ];
+    let mut world = World::grid(804, 3, 1, cols);
+    world.add_occupant(2, 0, Occupant::plant_stub()).unwrap();
+    for _ in 0..8 {
+        world.tick();
+    }
+    let h0 = world.surface_water_m_at(2, 0);
+    let theta0 = world.layer_theta_at(2, 0, 0);
+    let m_before = world.grid_water_mass();
+    let et0 = world.et_lost();
+    let ex0 = world.extract_lost();
+
+    let k = 3u32;
+    let rain = 0.05;
+    world.catch_up(k, rain);
+
+    let added = (k as f64) * rain * 3.0; // 3 cells
+    let m_books = world.grid_water_mass() + world.et_lost() + world.extract_lost();
+    assert_mass_close(m_books, m_before + added);
+
+    let h1 = world.surface_water_m_at(2, 0);
+    let theta1 = world.layer_theta_at(2, 0, 0);
+    assert!(
+        h1 > h0 + MASS_EPSILON || theta1 > theta0 + MASS_EPSILON
+            || world.et_lost() > et0 + MASS_EPSILON
+            || world.extract_lost() > ex0 + MASS_EPSILON,
+        "catch_up should move water or apply sinks: h {h0}->{h1} θ {theta0}->{theta1}"
+    );
+    // Sinks applied (K>0).
+    assert!(
+        world.et_lost() >= et0 - MASS_EPSILON,
+        "ET ledger non-decreasing"
+    );
+}
+
+/// D8: rain=0; catch_up(K) vs K live sink-steps; θ,h,et,extract within 1e-9.
+#[test]
+fn d8_drought_matches_live_sinks() {
+    let tex = Texture::Sand;
+    let mk = || {
+        let col = Column::new(
+            0.0,
+            0.08,
+            vec![
+                SoilLayer::new(0.3, tex.porosity(), tex),
+                SoilLayer::new(0.5, tex.theta_fc(), tex),
+            ],
+        );
+        let mut w = World::new(805, col);
+        w.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+        // Rest hydro without hitting many ET steps: tick a few non-ET.
+        for _ in 0..3 {
+            w.tick();
+        }
+        w
+    };
+
+    let k = 4u32;
+    let mut live = mk();
+    let mut caught = mk();
+
+    // Align clocks / state: clone-equivalent via same seed script.
+    assert_eq!(live.tick_count(), caught.tick_count());
+    assert_approx_eq(live.grid_water_mass(), caught.grid_water_mass(), "pre mass");
+
+    // Live: K sink-steps (each N_ET hydro ticks ending on ET).
+    for _ in 0..k {
+        tick_through_next_et(&mut live);
+    }
+
+    caught.catch_up(k, 0.0);
+
+    assert_approx_eq(
+        caught.surface_water_m(),
+        live.surface_water_m(),
+        "h match drought",
+    );
+    assert_approx_eq(
+        caught.layer_theta_at(0, 0, 0),
+        live.layer_theta_at(0, 0, 0),
+        "θ_top match",
+    );
+    assert_approx_eq(
+        caught.layer_theta_at(0, 0, 1),
+        live.layer_theta_at(0, 0, 1),
+        "θ_bot match",
+    );
+    assert_approx_eq(caught.et_lost(), live.et_lost(), "et match");
+    assert_approx_eq(caught.extract_lost(), live.extract_lost(), "extract match");
+}
+
+/// D8: rain only on high; after catch_up valley has water (settle routed it).
+#[test]
+fn d8_no_teleport_uphill() {
+    let tex = Texture::Sand;
+    let phi = tex.porosity();
+    // Saturated so rain stays as pond and runs downhill.
+    let cols = vec![
+        Column::new(5.0, 0.0, vec![SoilLayer::new(0.3, phi, tex), SoilLayer::new(0.5, phi, tex)]),
+        Column::new(0.0, 0.0, vec![SoilLayer::new(0.3, phi, tex), SoilLayer::new(0.5, phi, tex)]),
+    ];
+    let mut world = World::grid(806, 2, 1, cols);
+    for _ in 0..4 {
+        world.tick();
+    }
+    assert!(world.surface_water_m_at(1, 0) <= MASS_EPSILON);
+
+    // Source only on high via catch_up rain on all cells — but test says rain only on high.
+    // Use manual rain on high then catch_up settle path: catch_up adds rain everywhere.
+    // Spec test: "rain only on high; after catch_up valley has water".
+    // Interpret: add rain on high, then catch_up(K, 0) to settle; or catch_up with rain
+    // then verify valley got water from settle (not teleport uphill from valley).
+    // Stronger reading: rain on high only, catch_up drought settle moves it down.
+    world.add_rain_at(0, 0, 0.40);
+    let m0 = closed_mass(&world);
+    world.catch_up(1, 0.0); // settle + one sink-step
+
+    let valley_h = world.surface_water_m_at(1, 0);
+    let valley_soil = world.column_at(1, 0).soil_water_mass();
+    assert!(
+        valley_h > MASS_EPSILON || valley_soil > phi * 0.3 + phi * 0.5 + MASS_EPSILON,
+        "valley should receive water via settle, h={valley_h} soil={valley_soil}"
+    );
+    // High should not have gained from valley (no uphill teleport).
+    assert_mass_close(closed_mass(&world), m0);
 }

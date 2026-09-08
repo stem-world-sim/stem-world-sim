@@ -1,9 +1,11 @@
-//! Stem World Sim — Sprint 7 shade scales ET (closed basin).
+//! Stem World Sim — Sprint 8 awake set + catch-up (closed basin).
 //!
 //! Water mass (A = 1): M = h_surf + sum_i (theta_i * L_i)
 //! Grid mass: sum of column M. Closed basin: M + et_lost() + extract_lost() == mass ever added.
-//! Tick order: infiltrate → pond → soil → lake_snap → at_rest; advance clock;
-//! if clock.tick % N_ET == 0: ET → occupants → lake_snap → rest again.
+//! Tick order: infiltrate → pond → soil → lake_snap → at_rest/awake prune; advance clock;
+//! if clock.tick % N_ET == 0: ET → occupants → lake_snap → rest/awake again.
+//! Hydro visits only the awake set. Rain / add_occupant / flux / catch_up wake cell+4-nbrs.
+//! After a tick, at_rest cells whose 4-neighbors are also at_rest leave the awake set.
 //! Pond: every lower-H 4-neighbor with ΔH > H_REST, weights ∝ ΔH, each edge ≤ R_MAX
 //! and ≤ 0.5 ΔH; donor-scale then receiver-cap; drop V ≤ V_REST. Mass conserved.
 //! Soil percolate/lateral: V = min(old cap, unused pore room on receiver); unused=0 ⇒ V=0;
@@ -13,6 +15,7 @@
 //! ET: pond first (E_OPEN) else top-layer soil (E_SOIL, may go below θ_fc); skip ≤ V_REST.
 //! S = clamp(sum alive shade, 0, 1); E_eff = E * (1 - S). PlantStub shade default 0.25.
 //! Occupants: per-cell list ≤ MAX_OCCUPANTS; PlantStub uptake by root mask; wilt at T_WILT.
+//! catch_up(K, rain): source → settle ≤ T_SETTLE hydro → one batched K-sink pass.
 //! Unique-min-H chute revoked. Capillary stays.
 
 /// Absolute / relative tolerance for water-mass comparisons (f64).
@@ -47,6 +50,9 @@ pub const P_MAX: f64 = 0.01;
 
 /// Dry sink-steps before PlantStub wilts (alive = false). S06.
 pub const T_WILT: u32 = 3;
+
+/// Max live hydro settle ticks inside [`World::catch_up`]. S08.
+pub const T_SETTLE: u64 = 64;
 
 /// Soil texture: porosity, field capacity, infiltrate and drain rate limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -504,6 +510,7 @@ const NEIGHBOR_OFFSETS: [(i32, i32); 4] = [
 /// S01 1-column world = grid 1×1; single-cell queries operate on (0,0).
 /// Default texture for unspecified layers: Sand.
 /// S04: `at_rest` tracks cells with no supra-floor hydro flux last tick.
+/// S08: `awake` is the explicit hydro visit set (rain/occupant/flux/catch_up wake).
 #[derive(Clone, Debug, PartialEq)]
 pub struct World {
     seed: u64,
@@ -514,6 +521,8 @@ pub struct World {
     columns: Vec<Column>,
     /// Per-cell rest flag (updated end of each tick).
     at_rest: Vec<bool>,
+    /// Explicit awake set: hydro visits only these cells. S08.
+    awake: Vec<bool>,
     /// Cumulative water depth evaporated (A = 1); closed-basin sink. S05.
     et_lost: f64,
     /// Cumulative water depth extracted by occupants (A = 1). S06.
@@ -530,6 +539,7 @@ impl World {
             height: 1,
             columns: vec![column],
             at_rest: vec![false],
+            awake: vec![true],
             et_lost: 0.0,
             extract_lost: 0.0,
         }
@@ -551,6 +561,7 @@ impl World {
             height,
             columns,
             at_rest: vec![false; n],
+            awake: vec![true; n],
             et_lost: 0.0,
             extract_lost: 0.0,
         }
@@ -564,7 +575,7 @@ impl World {
     pub fn set_column(&mut self, x: usize, y: usize, column: Column) {
         let i = self.idx(x, y);
         self.columns[i] = column;
-        self.at_rest[i] = false;
+        self.wake_idx(i);
     }
 
     pub fn width(&self) -> usize {
@@ -664,7 +675,7 @@ impl World {
         debug_assert!(r >= 0.0, "rain depth must be non-negative");
         let i = self.idx(x, y);
         self.columns[i].surface_water_m += r;
-        self.at_rest[i] = false;
+        self.wake_idx(i);
     }
 
     /// Explicit surface-water add (wakes the cell). Alias semantics of rain for mass.
@@ -672,12 +683,12 @@ impl World {
         self.add_water_at(0, 0, amount);
     }
 
-    /// Explicit surface-water add at (x,y); clears at_rest on that cell.
+    /// Explicit surface-water add at (x,y); wakes cell + 4-neighbors. S08.
     pub fn add_water_at(&mut self, x: usize, y: usize, amount: f64) {
         debug_assert!(amount >= 0.0, "water depth must be non-negative");
         let i = self.idx(x, y);
         self.columns[i].surface_water_m += amount;
-        self.at_rest[i] = false;
+        self.wake_idx(i);
     }
 
     /// S04: true if cell had no supra-floor hydro flux last tick.
@@ -688,6 +699,11 @@ impl World {
     /// S04: true when every cell is at_rest.
     pub fn grid_at_rest(&self) -> bool {
         self.at_rest.iter().all(|&r| r)
+    }
+
+    /// S08: number of cells currently in the awake set.
+    pub fn awake_count(&self) -> usize {
+        self.awake.iter().filter(|&&a| a).count()
     }
 
     /// Grid water mass = sum of column M (I3).
@@ -724,12 +740,15 @@ impl World {
     }
 
     /// Add an occupant at (x,y). Err if the cell already has [`MAX_OCCUPANTS`].
+    /// Wakes the cell and its 4-neighbors. S08.
     pub fn add_occupant(&mut self, x: usize, y: usize, occ: Occupant) -> Result<(), OccupantsFull> {
-        let col = self.column_at_mut(x, y);
+        let i = self.idx(x, y);
+        let col = &mut self.columns[i];
         if col.occupants.len() >= MAX_OCCUPANTS {
             return Err(OccupantsFull);
         }
         col.occupants.push(occ);
+        self.wake_idx(i);
         Ok(())
     }
 
@@ -751,51 +770,146 @@ impl World {
         self.clock.advance();
     }
 
-    /// Full tick: infiltrate → pond → soil → lake_snap → at_rest; advance clock;
-    /// if clock.tick % N_ET == 0: ET → occupants → lake_snap → rest again (S05/S06).
-    /// S04: sleeping cells (at_rest and all 4-nbrs at_rest) skip hydro as donors.
+    /// Full tick: infiltrate → pond → soil → lake_snap → at_rest/awake prune; advance clock;
+    /// if clock.tick % N_ET == 0: ET → occupants → lake_snap → rest/awake again (S05/S06/S08).
+    /// S08: hydro visits only the awake set. S04 sleep integrated via awake prune.
     /// S04.1: soil flux capped by unused pore room; lake snap after soil.
     /// S05/S06: sink cadence after advance; ticks 10,20,… run one ET+occupant step.
     pub fn tick(&mut self) {
-        let n = self.columns.len();
-        let active = self.compute_active();
-        let mut busy = vec![false; n];
-
-        self.infiltrate_active(&active, &mut busy);
-        self.pond_pass(&active, &mut busy);
-        let percolated = self.percolate_active(&active, &mut busy);
-        self.lateral_drain_pass(&percolated, &active, &mut busy);
-        self.lake_snap();
-
-        // at_rest / sleep flags after snap (S04). Snap conserves mass and equalizes
-        // H* but does not force at_rest over a busy wake/pond/soil tick.
-        for i in 0..n {
-            self.at_rest[i] = !busy[i];
-        }
+        self.hydro_step();
         self.clock.advance();
 
         // S05/S06 sink batch: after advance, when tick is a multiple of N_ET.
+        // Live sinks still scan all cells (cheap early-outs) so S05–S07 cadence holds;
+        // cells that actually lose water re-enter the awake set.
         if self.clock.tick % N_ET == 0 {
+            let n = self.columns.len();
             let mut sink_busy = vec![false; n];
             self.et_pass(&mut sink_busy);
             self.occupant_pass(&mut sink_busy);
             self.lake_snap();
             for i in 0..n {
                 self.at_rest[i] = !sink_busy[i];
+                if sink_busy[i] {
+                    self.awake[i] = true;
+                }
             }
+            self.prune_awake();
         }
     }
 
-    /// Active if !at_rest OR any 4-neighbor !at_rest (rule 5: sleep only when self
-    /// and every neighbor are at_rest). Conservative enough for rain-wake + lake sleep.
-    fn compute_active(&self) -> Vec<bool> {
+    /// S08 catch-up facsimile: apply K sink-steps of unobserved climate.
+    /// Order: source rain → settle hydro ≤ T_SETTLE → one batched K-sink pass.
+    /// Calendar advances by K * N_ET. When rain_per_step == 0, sinks match K live
+    /// unit sink-steps on a resting basin (exact θ/h/et/extract).
+    pub fn catch_up(&mut self, k: u32, rain_per_step: f64) {
+        debug_assert!(rain_per_step >= 0.0, "rain_per_step must be non-negative");
+        let k_u = k as u64;
         let n = self.columns.len();
-        let mut active = vec![false; n];
+
+        // 1. Source: every cell h += K * rain_per_step; wake cell + neighbors.
+        if k > 0 {
+            let add = (k as f64) * rain_per_step;
+            if add > 0.0 {
+                for i in 0..n {
+                    self.columns[i].surface_water_m += add;
+                    self.wake_idx(i);
+                }
+            } else {
+                // Drought: still wake? Spec: wake those cells (+neighbors) after source.
+                // rain may be 0 — waking every cell would defeat desert sleep. Only wake
+                // when water was actually added. Sinks below still run world-wide.
+            }
+        }
+
+        // 2. Settle: live hydro until awake_count==0 or T_SETTLE ticks (no ET).
+        if k > 0 || self.awake_count() > 0 {
+            for _ in 0..T_SETTLE {
+                if self.awake_count() == 0 {
+                    break;
+                }
+                self.hydro_step();
+            }
+        }
+
+        // 3. Sinks: batched as K unit ET+occupant steps (no hydro between).
+        // Equivalent to K * E_eff / K * P_max on a resting basin; exact when rain=0.
+        if k > 0 {
+            let mut sink_busy = vec![false; n];
+            for _ in 0..k {
+                self.et_pass(&mut sink_busy);
+                self.occupant_pass(&mut sink_busy);
+            }
+            self.lake_snap();
+            for i in 0..n {
+                self.at_rest[i] = !sink_busy[i];
+                if sink_busy[i] {
+                    self.awake[i] = true;
+                }
+            }
+            self.prune_awake();
+        }
+
+        // 4. Calendar: K sink-steps ≡ K * N_ET hydro ticks.
+        self.clock.tick = self.clock.tick.saturating_add(k_u.saturating_mul(N_ET));
+    }
+
+    /// Hydro-only step (no clock, no ET): infiltrate → pond → soil → snap → rest/awake.
+    fn hydro_step(&mut self) {
+        let n = self.columns.len();
+        let active = self.awake.clone();
+        let mut busy = vec![false; n];
+        let mut flux_recv = vec![false; n];
+
+        self.infiltrate_active(&active, &mut busy);
+        self.pond_pass(&active, &mut busy, &mut flux_recv);
+        let percolated = self.percolate_active(&active, &mut busy);
+        self.lateral_drain_pass(&percolated, &active, &mut busy, &mut flux_recv);
+        self.lake_snap();
+
+        for i in 0..n {
+            if flux_recv[i] {
+                self.wake_idx(i);
+            }
+        }
+        for i in 0..n {
+            self.at_rest[i] = !busy[i];
+            if busy[i] {
+                self.awake[i] = true;
+            }
+        }
+        self.prune_awake();
+    }
+
+    /// Wake cell i and its 4-neighbors (clear at_rest, enter awake set). S08.
+    fn wake_idx(&mut self, i: usize) {
+        self.awake[i] = true;
+        self.at_rest[i] = false;
+        let x = i % self.width;
+        let y = i / self.width;
+        for &(dx, dy) in &NEIGHBOR_OFFSETS {
+            let nx = x as i32 + dx;
+            let ny = y as i32 + dy;
+            if nx < 0 || ny < 0 || nx as usize >= self.width || ny as usize >= self.height {
+                continue;
+            }
+            let j = ny as usize * self.width + nx as usize;
+            self.awake[j] = true;
+            self.at_rest[j] = false;
+        }
+    }
+
+    /// Drop awake cells that are at_rest with all 4-neighbors at_rest. S08.
+    fn prune_awake(&mut self) {
+        let n = self.columns.len();
+        let mut leave = vec![false; n];
         for y in 0..self.height {
             for x in 0..self.width {
                 let i = y * self.width + x;
+                if !self.awake[i] {
+                    continue;
+                }
                 if !self.at_rest[i] {
-                    active[i] = true;
                     continue;
                 }
                 let mut all_nbrs_rest = true;
@@ -811,10 +925,16 @@ impl World {
                         break;
                     }
                 }
-                active[i] = !all_nbrs_rest;
+                if all_nbrs_rest {
+                    leave[i] = true;
+                }
             }
         }
-        active
+        for i in 0..n {
+            if leave[i] {
+                self.awake[i] = false;
+            }
+        }
     }
 
     /// Tick until every column is quiescent (surface dry or saturated).
@@ -882,7 +1002,7 @@ impl World {
     /// Then receiver cap: for each j, room = max(0, min(donor H) − H_j); if In > room scale by room/In.
     /// After all scales, drop V ≤ V_REST. Only active cells donate; receivers may be sleeping.
     /// Apply after both caps. Equal H ⇒ no flux. Closed boundary.
-    fn pond_pass(&mut self, active: &[bool], busy: &mut [bool]) {
+    fn pond_pass(&mut self, active: &[bool], busy: &mut [bool], flux_recv: &mut [bool]) {
         let n = self.columns.len();
         if n == 0 {
             return;
@@ -999,6 +1119,7 @@ impl World {
             delta[j] += v;
             busy[i] = true;
             busy[j] = true;
+            flux_recv[j] = true;
         }
 
         for (col, d) in self.columns.iter_mut().zip(delta.iter()) {
@@ -1038,7 +1159,13 @@ impl World {
     /// If any lower-z: targets at min_z; equal split of leftover m, each ≤ contact.
     /// Else flat: half-diff of leftover m, ≤ contact; total ≤ leftover m and remaining D.
     /// Receiver: soil top-down only. Capillary does not move.
-    fn lateral_drain_pass(&mut self, percolated: &[f64], active: &[bool], busy: &mut [bool]) {
+    fn lateral_drain_pass(
+        &mut self,
+        percolated: &[f64],
+        active: &[bool],
+        busy: &mut [bool],
+        flux_recv: &mut [bool],
+    ) {
         let n = self.columns.len();
         if n == 0 {
             return;
@@ -1189,6 +1316,7 @@ impl World {
             soil_add[to] += v;
             busy[from] = true;
             busy[to] = true;
+            flux_recv[to] = true;
         }
 
         for i in 0..n {
