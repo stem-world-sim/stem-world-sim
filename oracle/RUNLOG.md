@@ -1,12 +1,12 @@
 # Oracle RUNLOG
 
 ```
-sprint: S03
+sprint: S03.1
 result: green
-branch: feat/s03-water-mechanics
+branch: feat/s03.1-lateral-interflow
 date: 2026-09-07 (PT)
 epsilon: 1e-9 relative on f64 water mass
-invariants encoded: I1, I2, I3, I4, I5, I6 + D0 + D1 + D3 (water mechanics)
+invariants encoded: I1, I2, I3, I4, I5, I6 + D0 + D1 + D3 + D31 (lateral interflow)
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -28,5 +28,8 @@ tests:
   - d3_below_fc_does_not_drain
   - d3_no_soil_drain_uphill
   - d3_pond_moves_faster_than_soil
-notes: Texture {Sand,Loam,Clay} on SoilLayer (φ, θ_fc=0.5φ, I_max, D_max from table). Default Sand. Tick = rate-limited infiltrate (budget min(h,I_max) top-down) + S02.1 runoff + gravity_drain_pass (mobile θ>θ_fc, m=min(D_max,m_avail) to strictly lower-z neighbor NESW/lowest-z, onto surface; 1×1/pit no-op). Capillary ≤θ_fc stays. S02 theta-never-moves revoked for mobile only. tick_until bound accounts for I_max. CI via CARGO_TARGET_DIR=/tmp/sws-target cargo test --workspace.
+  - d31_equal_z_mobile_shares
+  - d31_equal_z_below_fc_no_share
+  - d31_downslope_beats_equal_z
+notes: Replaced gravity_drain_pass with simultaneous S03+S03.1. Candidates = lower-z OR (equal-z && m_nbr < m_i); never z_nbr > z_i. If any lower-z: V=min(D_max,m_i) split equally across all at min_z → neighbor surface. Else flat: per poorer equal-z neighbor V_j=min(D_max/|P|, 0.5*(m_i-m_nbr)), total ≤ D_max and m_i; add to neighbor soil (excess over φ → surface). Column mobile = sum layers; remove mobile top-down; soil fill top-down to φ. Pond S02.1 unchanged. Capillary ≤θ_fc stays. Prefer sand in d31_*; ε=MASS_EPSILON.
 ```

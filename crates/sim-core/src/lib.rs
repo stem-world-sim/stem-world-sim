@@ -1,9 +1,9 @@
-//! Stem World Sim — Sprint 3 water mechanics on a 4-neighbor grid.
+//! Stem World Sim — Sprint 3.1 lateral interflow on a 4-neighbor grid.
 //!
 //! Water mass (A = 1): M = h_surf + sum_i (theta_i * L_i)
 //! Grid mass: sum of column M.
 //! Tick order: rate-limited infiltrate → S02.1 runoff → gravity drain → clock.
-//! Mobile soil water (θ > θ_fc) may drain downhill; capillary water stays put.
+//! Mobile soil water (θ > θ_fc) drains to lower-z surface or equal-z soil; capillary stays.
 
 /// Absolute / relative tolerance for water-mass comparisons (f64).
 pub const MASS_EPSILON: f64 = 1e-9;
@@ -198,6 +198,33 @@ impl Column {
                 layer.theta = fc;
             }
             amount -= take;
+        }
+    }
+
+    /// Add water into soil top-down toward φ; any leftover goes to surface.
+    /// Returns the amount that landed in soil (for debugging); surface absorbs the rest.
+    fn add_soil_water(&mut self, mut amount: f64) {
+        if amount <= 0.0 {
+            return;
+        }
+        for layer in &mut self.layers {
+            if amount <= 0.0 {
+                break;
+            }
+            let capacity = layer.remaining_pore_m();
+            if capacity <= 0.0 {
+                continue;
+            }
+            let fill = amount.min(capacity);
+            layer.theta += fill / layer.thickness_m;
+            // Numerical guard: never exceed φ from fp noise.
+            if layer.theta > layer.porosity {
+                layer.theta = layer.porosity;
+            }
+            amount -= fill;
+        }
+        if amount > 0.0 {
+            self.surface_water_m += amount;
         }
     }
 }
@@ -526,8 +553,13 @@ impl World {
         }
     }
 
-    /// Simultaneous gravity drain: mobile soil water (θ > θ_fc) to lower-z neighbor surface.
-    /// m = min(D_max, m_avail). Lowest z wins; NESW tie-break. No lower-z neighbor ⇒ no-op.
+    /// Simultaneous gravity drain (S03 + S03.1).
+    /// Snapshot z, θ/m, D_max; then apply.
+    /// - Strictly lower-z candidates: V = min(D_max, m_i) split equally across all at
+    ///   the lowest z; add each share to neighbor **surface**.
+    /// - Else flat equal-z with m_nbr < m_i: half-diff shares into neighbor **soil**
+    ///   (excess over φ → that neighbor's surface). Total leaving ≤ D_max and ≤ m_i.
+    /// Never send to z_nbr > z_i. Capillary (θ ≤ θ_fc) does not move.
     fn gravity_drain_pass(&mut self) {
         let n = self.columns.len();
         if n == 0 {
@@ -537,25 +569,32 @@ impl World {
         let elevations: Vec<f64> = self.columns.iter().map(|c| c.elevation_m).collect();
         let mobiles: Vec<f64> = self.columns.iter().map(Column::mobile_water_m).collect();
         let d_maxes: Vec<f64> = self.columns.iter().map(Column::d_max).collect();
+        // Snapshot remaining pore capacity for simultaneous soil fills.
+        let mut pore_left: Vec<f64> = self
+            .columns
+            .iter()
+            .map(Column::remaining_pore_capacity_m)
+            .collect();
 
-        // Planned transfers: (from_idx, to_idx, amount)
-        let mut transfers: Vec<(usize, usize, f64)> = Vec::new();
+        // Planned: (from, to, amount, to_soil)
+        let mut transfers: Vec<(usize, usize, f64, bool)> = Vec::new();
 
         for y in 0..self.height {
             for x in 0..self.width {
                 let i = y * self.width + x;
-                let m_avail = mobiles[i];
-                if m_avail <= 0.0 {
+                let m_i = mobiles[i];
+                if m_i <= 0.0 {
                     continue;
                 }
-                let m = m_avail.min(d_maxes[i]);
-                if m <= 0.0 {
+                let d_max = d_maxes[i];
+                if d_max <= 0.0 {
                     continue;
                 }
-
                 let z_i = elevations[i];
-                // Strictly lower z; lowest z wins; NESW if tied.
-                let mut best: Option<(usize, f64)> = None;
+
+                let mut lower: Vec<(usize, f64)> = Vec::new();
+                let mut equal_poorer: Vec<(usize, f64)> = Vec::new();
+
                 for &(dx, dy) in &NEIGHBOR_OFFSETS {
                     let nx = x as i32 + dx;
                     let ny = y as i32 + dy;
@@ -565,25 +604,98 @@ impl World {
                     let j = ny as usize * self.width + nx as usize;
                     let z_nbr = elevations[j];
                     if z_nbr < z_i {
-                        match best {
-                            None => best = Some((j, z_nbr)),
-                            Some((_, bz)) if z_nbr < bz => best = Some((j, z_nbr)),
-                            // equal z: keep first (NESW order)
-                            _ => {}
+                        lower.push((j, z_nbr));
+                    } else if z_nbr == z_i && mobiles[j] < m_i {
+                        equal_poorer.push((j, mobiles[j]));
+                    }
+                    // z_nbr > z_i: never send
+                }
+
+                if !lower.is_empty() {
+                    // Prefer strictly lower z: T = all at min_z; split V equally → surface.
+                    let z_star = lower.iter().map(|&(_, z)| z).fold(f64::INFINITY, f64::min);
+                    let targets: Vec<usize> = lower
+                        .into_iter()
+                        .filter(|&(_, z)| z == z_star)
+                        .map(|(j, _)| j)
+                        .collect();
+                    let n_t = targets.len();
+                    if n_t == 0 {
+                        continue;
+                    }
+                    let v = m_i.min(d_max);
+                    if v <= 0.0 {
+                        continue;
+                    }
+                    let share = v / n_t as f64;
+                    for j in targets {
+                        transfers.push((i, j, share, false));
+                    }
+                } else if !equal_poorer.is_empty() {
+                    // Flat bench: half-diff into soil; D_max split across poorer neighbors.
+                    let n_p = equal_poorer.len();
+                    let d_share = d_max / n_p as f64;
+                    let mut planned: Vec<(usize, f64)> = Vec::new();
+                    let mut total = 0.0;
+                    for (j, m_nbr) in equal_poorer {
+                        let v_j = d_share.min(0.5 * (m_i - m_nbr));
+                        if v_j > 0.0 {
+                            planned.push((j, v_j));
+                            total += v_j;
+                        }
+                    }
+                    if total <= 0.0 {
+                        continue;
+                    }
+                    // Cap total leaving at m_i (and D_max — already ≤ via shares).
+                    let cap = m_i.min(d_max);
+                    let scale = if total > cap { cap / total } else { 1.0 };
+                    for (j, v_j) in planned {
+                        let v = v_j * scale;
+                        if v > 0.0 {
+                            transfers.push((i, j, v, true));
                         }
                     }
                 }
-
-                if let Some((j, _)) = best {
-                    transfers.push((i, j, m));
-                }
-                // else: 1×1 or pit — keep m in place
             }
         }
 
-        for (from, to, m) in transfers {
-            self.columns[from].remove_mobile_water(m);
-            self.columns[to].surface_water_m += m;
+        // Apply: remove mobile from donors, then deliver to surface or soil.
+        // Soil delivery uses snapshot pore capacity; leftover → surface.
+        let mut remove_amt = vec![0.0f64; n];
+        let mut surface_delta = vec![0.0f64; n];
+        let mut soil_add = vec![0.0f64; n];
+
+        for (from, to, amount, to_soil) in transfers {
+            remove_amt[from] += amount;
+            if to_soil {
+                let can = pore_left[to].max(0.0);
+                let into_soil = amount.min(can);
+                pore_left[to] -= into_soil;
+                soil_add[to] += into_soil;
+                surface_delta[to] += amount - into_soil;
+            } else {
+                surface_delta[to] += amount;
+            }
+        }
+
+        for i in 0..n {
+            if remove_amt[i] > 0.0 {
+                self.columns[i].remove_mobile_water(remove_amt[i]);
+            }
+        }
+        for i in 0..n {
+            if soil_add[i] > 0.0 {
+                self.columns[i].add_soil_water(soil_add[i]);
+            }
+            if surface_delta[i] != 0.0 {
+                self.columns[i].surface_water_m += surface_delta[i];
+                if self.columns[i].surface_water_m < 0.0
+                    && self.columns[i].surface_water_m.abs() <= MASS_EPSILON
+                {
+                    self.columns[i].surface_water_m = 0.0;
+                }
+            }
         }
     }
 }

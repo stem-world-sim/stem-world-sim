@@ -630,3 +630,164 @@ fn d3_pond_moves_faster_than_soil() {
         "pond path should deliver more to valley after 2 ticks: A={gained_a} B={gained_b}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Sprint 3.1 — equal-z lateral interflow (ε = MASS_EPSILON = 1e-9)
+// Prefer sand. Capillary θ ≤ θ_fc does not move. Pond routing unchanged.
+// ---------------------------------------------------------------------------
+
+/// D31: 1×2 flat same z; A θ=φ, B θ=θ_fc; B θ rises, A θ falls; no oscillation swap.
+#[test]
+fn d31_equal_z_mobile_shares() {
+    let tex = Texture::Sand;
+    let phi = tex.porosity();
+    let fc = tex.theta_fc();
+    let z = 10.0;
+    let cols = vec![
+        textured_column(z, 0.0, phi, tex), // A saturated
+        textured_column(z, 0.0, fc, tex),  // B at field capacity
+    ];
+    let mut world = World::grid(131, 2, 1, cols);
+    let m0 = world.grid_water_mass();
+    let theta_a0: Vec<f64> = world
+        .column_at(0, 0)
+        .layers
+        .iter()
+        .map(|l| l.theta)
+        .collect();
+    let theta_b0: Vec<f64> = world
+        .column_at(1, 0)
+        .layers
+        .iter()
+        .map(|l| l.theta)
+        .collect();
+
+    // Mobile ≈ 0.16 m; D_max = 0.04 → several ticks to share.
+    for _ in 0..32 {
+        world.tick();
+        assert_mass_close(world.grid_water_mass(), m0);
+    }
+
+    let col_a = world.column_at(0, 0);
+    let col_b = world.column_at(1, 0);
+    for (i, layer) in col_a.layers.iter().enumerate() {
+        assert!(
+            layer.theta < theta_a0[i] - MASS_EPSILON,
+            "A layer {i} theta should fall: was {}, now {}",
+            theta_a0[i],
+            layer.theta
+        );
+        assert!(
+            layer.theta + MASS_EPSILON >= fc,
+            "A layer {i} must stay ≥ θ_fc={fc}, got {}",
+            layer.theta
+        );
+    }
+    for (i, layer) in col_b.layers.iter().enumerate() {
+        assert!(
+            layer.theta > theta_b0[i] + MASS_EPSILON,
+            "B layer {i} theta should rise: was {}, now {}",
+            theta_b0[i],
+            layer.theta
+        );
+    }
+
+    // No oscillation swap: one extra tick must not invert A↔B soil mass.
+    let soil_a = col_a.soil_water_mass();
+    let soil_b = col_b.soil_water_mass();
+    world.tick();
+    assert_mass_close(world.grid_water_mass(), m0);
+    let soil_a1 = world.column_at(0, 0).soil_water_mass();
+    let soil_b1 = world.column_at(1, 0).soil_water_mass();
+    // If A was wetter, it should still be ≥ B (or equal within ε); never swap roles.
+    if soil_a + MASS_EPSILON >= soil_b {
+        assert!(
+            soil_a1 + MASS_EPSILON >= soil_b1
+                || (soil_a1 - soil_b1).abs() <= MASS_EPSILON,
+            "extra tick swapped wet/dry roles: before A={soil_a} B={soil_b}, after A={soil_a1} B={soil_b1}"
+        );
+    }
+    // Absolute soil masses should not leapfrog past each other by more than a tiny step.
+    let before_gap = soil_a - soil_b;
+    let after_gap = soil_a1 - soil_b1;
+    assert!(
+        !(before_gap > MASS_EPSILON && after_gap < -MASS_EPSILON),
+        "oscillation swap detected: gap {before_gap} → {after_gap}"
+    );
+}
+
+/// D31: 1×2 flat; A at θ_fc, B drier; A mobile/mass unchanged (no capillary share).
+#[test]
+fn d31_equal_z_below_fc_no_share() {
+    let tex = Texture::Sand;
+    let fc = tex.theta_fc();
+    let z = 10.0;
+    let cols = vec![
+        textured_column(z, 0.0, fc, tex),       // A at field capacity
+        textured_column(z, 0.0, fc * 0.5, tex), // B drier
+    ];
+    let mut world = World::grid(137, 2, 1, cols);
+    let m_a0 = world.water_mass_at(0, 0);
+    let soil_a0 = world.column_at(0, 0).soil_water_mass();
+    let mobile_a0 = world.column_at(0, 0).mobile_water_m();
+    let m0 = world.grid_water_mass();
+
+    for _ in 0..16 {
+        world.tick();
+        assert_mass_close(world.grid_water_mass(), m0);
+    }
+
+    assert_mass_close(world.water_mass_at(0, 0), m_a0);
+    assert_mass_close(world.column_at(0, 0).soil_water_mass(), soil_a0);
+    assert_mass_close(world.column_at(0, 0).mobile_water_m(), mobile_a0);
+    assert!(
+        world.column_at(0, 0).mobile_water_m() <= MASS_EPSILON,
+        "A should have no mobile water"
+    );
+}
+
+/// D31: wet highland has same-z neighbor and lower-z neighbor; drain prefers valley surface.
+/// 2×2: (0,0) z=10 θ=φ; (1,0) z=10 θ=θ_fc; (0,1) z=5 θ=θ_fc; (1,1) z=5 θ=θ_fc.
+#[test]
+fn d31_downslope_beats_equal_z() {
+    let tex = Texture::Sand;
+    let phi = tex.porosity();
+    let fc = tex.theta_fc();
+    // Row-major y outer: (0,0), (1,0), (0,1), (1,1)
+    let cols = vec![
+        textured_column(10.0, 0.0, phi, tex), // (0,0) wet high
+        textured_column(10.0, 0.0, fc, tex),  // (1,0) equal-z highland at fc
+        textured_column(5.0, 0.0, fc, tex),   // (0,1) valley
+        textured_column(5.0, 0.0, fc, tex),   // (1,1) valley
+    ];
+    let mut world = World::grid(139, 2, 2, cols);
+    let m0 = world.grid_water_mass();
+    let m_eq0 = world.water_mass_at(1, 0);
+    let mobile_eq0 = world.column_at(1, 0).mobile_water_m();
+    let m_valley0 = world.water_mass_at(0, 1);
+
+    for _ in 0..8 {
+        world.tick();
+        assert_mass_close(world.grid_water_mass(), m0);
+    }
+
+    let valley_gain = world.water_mass_at(0, 1) - m_valley0;
+    assert!(
+        valley_gain > MASS_EPSILON,
+        "valley (0,1) should gain mass from preferential downslope drain, gain={valley_gain}"
+    );
+    // Equal-z highland must not gain mobile via the preferential path.
+    assert!(
+        world.column_at(1, 0).mobile_water_m() <= mobile_eq0 + MASS_EPSILON,
+        "equal-z neighbor must not gain mobile from high preferential path"
+    );
+    assert_mass_close(world.water_mass_at(1, 0), m_eq0);
+    // Valley should have risen while equal-z stayed near fc (soil).
+    for layer in world.column_at(1, 0).layers.iter() {
+        assert!(
+            (layer.theta - fc).abs() <= 1e-6 || layer.theta <= fc + 1e-6,
+            "equal-z highland layer should stay near θ_fc, got {}",
+            layer.theta
+        );
+    }
+}
