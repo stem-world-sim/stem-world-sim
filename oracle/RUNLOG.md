@@ -1,13 +1,13 @@
 # Oracle RUNLOG
 
 ```
-sprint: S08
+sprint: S09
 result: green
-branch: feat/s08-fidelity
+branch: feat/s09-regions
 date: 2026-09-08 (PT)
 epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15; H_REST=0.02 m; V_REST=1e-4 m
-constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25; T_SETTLE=64
-invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8
+constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25; T_SETTLE=64; CHUNK=8
+invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -76,5 +76,11 @@ tests:
   - d8_rain_fills_then_plants
   - d8_drought_matches_live_sinks
   - d8_no_teleport_uphill
-notes: S08 awake set + catch_up. Explicit awake[] visit set for hydro; rain/add_water/add_occupant/set_column/flux-recv wake cell+4-nbrs; after hydro (and after live sinks) prune cells that are at_rest with all 4-nbrs at_rest. awake_count() query. tick = hydro_step + clock + optional ET/occupants (live sinks still scan all cells for S05-S07 cadence; losers re-enter awake). catch_up(K,rain): every cell h+=K*rain_per_step (wake if rain>0) -> settle hydro_step <= T_SETTLE=64 until awake_count==0 -> K unit ET+occupant steps (exact drought match) -> clock += K*N_ET. T_SETTLE exceeded leaves movers awake. Books: rain on grid; et_lost/extract_lost from batched sinks. Older D0-D7 names green.
+  - d9_ignore_zero_visits
+  - d9_observe_one_chunk_only
+  - d9_cannot_ignore_moving
+  - d9_catchup_other_chunk_untouched
+  - d9_drought_chunk_wilts
+  - d9_halo_can_export_pond
+notes: S09 chunk observe/ignore + scoped catch-up. CHUNK=8; chunk_id(x,y)=(x/CHUNK,y/CHUNK); each chunk observed+t_away. Default observed=true (W*H<=12 and larger; 16×16 tests ignore explicitly). API observe_chunk / ignore_chunk->Result<ChunkBusy> (only if every cell at_rest) / catch_up_chunk(cx,cy,K,rain) = S08 order on chunk+1-cell 4-nbr halo with receivers clipped to region. Live hydro+sinks visit observed∪awake; last_hydro_visits() + observed_chunk_count(). Ignoring rest chunk yields zero hydro visits next tick. Halo export can wet adjacent valley chunk; far cells beyond halo unchanged. Older D0–D8 names green.
 ```

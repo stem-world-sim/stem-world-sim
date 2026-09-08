@@ -5,8 +5,8 @@
 //! Grid mass: sum of column M.
 
 use sim_core::{
-    Column, Occupant, SoilLayer, Texture, World, E_OPEN, E_SOIL, H_REST, MASS_EPSILON, MAX_OCCUPANTS,
-    N_ET, N_LAYERS, P_MAX, R_MAX, T_SETTLE, T_WILT, V_REST,
+    ChunkBusy, Column, Occupant, SoilLayer, Texture, World, CHUNK, E_OPEN, E_SOIL, H_REST,
+    MASS_EPSILON, MAX_OCCUPANTS, N_ET, N_LAYERS, P_MAX, R_MAX, T_SETTLE, T_WILT, V_REST,
 };
 
 fn assert_mass_close(actual: f64, expected: f64) {
@@ -166,6 +166,10 @@ fn i6_queries_are_kernel_methods() {
     let _plant = world.plant_at(0, 0);
     let _occ_n = world.occupant_count(0, 0);
     let _th = world.layer_theta_at(0, 0, 0);
+    // S08 / S09 region queries.
+    let _awake = world.awake_count();
+    let _obs = world.observed_chunk_count();
+    let _visits = world.last_hydro_visits();
 
     assert!(mass >= 0.0);
     assert!(surf >= 0.0);
@@ -2404,4 +2408,311 @@ fn d8_no_teleport_uphill() {
     );
     // High should not have gained from valley (no uphill teleport).
     assert_mass_close(closed_mass(&world), m0);
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 9 — region observe + scoped catch-up (CHUNK=8)
+// ---------------------------------------------------------------------------
+
+fn desert_grid(seed: u64, w: usize, h: usize) -> World {
+    let tex = Texture::Sand;
+    let cols: Vec<Column> = (0..w * h)
+        .map(|_| {
+            Column::new(
+                0.0,
+                0.0,
+                vec![
+                    SoilLayer::new(0.3, 0.0, tex),
+                    SoilLayer::new(0.5, 0.0, tex),
+                ],
+            )
+        })
+        .collect();
+    World::grid(seed, w, h, cols)
+}
+
+fn rest_all(world: &mut World) {
+    // Drive hydro to rest; large deserts need a couple ticks.
+    for _ in 0..4 {
+        world.tick();
+    }
+    assert!(world.grid_at_rest(), "precondition: grid at rest");
+}
+
+fn chunk_xy(x: usize, y: usize) -> (usize, usize) {
+    (x / CHUNK, y / CHUNK)
+}
+
+fn ignore_all_chunks(world: &mut World) {
+    let ncx = (world.width() + CHUNK - 1) / CHUNK;
+    let ncy = (world.height() + CHUNK - 1) / CHUNK;
+    for cy in 0..ncy {
+        for cx in 0..ncx {
+            world.ignore_chunk(cx, cy).expect("rest chunk should ignore");
+        }
+    }
+}
+
+/// D9: 16×16 rest; ignore all; tick; hydro cell visits == 0.
+#[test]
+fn d9_ignore_zero_visits() {
+    let mut world = desert_grid(901, 16, 16);
+    rest_all(&mut world);
+    assert_eq!(world.awake_count(), 0);
+    ignore_all_chunks(&mut world);
+    assert_eq!(world.observed_chunk_count(), 0);
+
+    world.tick();
+    assert_eq!(
+        world.last_hydro_visits(),
+        0,
+        "ignored resting world must visit no hydro cells"
+    );
+    assert_eq!(world.awake_count(), 0);
+}
+
+/// D9: ignore all but (0,0); rain inside (0,0); only that chunk + halo awake.
+#[test]
+fn d9_observe_one_chunk_only() {
+    let mut world = desert_grid(902, 16, 16);
+    rest_all(&mut world);
+    ignore_all_chunks(&mut world);
+    world.observe_chunk(0, 0);
+    assert_eq!(world.observed_chunk_count(), 1);
+
+    // Rain near chunk edge so 4-neighbors include halo cells outside the chunk.
+    let rx = CHUNK - 1;
+    let ry = CHUNK - 1;
+    assert_eq!(chunk_xy(rx, ry), (0, 0));
+    world.add_rain_at(rx, ry, 0.05);
+
+    // Awake = rain cell + 4-neighbors (includes (CHUNK, ry) and (rx, CHUNK) halo).
+    let ncx = (world.width() + CHUNK - 1) / CHUNK;
+    let ncy = (world.height() + CHUNK - 1) / CHUNK;
+    for y in 0..world.height() {
+        for x in 0..world.width() {
+            let i_awake = !world.cell_at_rest(x, y);
+            // Approximate awake via at_rest cleared by wake; also check awake_count path.
+            let (cx, cy) = chunk_xy(x, y);
+            let in_chunk0 = cx == 0 && cy == 0;
+            let in_halo = {
+                // 4-neighbor of any cell in chunk (0,0)
+                let x0 = 0;
+                let y0 = 0;
+                let x1 = CHUNK.min(world.width());
+                let y1 = CHUNK.min(world.height());
+                let mut h = in_chunk0;
+                if !h {
+                    for yy in y0..y1 {
+                        for xx in x0..x1 {
+                            let man = (x as i32 - xx as i32).abs() + (y as i32 - yy as i32).abs();
+                            if man == 1 {
+                                h = true;
+                                break;
+                            }
+                        }
+                        if h {
+                            break;
+                        }
+                    }
+                }
+                h
+            };
+            if i_awake {
+                assert!(
+                    in_halo,
+                    "awake cell ({x},{y}) must lie in chunk (0,0) + halo"
+                );
+            }
+            let _ = (ncx, ncy);
+        }
+    }
+    assert!(world.awake_count() >= 1);
+    // Halo cells outside chunk that are 4-neighbors of rain cell must be awake.
+    assert!(!world.cell_at_rest(CHUNK, ry), "east halo awake");
+    assert!(!world.cell_at_rest(rx, CHUNK), "south halo awake");
+}
+
+/// D9: pond still flowing; ignore_chunk fails or stays observed.
+#[test]
+fn d9_cannot_ignore_moving() {
+    let tex = Texture::Sand;
+    let phi = tex.porosity();
+    // 2×1 steep face with pond on high — will keep flowing for several ticks.
+    let cols = vec![
+        Column::new(
+            5.0,
+            0.5,
+            vec![SoilLayer::new(0.3, phi, tex), SoilLayer::new(0.5, phi, tex)],
+        ),
+        Column::new(
+            0.0,
+            0.0,
+            vec![SoilLayer::new(0.3, phi, tex), SoilLayer::new(0.5, phi, tex)],
+        ),
+    ];
+    let mut world = World::grid(903, 2, 1, cols);
+    // One tick so flux is happening / cells not all at_rest.
+    world.tick();
+    assert!(
+        !world.grid_at_rest(),
+        "precondition: pond still moving"
+    );
+    let before = world.observed_chunk_count();
+    let res = world.ignore_chunk(0, 0);
+    assert!(
+        res.is_err() || world.observed_chunk_count() == before,
+        "ignore while moving must fail or leave chunk observed"
+    );
+    assert!(matches!(res, Err(ChunkBusy)) || world.observed_chunk_count() == before);
+    // Chunk must remain observed either way under our Result API.
+    assert_eq!(world.observed_chunk_count(), before);
+}
+
+/// D9: two chunks; catch_up_chunk A; B mass unchanged.
+#[test]
+fn d9_catchup_other_chunk_untouched() {
+    // 16×8 → two chunks along x: (0,0) and (1,0).
+    let w = 16usize;
+    let h = 8usize;
+    let tex = Texture::Sand;
+    let fc = tex.theta_fc();
+    let cols: Vec<Column> = (0..w * h)
+        .map(|i| {
+            let x = i % w;
+            let elev = if x < CHUNK { 1.0 } else { 0.0 };
+            Column::new(
+                elev,
+                0.0,
+                vec![
+                    SoilLayer::new(0.3, fc, tex),
+                    SoilLayer::new(0.5, fc, tex),
+                ],
+            )
+        })
+        .collect();
+    let mut world = World::grid(904, w, h, cols);
+    rest_all(&mut world);
+
+    // Cells strictly outside A + 1-cell halo (x >= CHUNK+1) must be untouched.
+    let mut far_b0 = 0.0;
+    for y in 0..h {
+        for x in (CHUNK + 1)..w {
+            far_b0 += world.water_mass_at(x, y);
+        }
+    }
+
+    world.catch_up_chunk(0, 0, 2, 0.05);
+
+    let mut far_b1 = 0.0;
+    for y in 0..h {
+        for x in (CHUNK + 1)..w {
+            far_b1 += world.water_mass_at(x, y);
+        }
+    }
+    assert_approx_eq(far_b1, far_b0, "far chunk-B mass unchanged");
+}
+
+/// D9: plant in A, ignore A, catch_up_chunk(A,K=5,rain=0); plant wilted; B intact.
+#[test]
+fn d9_drought_chunk_wilts() {
+    let w = 16usize;
+    let h = 8usize;
+    let tex = Texture::Sand;
+    // Tiny top water so drought K=5 wilts; B has more water so a mistaken sink would show.
+    let cols: Vec<Column> = (0..w * h)
+        .map(|i| {
+            let x = i % w;
+            if x < CHUNK {
+                Column::new(
+                    0.0,
+                    0.0,
+                    vec![
+                        SoilLayer::new(0.3, 0.02, tex),
+                        SoilLayer::new(0.5, 0.0, tex),
+                    ],
+                )
+            } else {
+                Column::new(
+                    0.0,
+                    0.0,
+                    vec![
+                        SoilLayer::new(0.3, 0.15, tex),
+                        SoilLayer::new(0.5, 0.10, tex),
+                    ],
+                )
+            }
+        })
+        .collect();
+    let mut world = World::grid(905, w, h, cols);
+    world.add_occupant(1, 1, Occupant::plant_stub()).unwrap();
+    world.add_occupant(CHUNK + 1, 1, Occupant::plant_stub()).unwrap();
+    rest_all(&mut world);
+    assert!(world.plant_at(1, 1));
+    assert!(world.plant_at(CHUNK + 1, 1));
+
+    let theta_b0 = world.layer_theta_at(CHUNK + 1, 1, 0);
+    let mass_b0 = world.water_mass_at(CHUNK + 1, 1);
+
+    world.ignore_chunk(0, 0).expect("A at rest");
+    world.catch_up_chunk(0, 0, 5, 0.0);
+
+    assert!(!world.plant_at(1, 1), "plant in A should wilt");
+    assert!(world.plant_at(CHUNK + 1, 1), "plant in B stays alive");
+    assert_approx_eq(
+        world.layer_theta_at(CHUNK + 1, 1, 0),
+        theta_b0,
+        "B theta intact",
+    );
+    assert_approx_eq(world.water_mass_at(CHUNK + 1, 1), mass_b0, "B mass intact");
+}
+
+/// D9: rain catch-up on high chunk; adjacent valley chunk gains water via halo.
+#[test]
+fn d9_halo_can_export_pond() {
+    let w = 16usize;
+    let h = 8usize;
+    let tex = Texture::Sand;
+    let phi = tex.porosity();
+    // Chunk A (x<8) high saturated; chunk B valley saturated (room for pond).
+    let cols: Vec<Column> = (0..w * h)
+        .map(|i| {
+            let x = i % w;
+            if x < CHUNK {
+                Column::new(
+                    2.0,
+                    0.0,
+                    vec![SoilLayer::new(0.3, phi, tex), SoilLayer::new(0.5, phi, tex)],
+                )
+            } else {
+                Column::new(
+                    0.0,
+                    0.0,
+                    vec![SoilLayer::new(0.3, phi, tex), SoilLayer::new(0.5, phi, tex)],
+                )
+            }
+        })
+        .collect();
+    let mut world = World::grid(906, w, h, cols);
+    rest_all(&mut world);
+
+    let mut valley0 = 0.0;
+    for y in 0..h {
+        for x in CHUNK..w {
+            valley0 += world.water_mass_at(x, y);
+        }
+    }
+
+    world.catch_up_chunk(0, 0, 3, 0.10);
+
+    let mut valley1 = 0.0;
+    for y in 0..h {
+        for x in CHUNK..w {
+            valley1 += world.water_mass_at(x, y);
+        }
+    }
+    assert!(
+        valley1 > valley0 + MASS_EPSILON,
+        "valley chunk should gain water via halo export: {valley0} -> {valley1}"
+    );
 }
