@@ -4,7 +4,7 @@
 //! Cell area A = 1. Column water mass M = h_surf + sum(theta_i * L_i).
 //! Grid mass: sum of column M.
 
-use sim_core::{Column, SoilLayer, Texture, World, MASS_EPSILON};
+use sim_core::{Column, SoilLayer, Texture, World, MASS_EPSILON, R_MAX};
 
 fn assert_mass_close(actual: f64, expected: f64) {
     let scale = expected.abs().max(1.0);
@@ -382,8 +382,8 @@ fn d1_flat_pair_equalizes_no_oscillation() {
     let mut world = World::grid(31, 2, 1, cols);
     let m0 = world.grid_water_mass();
 
-    // Half-drop on flat: each tick moves half the remaining ΔH, so equalizes gradually.
-    for _ in 0..64 {
+    // Half-drop + R_max: equalizes gradually; more ticks if R_max binds on larger ponds.
+    for _ in 0..128 {
         world.tick();
         assert_mass_close(world.grid_water_mass(), m0);
     }
@@ -421,7 +421,7 @@ fn d1_same_z_three_share() {
     world.add_rain_at(1, 0, rain); // center
     let m0 = world.grid_water_mass();
 
-    for _ in 0..64 {
+    for _ in 0..128 {
         world.tick();
         assert_mass_close(world.grid_water_mass(), m0);
     }
@@ -633,7 +633,7 @@ fn d3_pond_moves_faster_than_soil() {
 
 // ---------------------------------------------------------------------------
 // Sprint 3.1 — equal-z lateral interflow (ε = MASS_EPSILON = 1e-9)
-// Prefer sand. Capillary θ ≤ θ_fc does not move. Pond routing unchanged.
+// Prefer sand. Capillary θ ≤ θ_fc does not move. Pond is S03.3 (R_max).
 // ---------------------------------------------------------------------------
 
 /// D31: 1×2 flat same z; A θ=φ, B θ=θ_fc; B θ rises, A θ falls; no oscillation swap.
@@ -989,4 +989,159 @@ fn d32_contact_limited_by_slower_soil() {
         flux <= d_clay + MASS_EPSILON,
         "contact flux {flux} must be ≤ D_max_clay={d_clay} + ε"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 3.3 — pond head + R_max (ε = MASS_EPSILON = 1e-9; R_MAX = 0.15)
+// Sand ok. Unique-min-H chute revoked. Soils at φ for pond-only scripts.
+// ---------------------------------------------------------------------------
+
+/// D33: 1×2 slope Δz=6; high h=0.50 at φ; after 1 tick high h > 0 and
+/// high lost ≤ R_max + ε to the downhill edge.
+#[test]
+fn d33_steep_face_does_not_empty_in_one_tick() {
+    let pond = 0.50;
+    let cols = vec![
+        saturated_column(6.0, pond), // high
+        saturated_column(0.0, 0.0),  // low
+    ];
+    let mut world = World::grid(173, 2, 1, cols);
+    let h0 = world.surface_water_m_at(0, 0);
+    let m0 = world.grid_water_mass();
+    assert!((h0 - pond).abs() <= MASS_EPSILON);
+
+    world.tick();
+    assert_mass_close(world.grid_water_mass(), m0);
+
+    let h1 = world.surface_water_m_at(0, 0);
+    let lost = h0 - h1;
+    assert!(
+        h1 > MASS_EPSILON,
+        "steep face must not empty high in one tick: h={h1}"
+    );
+    assert!(
+        lost <= R_MAX + MASS_EPSILON,
+        "high lost {lost} exceeds R_MAX={R_MAX} + ε"
+    );
+    assert!(
+        lost > MASS_EPSILON,
+        "some pond should move downhill, lost={lost}"
+    );
+}
+
+/// D33: 2×2 — high-A pond, high-B same z dry, valley under A empty;
+/// after 1 tick high-B h > 0 AND valley M rose (face capped ⇒ same-z edge gets flux).
+#[test]
+fn d33_same_z_gets_pond_when_face_capped() {
+    let pond = 0.50;
+    // Row-major: (0,0) high-A, (1,0) high-B, (0,1) valley-A, (1,1) valley-B
+    let cols = vec![
+        saturated_column(6.0, pond), // (0,0) high-A
+        saturated_column(6.0, 0.0),  // (1,0) high-B same z dry
+        saturated_column(0.0, 0.0),  // (0,1) valley under A
+        saturated_column(0.0, 0.0),  // (1,1) valley
+    ];
+    let mut world = World::grid(179, 2, 2, cols);
+    let m_valley0 = world.water_mass_at(0, 1);
+    let m0 = world.grid_water_mass();
+
+    world.tick();
+    assert_mass_close(world.grid_water_mass(), m0);
+
+    let h_b = world.surface_water_m_at(1, 0);
+    assert!(
+        h_b > MASS_EPSILON,
+        "high-B should receive same-z pond when steep face is R_max-capped, h_b={h_b}"
+    );
+    assert!(
+        world.water_mass_at(0, 1) > m_valley0 + MASS_EPSILON,
+        "valley under A should rise"
+    );
+}
+
+/// D33: 1×2 Δz=6; enough pond on low that H_low ≈ H_high; after N≥15 ticks
+/// |H_high−H_low| shrinks; last 3 ticks each |h| change < 1e-4 (no oscillation).
+#[test]
+fn d33_drowned_lake_heads_equalize_no_oscillation() {
+    // high: z=6 h=0.2 → H=6.2; low: z=0 h=6.0 → H=6.0; near-equal drowned lake
+    let h_high0 = 0.20;
+    let h_low0 = 6.00;
+    let cols = vec![
+        saturated_column(6.0, h_high0),
+        saturated_column(0.0, h_low0),
+    ];
+    let mut world = World::grid(181, 2, 1, cols);
+    let m0 = world.grid_water_mass();
+    let dh0 = (world.column_at(0, 0).head() - world.column_at(1, 0).head()).abs();
+    assert!(dh0 > MASS_EPSILON, "start with a small head gap");
+
+    let n = 20usize;
+    let mut h_hist: Vec<(f64, f64)> = Vec::with_capacity(n + 1);
+    h_hist.push((
+        world.surface_water_m_at(0, 0),
+        world.surface_water_m_at(1, 0),
+    ));
+
+    for _ in 0..n {
+        world.tick();
+        assert_mass_close(world.grid_water_mass(), m0);
+        h_hist.push((
+            world.surface_water_m_at(0, 0),
+            world.surface_water_m_at(1, 0),
+        ));
+    }
+
+    let dh_final = (world.column_at(0, 0).head() - world.column_at(1, 0).head()).abs();
+    assert!(
+        dh_final < dh0 - 1e-6,
+        "|H_high-H_low| should shrink: start={dh0}, end={dh_final}"
+    );
+
+    // Last 3 ticks: each |h| change < 1e-4 on both cells.
+    assert!(h_hist.len() >= 4);
+    for k in (h_hist.len() - 3)..h_hist.len() {
+        let (ha0, hb0) = h_hist[k - 1];
+        let (ha1, hb1) = h_hist[k];
+        let da = (ha1 - ha0).abs();
+        let db = (hb1 - hb0).abs();
+        assert!(
+            da < 1e-4,
+            "last ticks: |Δh_high|={da} not < 1e-4 (tick index {k})"
+        );
+        assert!(
+            db < 1e-4,
+            "last ticks: |Δh_low|={db} not < 1e-4 (tick index {k})"
+        );
+    }
+}
+
+/// D33: two cells any z with H equal ⇒ no net pond move.
+#[test]
+#[allow(non_snake_case)]
+fn d33_equal_H_no_flux() {
+    // Different z, compensating h so H equal: z=10 h=1 and z=9 h=2 → H=11.
+    // Empty soil (no pore / no mobile) so infiltrate and soil drain cannot change H.
+    let cols = vec![
+        Column::new(10.0, 1.0, vec![]),
+        Column::new(9.0, 2.0, vec![]),
+    ];
+    let mut world = World::grid(191, 2, 1, cols);
+    let m_a0 = world.water_mass_at(0, 0);
+    let m_b0 = world.water_mass_at(1, 0);
+    let h_a0 = world.surface_water_m_at(0, 0);
+    let h_b0 = world.surface_water_m_at(1, 0);
+    assert_approx_eq(
+        world.column_at(0, 0).head(),
+        world.column_at(1, 0).head(),
+        "heads equal at start",
+    );
+
+    for _ in 0..8 {
+        world.tick();
+    }
+
+    assert_mass_close(world.water_mass_at(0, 0), m_a0);
+    assert_mass_close(world.water_mass_at(1, 0), m_b0);
+    assert_approx_eq(world.surface_water_m_at(0, 0), h_a0, "no net pond move A");
+    assert_approx_eq(world.surface_water_m_at(1, 0), h_b0, "no net pond move B");
 }
