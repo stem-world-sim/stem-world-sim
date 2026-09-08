@@ -11,11 +11,11 @@ button{appearance:none;border:0;border-radius:8px;padding:.48rem .65rem;font:inh
 .map{display:grid;grid-template-columns:repeat(3,1fr);gap:.4rem;max-width:26rem;margin:.3rem auto}
 .cell{position:relative;min-height:6.2rem;border:2px solid #2a303a;border-radius:10px;padding:.3rem;cursor:pointer;overflow:hidden}.cell.sel{border-color:#e8eaef}
 .pond{position:absolute;left:0;right:0;bottom:0;background:var(--pond);opacity:.82;pointer-events:none}.meta{position:relative;z-index:1;font-size:.68rem;line-height:1.25}
-pre{background:#0e1014;padding:.6rem;border-radius:8px;font-size:.72rem;white-space:pre-wrap;margin:0}label{font-size:.82rem}input[type=range]{width:7.5rem}
+pre{background:#0e1014;padding:.6rem;border-radius:8px;font-size:.72rem;white-space:pre-wrap;margin:.4rem 0 0}label{font-size:.82rem}input[type=range]{width:7.5rem}
 </style></head><body>
 <h1>D3 — sand / loam / clay</h1>
-<p class="sub">S03.1. Open locally. Sand | Loam | Clay. High z=8, valley z=2. Equal-z valleys share mobile soil water.</p>
-<p class="warn">Hue=texture. Darker=wetter soil. Blue=pond. Soak valley sand then tick: loam valley should darken.</p>
+<p class="sub">S03.1. Open locally. Sand | Loam | Clay. High z=8, valley z=2.</p>
+<p class="warn">Lighter = drier. Darker = wetter. Blue = pond. Valleys equalize mobile water m, not % full.</p>
 <div class="card row">
 <button class="pri" type="button" id="rain">Rain selected</button>
 <button type="button" id="heavy">Heavy rain all high</button>
@@ -25,7 +25,13 @@ pre{background:#0e1014;padding:.6rem;border-radius:8px;font-size:.72rem;white-sp
 <label>R <span id="rV">0.25</span><input id="R" type="range" min="0.02" max="0.50" step="0.01" value="0.25"></label>
 </div>
 <div class="card"><div class="map" id="map"></div>
-<p class="legend">Tick = infiltrate, pond runoff, then drain (downslope first, else equal-z interflow).</p></div>
+<pre>Texture  φ     θ_fc (capillary floor)  I_max  D_max
+Sand     0.40  0.20   50% of φ         0.20   0.04
+Loam     0.45  0.225  50% of φ         0.05   0.01
+Clay     0.50  0.25   50% of φ         0.01   0.002
+θ_fc stops GRAVITY drain only. Plants / ET (later) can pull below it. Not a permanent tank.
+m = (θ-θ_fc)+ · L   Equal-z share equalizes m, so % sat stays different across textures.</pre>
+</div>
 <pre id="out">loading…</pre>
 <script>
 (function(){
@@ -35,7 +41,7 @@ var COLTX=['sand','loam','clay'],cells,lastLog=[];
 function idx(x,y){return y*W+x}function at(x,y){return cells[idx(x,y)]}function tex(c){return TX[c.tx]}
 function fc(c){return 0.5*tex(c).phi}function sat(c){return c.theta/tex(c).phi}function mass(c){return c.h+c.theta*L}function head(c){return c.z+c.h}
 function mob(c){return Math.max(0,c.theta-fc(c))*L}
-function color(c){var t=Math.max(0,Math.min(1,sat(c)));var h=tex(c).hue;var k=0.42+0.58*t;return 'rgb('+Math.round(h[0]*k)+','+Math.round(h[1]*k)+','+Math.round(h[2]*k)+')'}
+function color(c){var t=Math.max(0,Math.min(1,sat(c)));var h=tex(c).hue;var k=0.38+0.62*(1-t);return 'rgb('+Math.round(h[0]*k)+','+Math.round(h[1]*k)+','+Math.round(h[2]*k)+')'}
 function make(tx,z,th){return{tx:tx,z:z,h:0,theta:th}}
 function resetWorld(){cells=[];var x;for(x=0;x<3;x++)cells.push(make(COLTX[x],2,0.10));for(x=0;x<3;x++)cells.push(make(COLTX[x],8,0.10));tickN=0;lastLog=[];sel={x:0,y:1}}
 function infiltrate(c){var T=tex(c);var room=Math.max(0,T.phi-c.theta)*L;var take=Math.min(c.h,room,T.I);c.theta+=take/L;c.h-=take}
@@ -60,11 +66,11 @@ function draw(){document.getElementById('rV').textContent=parseFloat(document.ge
 for(y=Ht-1;y>=0;y--)for(x=0;x<W;x++){var c=at(x,y);tot+=mass(c);var pct=Math.min(72,(c.h/0.4)*72);
 html+='<div class="cell'+(sel.x===x&&sel.y===y?' sel':'')+'" data-x="'+x+'" data-y="'+y+'" style="background:'+color(c)+'">';
 html+='<div class="pond" style="height:'+pct+'%"></div><div class="meta">'+tex(c).name+(y===1?' high':' valley');
-html+='<br>z '+c.z+'  soil '+Math.round(sat(c)*100)+'%<br>h '+c.h.toFixed(3)+'  θ '+c.theta.toFixed(3)+'</div></div>'}
+html+='<br>z '+c.z+'  soil '+Math.round(sat(c)*100)+'%<br>h '+c.h.toFixed(3)+'  m '+mob(c).toFixed(3)+'</div></div>'}
 var map=document.getElementById('map');map.innerHTML=html;var nodes=map.querySelectorAll('.cell'),n;
 for(n=0;n<nodes.length;n++)nodes[n].onclick=function(ev){sel.x=+ev.currentTarget.getAttribute('data-x');sel.y=+ev.currentTarget.getAttribute('data-y');draw()};
 var lines=['tick '+tickN+'  grid M='+tot.toFixed(4)+'  selected ('+sel.x+','+sel.y+') '+tex(at(sel.x,sel.y)).name];
-lines.push('S03.1: downslope first; else equal-z interflow of mobile θ');
+lines.push('Equal-z share evens m, not % sat. θ_fc is gravity-only.');
 if(!lastLog.length)lines.push('Last drain: none.');else lines=lines.concat(lastLog.slice(0,8));
 document.getElementById('out').textContent=lines.join('\n')}
 document.getElementById('R').oninput=function(){document.getElementById('rV').textContent=parseFloat(this.value).toFixed(2)};
