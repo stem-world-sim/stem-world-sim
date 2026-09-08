@@ -1,40 +1,31 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>SWS D3 — water mechanics</title>
 <style>
 :root{color-scheme:dark;--bg:#12141a;--card:#1c2028;--ink:#e8eaef;--muted:#9aa3b2;--pond:#4aa3d8}
-*{box-sizing:border-box}
-body{margin:0 auto;max-width:44rem;padding:1rem;font:15px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--ink)}
-h1{font-size:1.12rem;margin:0 0 .3rem}
-.sub,.warn,.legend{font-size:.82rem;color:var(--muted);margin:0 0 .65rem}
+*{box-sizing:border-box}body{margin:0 auto;max-width:44rem;padding:1rem;font:15px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--ink)}
+h1{font-size:1.12rem;margin:0 0 .3rem}.sub,.warn,.legend{font-size:.82rem;color:var(--muted);margin:0 0 .65rem}
 .warn{background:#3a2a18;border:1px solid #7a5a28;padding:.55rem .7rem;border-radius:8px;color:#f0d9a8}
-.card{background:var(--card);border-radius:12px;padding:.75rem;margin-bottom:.65rem}
-.row{display:flex;flex-wrap:wrap;gap:.35rem;align-items:center}
-button{appearance:none;border:0;border-radius:8px;padding:.48rem .65rem;font:inherit;background:#2c3544;color:var(--ink)}
-button.pri{background:#2e5a3c}
+.card{background:var(--card);border-radius:12px;padding:.75rem;margin-bottom:.65rem}.row{display:flex;flex-wrap:wrap;gap:.35rem;align-items:center}
+button{appearance:none;border:0;border-radius:8px;padding:.48rem .65rem;font:inherit;background:#2c3544;color:var(--ink)}button.pri{background:#2e5a3c}
 .map{display:grid;grid-template-columns:repeat(3,1fr);gap:.4rem;max-width:26rem;margin:.3rem auto}
-.cell{position:relative;min-height:6.2rem;border:2px solid #2a303a;border-radius:10px;padding:.3rem;cursor:pointer;overflow:hidden}
-.cell.sel{border-color:#e8eaef}
-.pond{position:absolute;left:0;right:0;bottom:0;background:var(--pond);opacity:.82;pointer-events:none}
-.meta{position:relative;z-index:1;font-size:.68rem;line-height:1.25}
-pre{background:#0e1014;padding:.6rem;border-radius:8px;font-size:.72rem;white-space:pre-wrap;margin:0}
-label{font-size:.82rem}input[type=range]{width:7.5rem}
+.cell{position:relative;min-height:6.2rem;border:2px solid #2a303a;border-radius:10px;padding:.3rem;cursor:pointer;overflow:hidden}.cell.sel{border-color:#e8eaef}
+.pond{position:absolute;left:0;right:0;bottom:0;background:var(--pond);opacity:.82;pointer-events:none}.meta{position:relative;z-index:1;font-size:.68rem;line-height:1.25}
+pre{background:#0e1014;padding:.6rem;border-radius:8px;font-size:.72rem;white-space:pre-wrap;margin:0}label{font-size:.82rem}input[type=range]{width:7.5rem}
 </style></head><body>
 <h1>D3 — sand / loam / clay</h1>
-<p class="sub">S03 kernel copy. Open this file locally. Columns Sand | Loam | Clay. Top high z=8, bottom valley z=2.</p>
-<p class="warn">Hue = texture (tan, olive, rust). Darker = wetter soil. Blue = pond. Clay ponds under heavy rain before soil is full.</p>
+<p class="sub">S03.1. Open locally. Sand | Loam | Clay. High z=8, valley z=2. Equal-z valleys share mobile soil water.</p>
+<p class="warn">Hue=texture. Darker=wetter soil. Blue=pond. Soak valley sand then tick: loam valley should darken.</p>
 <div class="card row">
 <button class="pri" type="button" id="rain">Rain selected</button>
 <button type="button" id="heavy">Heavy rain all high</button>
 <button type="button" id="tick">One tick</button>
+<button type="button" id="soak">Soak valley sand</button>
 <button type="button" id="reset">Reset</button>
 <label>R <span id="rV">0.25</span><input id="R" type="range" min="0.02" max="0.50" step="0.01" value="0.25"></label>
 </div>
 <div class="card"><div class="map" id="map"></div>
-<p class="legend">Tick = infiltrate ≤ I_max, pond runoff, soil drain ≤ D_max to lower z.</p></div>
+<p class="legend">Tick = infiltrate, pond runoff, then drain (downslope first, else equal-z interflow).</p></div>
 <pre id="out">loading…</pre>
 <script>
 (function(){
@@ -43,21 +34,27 @@ var TX={sand:{name:'Sand',phi:0.40,I:0.20,D:0.04,hue:[196,163,92]},loam:{name:'L
 var COLTX=['sand','loam','clay'],cells,lastLog=[];
 function idx(x,y){return y*W+x}function at(x,y){return cells[idx(x,y)]}function tex(c){return TX[c.tx]}
 function fc(c){return 0.5*tex(c).phi}function sat(c){return c.theta/tex(c).phi}function mass(c){return c.h+c.theta*L}function head(c){return c.z+c.h}
+function mob(c){return Math.max(0,c.theta-fc(c))*L}
 function color(c){var t=Math.max(0,Math.min(1,sat(c)));var h=tex(c).hue;var k=0.42+0.58*t;return 'rgb('+Math.round(h[0]*k)+','+Math.round(h[1]*k)+','+Math.round(h[2]*k)+')'}
 function make(tx,z,th){return{tx:tx,z:z,h:0,theta:th}}
 function resetWorld(){cells=[];var x;for(x=0;x<3;x++)cells.push(make(COLTX[x],2,0.10));for(x=0;x<3;x++)cells.push(make(COLTX[x],8,0.10));tickN=0;lastLog=[];sel={x:0,y:1}}
-function infiltrate(c){var T=tex(c);var room=Math.max(0,T.phi-c.theta)*L;var take=Math.min(c.h,room,T.I);if(L>0)c.theta+=take/L;c.h-=take}
+function infiltrate(c){var T=tex(c);var room=Math.max(0,T.phi-c.theta)*L;var take=Math.min(c.h,room,T.I);c.theta+=take/L;c.h-=take}
 function runoff(){var n=6,heads=[],depths=[],d=[],i,x,y;for(i=0;i<n;i++){heads.push(head(cells[i]));depths.push(cells[i].h);d.push(0)}
 var off=[[0,1],[1,0],[0,-1],[-1,0]];
 for(y=0;y<Ht;y++)for(x=0;x<W;x++){i=idx(x,y);if(depths[i]<=0)continue;var cands=[],k,minH=null;
 for(k=0;k<4;k++){var nx=x+off[k][0],ny=y+off[k][1];if(nx<0||ny<0||nx>=W||ny>=Ht)continue;var j=idx(nx,ny);if(heads[j]>=heads[i])continue;if(minH===null||heads[j]<minH)minH=heads[j];cands.push({j:j,H:heads[j]})}
 var T=cands.filter(function(a){return a.H===minH});if(!T.length)continue;var V=Math.min(depths[i],0.5*(heads[i]-minH));if(V<=0)continue;d[i]-=V;var sh=V/T.length;T.forEach(function(a){d[a.j]+=sh})}
 for(i=0;i<n;i++){cells[i].h+=d[i];if(cells[i].h<0&&Math.abs(cells[i].h)<=EPS)cells[i].h=0}}
-function drain(){var n=6,addH=[],sub=[],i,x,y;for(i=0;i<n;i++){addH.push(0);sub.push(0)}var off=[[0,1],[1,0],[0,-1],[-1,0]];
-for(y=0;y<Ht;y++)for(x=0;x<W;x++){i=idx(x,y);var c=cells[i],mobile=Math.max(0,c.theta-fc(c))*L,m=Math.min(tex(c).D,mobile);if(m<=0)continue;var best=null,k;
-for(k=0;k<4;k++){var nx=x+off[k][0],ny=y+off[k][1];if(nx<0||ny<0||nx>=W||ny>=Ht)continue;var j=idx(nx,ny);if(cells[j].z>=c.z)continue;if(!best||cells[j].z<cells[best].z)best=j}
-if(best===null)continue;sub[i]+=m;addH[best]+=m;lastLog.push('drain '+tex(c).name+' ('+x+','+y+') vol '+m.toFixed(3))}
-for(i=0;i<n;i++){if(sub[i]>0)cells[i].theta-=sub[i]/L;cells[i].h+=addH[i]}}
+function addSoil(c,vol){var room=Math.max(0,tex(c).phi-c.theta)*L;var s=Math.min(vol,room);c.theta+=s/L;c.h+=vol-s}
+function drain(){var n=6,dT=[],dH=[],i,x,y,k;for(i=0;i<n;i++){dT.push(0);dH.push(0)}var off=[[0,1],[1,0],[0,-1],[-1,0]];
+var snapM=[],snapZ=[];for(i=0;i<n;i++){snapM.push(mob(cells[i]));snapZ.push(cells[i].z)}
+for(y=0;y<Ht;y++)for(x=0;x<W;x++){i=idx(x,y);var mi=snapM[i];if(mi<=0)continue;var lower=[],flat=[];
+for(k=0;k<4;k++){var nx=x+off[k][0],ny=y+off[k][1];if(nx<0||ny<0||nx>=W||ny>=Ht)continue;var j=idx(nx,ny);if(snapZ[j]>snapZ[i])continue;if(snapZ[j]<snapZ[i])lower.push(j);else if(snapM[j]<mi)flat.push(j)}
+if(lower.length){var minz=snapZ[lower[0]],t;for(t=1;t<lower.length;t++)if(snapZ[lower[t]]<minz)minz=snapZ[lower[t]];
+var T=lower.filter(function(j){return snapZ[j]===minz});var V=Math.min(tex(cells[i]).D,mi);var sh=V/T.length;dT[i]-=V;T.forEach(function(j){dH[j]+=sh});lastLog.push('downslope '+tex(cells[i]).name+' '+V.toFixed(3))}
+else if(flat.length){var cap=tex(cells[i]).D/flat.length,left=Math.min(tex(cells[i]).D,mi);
+flat.forEach(function(j){var v=Math.min(cap,left,0.5*(mi-snapM[j]));if(v<=0)return;left-=v;dT[i]-=v;dT[j]+=v;lastLog.push('interflow ('+(j%W)+','+Math.floor(j/W)+') '+v.toFixed(3))})}}
+for(i=0;i<n;i++){if(dT[i]<0)cells[i].theta+=dT[i]/L;if(dT[i]>0)addSoil(cells[i],dT[i]);cells[i].h+=dH[i]}}
 function tick(){lastLog=[];var i;for(i=0;i<6;i++)infiltrate(cells[i]);runoff();drain();tickN+=1}
 function draw(){document.getElementById('rV').textContent=parseFloat(document.getElementById('R').value).toFixed(2);var html='',y,x,tot=0;
 for(y=Ht-1;y>=0;y--)for(x=0;x<W;x++){var c=at(x,y);tot+=mass(c);var pct=Math.min(72,(c.h/0.4)*72);
@@ -67,13 +64,14 @@ html+='<br>z '+c.z+'  soil '+Math.round(sat(c)*100)+'%<br>h '+c.h.toFixed(3)+'  
 var map=document.getElementById('map');map.innerHTML=html;var nodes=map.querySelectorAll('.cell'),n;
 for(n=0;n<nodes.length;n++)nodes[n].onclick=function(ev){sel.x=+ev.currentTarget.getAttribute('data-x');sel.y=+ev.currentTarget.getAttribute('data-y');draw()};
 var lines=['tick '+tickN+'  grid M='+tot.toFixed(4)+'  selected ('+sel.x+','+sel.y+') '+tex(at(sel.x,sel.y)).name];
-lines.push('I_max 0.20 / 0.05 / 0.01    D_max 0.04 / 0.01 / 0.002');
+lines.push('S03.1: downslope first; else equal-z interflow of mobile θ');
 if(!lastLog.length)lines.push('Last drain: none.');else lines=lines.concat(lastLog.slice(0,8));
 document.getElementById('out').textContent=lines.join('\n')}
 document.getElementById('R').oninput=function(){document.getElementById('rV').textContent=parseFloat(this.value).toFixed(2)};
 document.getElementById('rain').onclick=function(){at(sel.x,sel.y).h+=parseFloat(document.getElementById('R').value);lastLog=[];draw()};
 document.getElementById('heavy').onclick=function(){var x;for(x=0;x<3;x++)at(x,1).h+=0.30;lastLog=[];draw()};
 document.getElementById('tick').onclick=function(){tick();draw()};
+document.getElementById('soak').onclick=function(){at(0,0).theta=tex(at(0,0)).phi;lastLog=[];draw()};
 document.getElementById('reset').onclick=function(){resetWorld();draw()};
 resetWorld();draw();
 })();
