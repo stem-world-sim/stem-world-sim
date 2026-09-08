@@ -1,13 +1,13 @@
 # Oracle RUNLOG
 
 ```
-sprint: S05
+sprint: S06
 result: green
-branch: feat/s05-evaporation
+branch: feat/s06-occupants
 date: 2026-09-08 (PT)
 epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15; H_REST=0.02 m; V_REST=1e-4 m
-constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10
-invariants encoded: I1, I2, I3(+et_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5
+constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3
+invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -56,5 +56,12 @@ tests:
   - d5_bot_untouched
   - d5_batch_not_every_tick
   - d5_mass_et_accounts
-notes: S05 closed basin — water leaves only via batched ET. Query et_lost(). Tick order: infiltrate→pond→soil→lake_snap→at_rest; clock.advance(); if tick%N_ET==0 then ET→lake_snap→rest (so ET on ticks 10,20,…). On ET-step apply E*1 (not E*N_ET). Pond first if h>0 (min(h,E_OPEN)); else top soil min(θL,E_SOIL) may go below θ_fc; bot untouched; skip take≤V_REST; ET wakes only cells that lose >V_REST. I3/mass asserts use grid_water_mass()+et_lost(). No edge flux. No new spatial state. Older long scripts capped <N_ET where absolute θ/h freezes would conflict with ET; mass-conservation scripts keep closed_mass.
+  - d6_plant_drinks_top
+  - d6_mask_can_be_bot
+  - d6_two_occupants_sum
+  - d6_wilt_stops_uptake
+  - d6_extract_in_ledger
+  - d6_bare_cell_no_extract
+  - d6_cap_eight
+notes: S06 occupants + PlantStub. Per-cell Vec capped at MAX_OCCUPANTS. Sink cadence same as S05 (tick%N_ET==0 after advance): ET then occupants then lake_snap/rest. E_eff=E*(1-clamp(sum_shade,0,1)); shade=0 ⇒ S05-identical. Alive occupants in insert order take min(u*root[k], θ_k*L) per layer (below θ_fc OK); no pond drink; dry_steps→wilt at T_WILT. Books: grid_mass+et_lost+extract_lost. Queries: plant_at, occupant_count, extract_lost, layer_theta_at; add_occupant/clear_occupants. Older mass asserts include extract_lost (0 when bare).
 ```
