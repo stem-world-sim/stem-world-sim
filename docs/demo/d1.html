@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SWS D1 — slope runoff</title>
+  <style>
+    :root { color-scheme: dark; --bg:#12141a; --card:#1c2028; --ink:#e8eaef; --muted:#9aa3b2; --pond:#5b9fd6; --soil:#c4a574; --pore:#3d4a3a; }
+    * { box-sizing: border-box; }
+    body { margin: 0 auto; max-width: 44rem; padding: 1rem; font: 16px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--ink); }
+    h1 { font-size: 1.15rem; margin: 0 0 .35rem; }
+    .sub, .warn { font-size: .85rem; color: var(--muted); margin: 0 0 .7rem; }
+    .warn { background: #3a2a18; border: 1px solid #7a5a28; padding: .6rem .75rem; border-radius: 8px; color: #f0d9a8; }
+    .card { background: var(--card); border-radius: 12px; padding: .9rem; margin-bottom: .75rem; }
+    .row { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .5rem; }
+    button { appearance: none; border: 0; border-radius: 8px; padding: .55rem .75rem; font: inherit; background: #2c3544; color: var(--ink); }
+    button.pri { background: #2e5a3c; }
+    .grid { display: flex; gap: .6rem; align-items: flex-end; min-height: 210px; }
+    .cell { flex: 1; display: flex; flex-direction: column; align-items: stretch; }
+    .cell h2 { font-size: .75rem; margin: 0 0 .3rem; color: var(--muted); text-align: center; }
+    .stack { height: 160px; display: flex; flex-direction: column; justify-content: flex-end; background: #0e1014; border: 1px solid #2a303a; border-radius: 8px; overflow: hidden; }
+    .pond { background: var(--pond); width: 100%; }
+    .layer { display: flex; height: 28%; }
+    .wet { background: var(--soil); }
+    .empty { background: var(--pore); }
+    pre { background: #0e1014; padding: .7rem; border-radius: 8px; font-size: .75rem; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>D1 slope runoff</h1>
+  <p class="sub">Three columns in a line: High → Low → Ridge. Tick = infiltrate all, then one surface runoff pass. Download this file and open locally.</p>
+  <p class="warn">Critic instrument. Matches S02 rule (H = z+h, send min(h, ΔH) to lowest neighbor). cargo test wins if they disagree.</p>
+  <div class="card row">
+    <button class="pri" type="button" id="down">Rain on high + ticks</button>
+    <button type="button" id="up">Rain on low only</button>
+    <button type="button" id="flat">Flat equal H</button>
+    <button type="button" id="tick">One tick</button>
+    <button type="button" id="reset">Reset slope</button>
+  </div>
+  <div class="card grid" id="grid"></div>
+  <pre id="out">loading…</pre>
+<script>
+(function () {
+  var EPS = 1e-9;
+  var cells;
+  function layer(theta, phi, L) { return { theta: theta, phi: phi, L: L }; }
+  function col(z, h, theta) {
+    return { z: z, h: h, layers: [layer(theta, 0.4, 0.3), layer(theta, 0.4, 0.3)] };
+  }
+  function mass(c) {
+    var s = c.h, i;
+    for (i = 0; i < c.layers.length; i++) s += c.layers[i].theta * c.layers[i].L;
+    return s;
+  }
+  function pore(c) {
+    var s = 0, i;
+    for (i = 0; i < c.layers.length; i++) {
+      var ly = c.layers[i];
+      s += Math.max(0, ly.phi - ly.theta) * ly.L;
+    }
+    return s;
+  }
+  function infiltrate(c) {
+    var rem = c.h, i;
+    for (i = 0; i < c.layers.length; i++) {
+      if (rem <= 0) break;
+      var ly = c.layers[i];
+      var cap = Math.max(0, ly.phi - ly.theta) * ly.L;
+      var fill = Math.min(rem, cap);
+      if (ly.L > 0) ly.theta += fill / ly.L;
+      rem -= fill;
+    }
+    c.h = rem;
+  }
+  function head(c) { return c.z + c.h; }
+  function runoff(arr) {
+    var n = arr.length;
+    var heads = [], depths = [], delta = [], i;
+    for (i = 0; i < n; i++) { heads.push(head(arr[i])); depths.push(arr[i].h); delta.push(0); }
+    for (i = 0; i < n; i++) {
+      if (depths[i] <= 0) continue;
+      var bestJ = -1, bestH = 0;
+      var nbrs = [];
+      if (i + 1 < n) nbrs.push(i + 1);
+      if (i - 1 >= 0) nbrs.push(i - 1);
+      var k;
+      for (k = 0; k < nbrs.length; k++) {
+        var j = nbrs[k];
+        if (heads[j] >= heads[i]) continue;
+        if (bestJ < 0 || heads[j] < bestH) { bestJ = j; bestH = heads[j]; }
+      }
+      if (bestJ >= 0) {
+        var vol = Math.min(depths[i], heads[i] - bestH);
+        if (vol > 0) { delta[i] -= vol; delta[bestJ] += vol; }
+      }
+    }
+    for (i = 0; i < n; i++) {
+      arr[i].h += delta[i];
+      if (arr[i].h < 0 && Math.abs(arr[i].h) <= EPS) arr[i].h = 0;
+    }
+  }
+  function tick() {
+    var i;
+    for (i = 0; i < cells.length; i++) infiltrate(cells[i]);
+    runoff(cells);
+  }
+  function slopeWorld() {
+    return [col(10, 0, 0.1), col(5, 0, 0.1), col(20, 0, 0.1)];
+  }
+  function names() { return ['High z=10', 'Low z=5', 'Ridge z=20']; }
+  function draw() {
+    var g = document.getElementById('grid');
+    var html = '', i, tot = 0;
+    for (i = 0; i < cells.length; i++) {
+      var c = cells[i];
+      tot += mass(c);
+      var pondPct = Math.min(50, (c.h / 0.5) * 50);
+      var ly = '';
+      var L;
+      for (L = 0; L < c.layers.length; L++) {
+        var wet = c.layers[L].phi > 0 ? (c.layers[L].theta / c.layers[L].phi) * 100 : 0;
+        ly += '<div class="layer"><div class="wet" style="width:' + wet + '%"></div><div class="empty" style="width:' + (100 - wet) + '%"></div></div>';
+      }
+      html += '<div class="cell"><h2>' + names()[i] + '</h2><div class="stack"><div class="pond" style="height:' + pondPct + '%"></div>' + ly + '</div></div>';
+    }
+    g.innerHTML = html;
+    var lines = ['grid M = ' + tot.toFixed(5)];
+    for (i = 0; i < cells.length; i++) {
+      var c2 = cells[i];
+      lines.push(names()[i] + '  h=' + c2.h.toFixed(4) + '  M=' + mass(c2).toFixed(4) + '  pore=' + pore(c2).toFixed(4));
+    }
+    lines.push(cells[2].h <= EPS && mass(cells[2]) - 0.1 * 0.3 * 2 < 1e-6 ? 'Ridge still dry of extra water (I4).' : 'Check ridge.');
+    document.getElementById('out').textContent = lines.join('\n');
+  }
+  function manyTicks(n) { var t; for (t = 0; t < n; t++) tick(); }
+  document.getElementById('reset').onclick = function () { cells = slopeWorld(); draw(); };
+  document.getElementById('tick').onclick = function () { tick(); draw(); };
+  document.getElementById('down').onclick = function () {
+    cells = slopeWorld();
+    cells[0].h += 0.35;
+    manyTicks(8);
+    draw();
+  };
+  document.getElementById('up').onclick = function () {
+    cells = slopeWorld();
+    cells[1].h += 0.25;
+    manyTicks(8);
+    draw();
+  };
+  document.getElementById('flat').onclick = function () {
+    cells = [col(5, 0.2, 0.35), col(5, 0.2, 0.35), col(5, 0.2, 0.35)];
+    manyTicks(4);
+    draw();
+  };
+  cells = slopeWorld();
+  draw();
+})();
+</script>
+</body>
+</html>
