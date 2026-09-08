@@ -1,13 +1,13 @@
 # Oracle RUNLOG
 
 ```
-sprint: S07
+sprint: S08
 result: green
-branch: feat/s07-shade
+branch: feat/s08-fidelity
 date: 2026-09-08 (PT)
 epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15; H_REST=0.02 m; V_REST=1e-4 m
-constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25
-invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7
+constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25; T_SETTLE=64
+invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -70,5 +70,11 @@ tests:
   - d7_wilt_no_shade
   - d7_uptake_unchanged
   - d7_ledger
-notes: S07 shade scales ET. Before ET: S=clamp(sum(alive.shade),0,1); E_open_eff=E_OPEN*(1-S); E_soil_eff=E_SOIL*(1-S); then S05 pond-first else top. Dead/wilted shade=0. PlantStub default shade 0.25 (was 0). Occupant uptake unchanged. Bare cells S=0 ⇒ S05-identical. Books: grid_mass+et_lost+extract_lost. S06 E_eff path kept; default shade flip activates reduction.
+  - d8_desert_sleeps_zero_awake
+  - d8_rain_wakes_neighbors
+  - d8_drought_wilt
+  - d8_rain_fills_then_plants
+  - d8_drought_matches_live_sinks
+  - d8_no_teleport_uphill
+notes: S08 awake set + catch_up. Explicit awake[] visit set for hydro; rain/add_water/add_occupant/set_column/flux-recv wake cell+4-nbrs; after hydro (and after live sinks) prune cells that are at_rest with all 4-nbrs at_rest. awake_count() query. tick = hydro_step + clock + optional ET/occupants (live sinks still scan all cells for S05-S07 cadence; losers re-enter awake). catch_up(K,rain): every cell h+=K*rain_per_step (wake if rain>0) -> settle hydro_step <= T_SETTLE=64 until awake_count==0 -> K unit ET+occupant steps (exact drought match) -> clock += K*N_ET. T_SETTLE exceeded leaves movers awake. Books: rain on grid; et_lost/extract_lost from batched sinks. Older D0-D7 names green.
 ```
