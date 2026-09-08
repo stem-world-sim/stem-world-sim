@@ -1,17 +1,25 @@
-//! Stem World Sim — Sprint 3.3.1 pond receiver cap (S03.3 sender caps + receiver room).
+//! Stem World Sim — Sprint 4 hydro rest (floors + sleep).
 //!
 //! Water mass (A = 1): M = h_surf + sum_i (theta_i * L_i)
 //! Grid mass: sum of column M.
 //! Tick order: rate-limited infiltrate → pond pass → percolate → lateral → clock.
-//! Pond: every lower-H 4-neighbor, weights ∝ ΔH, each edge ≤ R_MAX and ≤ 0.5 ΔH;
-//! donor-scale then receiver-cap so H_j after ≤ min donor snapshot H. Mass conserved.
-//! Unique-min-H chute revoked. Soil percolate/lateral stay S03.2. Capillary stays.
+//! Pond: every lower-H 4-neighbor with ΔH > H_REST, weights ∝ ΔH, each edge ≤ R_MAX
+//! and ≤ 0.5 ΔH; donor-scale then receiver-cap; drop V ≤ V_REST. Mass conserved.
+//! Soil percolate/lateral skip V ≤ V_REST. Infiltrate skips take ≤ V_REST.
+//! Sleeping cells (at_rest and all 4-nbrs at_rest) skip hydro as donors.
+//! Unique-min-H chute revoked. Capillary stays.
 
 /// Absolute / relative tolerance for water-mass comparisons (f64).
 pub const MASS_EPSILON: f64 = 1e-9;
 
 /// Max pond flux per edge per tick (metres water, A = 1). S03.3.
 pub const R_MAX: f64 = 0.15;
+
+/// Pond edge ignored if ΔH ≤ H_REST (metres). S04.
+pub const H_REST: f64 = 0.02;
+
+/// Soil / infiltrate / drain flux ignored if |V| ≤ V_REST (metres water). S04.
+pub const V_REST: f64 = 1e-4;
 
 /// Soil texture: porosity, field capacity, infiltrate and drain rate limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,9 +174,14 @@ impl Column {
 
     /// Rate-limited capacity-step infiltration (no clock).
     /// budget = min(h_surf, I_max); fill top-down into remaining pores.
-    fn infiltrate_step(&mut self) {
+    /// Skips if take ≤ V_REST. Returns depth moved (0 if skipped).
+    fn infiltrate_step(&mut self) -> f64 {
         let mut budget = self.surface_water_m.min(self.i_max());
+        if budget <= V_REST {
+            return 0.0;
+        }
         let mut remaining_surface = self.surface_water_m;
+        let mut moved = 0.0;
         for layer in &mut self.layers {
             if budget <= 0.0 {
                 break;
@@ -178,11 +191,21 @@ impl Column {
                 continue;
             }
             let fill = budget.min(capacity);
+            if fill <= V_REST {
+                // Tiny residual fill — stop rather than drip below floor.
+                break;
+            }
             layer.theta += fill / layer.thickness_m;
             budget -= fill;
             remaining_surface -= fill;
+            moved += fill;
         }
         self.surface_water_m = remaining_surface.max(0.0);
+        if moved <= V_REST {
+            // Should not happen if we filled, but treat sub-floor as idle.
+            return 0.0;
+        }
+        moved
     }
 
     /// Remove up to `amount` metres of mobile water (θ → θ_fc), top-down.
@@ -279,7 +302,7 @@ impl Column {
                         continue;
                     }
                     let take = available.min(can).min(budget);
-                    if take <= 0.0 {
+                    if take <= V_REST {
                         continue;
                     }
                     delta[k] -= take;
@@ -310,7 +333,7 @@ impl Column {
                         continue;
                     }
                     let take = available.min(can).min(budget);
-                    if take <= 0.0 {
+                    if take <= V_REST {
                         continue;
                     }
                     delta[k] -= take;
@@ -376,6 +399,7 @@ const NEIGHBOR_OFFSETS: [(i32, i32); 4] = [
 /// World / Sim: seed + clock + regular 4-neighbor grid of columns.
 /// S01 1-column world = grid 1×1; single-cell queries operate on (0,0).
 /// Default texture for unspecified layers: Sand.
+/// S04: `at_rest` tracks cells with no supra-floor hydro flux last tick.
 #[derive(Clone, Debug, PartialEq)]
 pub struct World {
     seed: u64,
@@ -384,6 +408,8 @@ pub struct World {
     height: usize,
     /// Row-major: index = y * width + x, y in [0, height), x in [0, width).
     columns: Vec<Column>,
+    /// Per-cell rest flag (updated end of each tick).
+    at_rest: Vec<bool>,
 }
 
 impl World {
@@ -395,6 +421,7 @@ impl World {
             width: 1,
             height: 1,
             columns: vec![column],
+            at_rest: vec![false],
         }
     }
 
@@ -406,12 +433,14 @@ impl World {
             width * height,
             "columns.len() must equal width * height"
         );
+        let n = columns.len();
         Self {
             seed,
             clock: Clock::new(),
             width,
             height,
             columns,
+            at_rest: vec![false; n],
         }
     }
 
@@ -423,6 +452,7 @@ impl World {
     pub fn set_column(&mut self, x: usize, y: usize, column: Column) {
         let i = self.idx(x, y);
         self.columns[i] = column;
+        self.at_rest[i] = false;
     }
 
     pub fn width(&self) -> usize {
@@ -520,7 +550,32 @@ impl World {
 
     pub fn add_rain_at(&mut self, x: usize, y: usize, r: f64) {
         debug_assert!(r >= 0.0, "rain depth must be non-negative");
-        self.column_at_mut(x, y).surface_water_m += r;
+        let i = self.idx(x, y);
+        self.columns[i].surface_water_m += r;
+        self.at_rest[i] = false;
+    }
+
+    /// Explicit surface-water add (wakes the cell). Alias semantics of rain for mass.
+    pub fn add_water(&mut self, amount: f64) {
+        self.add_water_at(0, 0, amount);
+    }
+
+    /// Explicit surface-water add at (x,y); clears at_rest on that cell.
+    pub fn add_water_at(&mut self, x: usize, y: usize, amount: f64) {
+        debug_assert!(amount >= 0.0, "water depth must be non-negative");
+        let i = self.idx(x, y);
+        self.columns[i].surface_water_m += amount;
+        self.at_rest[i] = false;
+    }
+
+    /// S04: true if cell had no supra-floor hydro flux last tick.
+    pub fn cell_at_rest(&self, x: usize, y: usize) -> bool {
+        self.at_rest[self.idx(x, y)]
+    }
+
+    /// S04: true when every cell is at_rest.
+    pub fn grid_at_rest(&self) -> bool {
+        self.at_rest.iter().all(|&r| r)
     }
 
     /// Grid water mass = sum of column M (I3).
@@ -535,12 +590,52 @@ impl World {
     }
 
     /// Full tick: infiltrate → pond pass (S03.3.1) → percolate → lateral; advances clock once.
+    /// S04: sleeping cells (at_rest and all 4-nbrs at_rest) skip hydro as donors.
     pub fn tick(&mut self) {
-        self.infiltrate_all();
-        self.pond_pass();
-        let percolated = self.percolate_all();
-        self.lateral_drain_pass(&percolated);
+        let n = self.columns.len();
+        let active = self.compute_active();
+        let mut busy = vec![false; n];
+
+        self.infiltrate_active(&active, &mut busy);
+        self.pond_pass(&active, &mut busy);
+        let percolated = self.percolate_active(&active, &mut busy);
+        self.lateral_drain_pass(&percolated, &active, &mut busy);
+
+        for i in 0..n {
+            self.at_rest[i] = !busy[i];
+        }
         self.clock.advance();
+    }
+
+    /// Active if !at_rest OR any 4-neighbor !at_rest (rule 5: sleep only when self
+    /// and every neighbor are at_rest). Conservative enough for rain-wake + lake sleep.
+    fn compute_active(&self) -> Vec<bool> {
+        let n = self.columns.len();
+        let mut active = vec![false; n];
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let i = y * self.width + x;
+                if !self.at_rest[i] {
+                    active[i] = true;
+                    continue;
+                }
+                let mut all_nbrs_rest = true;
+                for &(dx, dy) in &NEIGHBOR_OFFSETS {
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    if nx < 0 || ny < 0 || nx as usize >= self.width || ny as usize >= self.height {
+                        continue;
+                    }
+                    let j = ny as usize * self.width + nx as usize;
+                    if !self.at_rest[j] {
+                        all_nbrs_rest = false;
+                        break;
+                    }
+                }
+                active[i] = !all_nbrs_rest;
+            }
+        }
+        active
     }
 
     /// Tick until every column is quiescent (surface dry or saturated).
@@ -586,15 +681,29 @@ impl World {
 
     fn infiltrate_all(&mut self) {
         for col in &mut self.columns {
-            col.infiltrate_step();
+            let _ = col.infiltrate_step();
         }
     }
 
-    /// Simultaneous pond pass (S03.3 + S03.3.1 receiver cap):
-    /// Snapshot H and h. Candidate V_ij = min(h_i w_ij, 0.5 ΔH_ij, R_MAX); donor-scale if ΣV > h_i.
+    fn infiltrate_active(&mut self, active: &[bool], busy: &mut [bool]) {
+        for (i, col) in self.columns.iter_mut().enumerate() {
+            if !active[i] {
+                continue;
+            }
+            let moved = col.infiltrate_step();
+            if moved > V_REST {
+                busy[i] = true;
+            }
+        }
+    }
+
+    /// Simultaneous pond pass (S03.3 + S03.3.1 receiver cap + S04 floors):
+    /// Snapshot H and h. Drop edges with ΔH ≤ H_REST before weights.
+    /// Candidate V_ij = min(h_i w_ij, 0.5 ΔH_ij, R_MAX); donor-scale if ΣV > h_i.
     /// Then receiver cap: for each j, room = max(0, min(donor H) − H_j); if In > room scale by room/In.
+    /// After all scales, drop V ≤ V_REST. Only active cells donate; receivers may be sleeping.
     /// Apply after both caps. Equal H ⇒ no flux. Closed boundary.
-    fn pond_pass(&mut self) {
+    fn pond_pass(&mut self, active: &[bool], busy: &mut [bool]) {
         let n = self.columns.len();
         if n == 0 {
             return;
@@ -613,13 +722,16 @@ impl World {
         for y in 0..self.height {
             for x in 0..self.width {
                 let i = y * self.width + x;
+                if !active[i] {
+                    continue;
+                }
                 let h_i = depths[i];
                 if h_i <= 0.0 {
                     continue;
                 }
                 let h_head = heads[i];
 
-                // Every 4-neighbor with strictly lower H (no unique-min-H).
+                // Every 4-neighbor with ΔH > H_REST (strictly lower H by more than floor).
                 let mut lower: Vec<(usize, f64)> = Vec::new();
                 for &(dx, dy) in &NEIGHBOR_OFFSETS {
                     let nx = x as i32 + dx;
@@ -631,7 +743,7 @@ impl World {
                     let h_nbr = heads[j];
                     if h_nbr < h_head {
                         let d_h = h_head - h_nbr;
-                        if d_h > 0.0 {
+                        if d_h > H_REST {
                             lower.push((j, d_h));
                         }
                     }
@@ -672,7 +784,6 @@ impl World {
         }
 
         // S03.3.1 receiver cap: H_j after ≤ every donor snapshot H that sent to j.
-        // Group edge indices by receiver.
         let mut incoming: Vec<Vec<usize>> = vec![Vec::new(); n];
         for (eidx, &(_i, j, _v)) in edges.iter().enumerate() {
             incoming[j].push(eidx);
@@ -699,15 +810,22 @@ impl World {
             }
         }
 
+        // S04: after all scales, drop V ≤ V_REST (treat as 0).
         let mut delta = vec![0.0f64; n];
         for (i, j, v) in edges {
-            if v > 0.0 {
-                delta[i] -= v;
-                delta[j] += v;
+            if v <= V_REST {
+                continue;
             }
+            delta[i] -= v;
+            delta[j] += v;
+            busy[i] = true;
+            busy[j] = true;
         }
 
         for (col, d) in self.columns.iter_mut().zip(delta.iter()) {
+            if *d == 0.0 {
+                continue;
+            }
             col.surface_water_m += *d;
             // Numerical guard: never go negative from fp noise.
             if col.surface_water_m < 0.0 && col.surface_water_m.abs() <= MASS_EPSILON {
@@ -716,13 +834,21 @@ impl World {
         }
     }
 
-    /// S03.2: percolate every column (profile-first), apply immediately.
-    /// Returns per-column volume percolated (for shared D_max with lateral).
-    fn percolate_all(&mut self) -> Vec<f64> {
-        self.columns
-            .iter_mut()
-            .map(Column::percolate_step)
-            .collect()
+    /// S04: percolate only active columns; mark busy if moved > V_REST.
+    fn percolate_active(&mut self, active: &[bool], busy: &mut [bool]) -> Vec<f64> {
+        let n = self.columns.len();
+        let mut out = vec![0.0f64; n];
+        for i in 0..n {
+            if !active[i] {
+                continue;
+            }
+            let moved = self.columns[i].percolate_step();
+            out[i] = moved;
+            if moved > V_REST {
+                busy[i] = true;
+            }
+        }
+        out
     }
 
     /// Lateral / downhill drain on leftover mobile m after percolate (S03.2).
@@ -732,7 +858,7 @@ impl World {
     /// If any lower-z: targets at min_z; equal split of leftover m, each ≤ contact.
     /// Else flat: half-diff of leftover m, ≤ contact; total ≤ leftover m and remaining D.
     /// Receiver: soil top-down (overflow past φ → surface). Capillary does not move.
-    fn lateral_drain_pass(&mut self, percolated: &[f64]) {
+    fn lateral_drain_pass(&mut self, percolated: &[f64], active: &[bool], busy: &mut [bool]) {
         let n = self.columns.len();
         if n == 0 {
             return;
@@ -752,8 +878,11 @@ impl World {
         for y in 0..self.height {
             for x in 0..self.width {
                 let i = y * self.width + x;
+                if !active[i] {
+                    continue;
+                }
                 let m_i = mobiles[i];
-                if m_i <= 0.0 {
+                if m_i <= V_REST {
                     continue;
                 }
                 let d_i = d_maxes[i];
@@ -800,7 +929,7 @@ impl World {
                         // Contact: min(donor remaining D, neighbor D_max).
                         let contact = d_rem.min(d_maxes[j]);
                         let v_j = equal_share.min(contact);
-                        if v_j > 0.0 {
+                        if v_j > V_REST {
                             planned.push((j, v_j));
                             total += v_j;
                         }
@@ -812,7 +941,7 @@ impl World {
                     let scale = if total > cap { cap / total } else { 1.0 };
                     for (j, v_j) in planned {
                         let v = v_j * scale;
-                        if v > 0.0 {
+                        if v > V_REST {
                             transfers.push((i, j, v));
                         }
                     }
@@ -822,7 +951,7 @@ impl World {
                     for (j, m_nbr) in equal_poorer {
                         let contact = d_rem.min(d_maxes[j]);
                         let v_j = contact.min(0.5 * (m_i - m_nbr));
-                        if v_j > 0.0 {
+                        if v_j > V_REST {
                             planned.push((j, v_j));
                             total += v_j;
                         }
@@ -834,7 +963,7 @@ impl World {
                     let scale = if total > cap { cap / total } else { 1.0 };
                     for (j, v_j) in planned {
                         let v = v_j * scale;
-                        if v > 0.0 {
+                        if v > V_REST {
                             transfers.push((i, j, v));
                         }
                     }
@@ -846,17 +975,22 @@ impl World {
         let mut soil_add = vec![0.0f64; n];
 
         for (from, to, amount) in transfers {
+            if amount <= V_REST {
+                continue;
+            }
             remove_amt[from] += amount;
             soil_add[to] += amount;
+            busy[from] = true;
+            busy[to] = true;
         }
 
         for i in 0..n {
-            if remove_amt[i] > 0.0 {
+            if remove_amt[i] > V_REST {
                 self.columns[i].remove_mobile_water(remove_amt[i]);
             }
         }
         for i in 0..n {
-            if soil_add[i] > 0.0 {
+            if soil_add[i] > V_REST {
                 // add_soil_water fills top-down; overflow past φ → surface.
                 self.columns[i].add_soil_water(soil_add[i]);
             }

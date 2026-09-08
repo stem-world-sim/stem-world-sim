@@ -1,12 +1,12 @@
 # Oracle RUNLOG
 
 ```
-sprint: S03.3.1
+sprint: S04
 result: green
-branch: feat/s03.3.1-pond-receiver-cap
+branch: feat/s04-hydro-rest
 date: 2026-09-08 (PT)
-epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15 m/edge/tick
-invariants encoded: I1, I2, I3, I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 (pond receiver cap)
+epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15; H_REST=0.02 m; V_REST=1e-4 m
+invariants encoded: I1, I2, I3, I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 (hydro rest)
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -41,5 +41,9 @@ tests:
   - d33_equal_H_no_flux
   - d331_multi_donor_no_head_inversion
   - d331_drowned_lake_no_period2
-notes: Keep S03.3 candidate V_ij=min(h_i w_ij, 0.5 ΔH, R_MAX) and donor scale if ΣV>h_i. NEW receiver cap after donor scale: for each j, In=sum incoming; room=max(0, min(donor snapshot H)-H_j); if In>room scale edges by room/In. Simultaneous apply. H_j after <= every donor snapshot H that sent to j. Mass conserved (scale only reduces). Soil percolate/lateral/infiltrate unchanged. Tick: infiltrate -> pond -> percolate -> lateral. d331_multi_donor: 1x3 unequal donors into mid; d331_drowned_lake: loam near-equal H 8.37 vs 8.38, no late period-2.
+  - d4_pond_below_H_rest_no_flux
+  - d4_drowned_lake_reaches_rest
+  - d4_rain_wakes_rest
+  - d4_closed_mass_still_conserved
+notes: H_REST=0.02 drop pond edges before weights; after donor+receiver scale drop V≤V_REST. Soil percolate/lateral skip V≤V_REST; infiltrate skip take≤V_REST. at_rest per cell end of tick if no supra-floor flux (pond/soil/infiltrate) as sender or receiver. Sleep next tick if self and all 4-nbrs at_rest (skip infiltrate/pond/drain as donors). Wake on add_rain/add_water (clears at_rest) or any non-rest neighbor. Queries cell_at_rest/grid_at_rest (I6). Mass conserved; no sinks. d331 near-eq assert bumped to ≤H_REST band (deadband). Tick order unchanged.
 ```

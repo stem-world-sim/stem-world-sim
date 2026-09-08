@@ -4,7 +4,7 @@
 //! Cell area A = 1. Column water mass M = h_surf + sum(theta_i * L_i).
 //! Grid mass: sum of column M.
 
-use sim_core::{Column, SoilLayer, Texture, World, MASS_EPSILON, R_MAX};
+use sim_core::{Column, SoilLayer, Texture, World, H_REST, MASS_EPSILON, R_MAX, V_REST};
 
 fn assert_mass_close(actual: f64, expected: f64) {
     let scale = expected.abs().max(1.0);
@@ -147,6 +147,9 @@ fn i6_queries_are_kernel_methods() {
     let surf = world.surface_water_m();
     let thetas = world.layer_thetas();
     let pore = world.remaining_pore_capacity_m();
+    // S04 rest queries are also kernel methods.
+    let _cell_rest = world.cell_at_rest(0, 0);
+    let _grid_rest = world.grid_at_rest();
 
     assert!(mass >= 0.0);
     assert!(surf >= 0.0);
@@ -1186,22 +1189,23 @@ fn d331_multi_donor_no_head_inversion() {
 }
 
 /// D331: drowned lake that used to period-2 bounce — 1×2 near-equal H
-/// (high H≈8.37 vs valley H≈8.38) plus multi-donor A–V–B unequal donors.
-/// Empty soil ⇒ pond-only. After many ticks |H| gap shrinks; last |Δh| small.
+/// plus multi-donor A–V–B unequal donors. Empty soil ⇒ pond-only.
+/// S04: pond stops at H_REST, so final |ΔH| ≤ H_REST (not bit-equal).
 #[test]
 fn d331_drowned_lake_no_period2() {
-    // Critic-style near-equal heads on 1×2 (empty layers = pond-only).
-    // high: z=8 h=0.37 → H=8.37; valley: z=0 h=8.38 → H=8.38.
+    // Critic-style heads on 1×2 (empty layers = pond-only).
+    // Start ΔH > H_REST so pond moves, then deadband freezes.
+    // high: z=8 h=0.50 → H=8.50; valley: z=0 h=8.20 → H=8.20; ΔH=0.30.
     let cols_pair = vec![
-        Column::new(8.0, 0.37, vec![]),
-        Column::new(0.0, 8.38, vec![]),
+        Column::new(8.0, 0.50, vec![]),
+        Column::new(0.0, 8.20, vec![]),
     ];
     let mut world = World::grid(3312, 2, 1, cols_pair);
     let m0 = world.grid_water_mass();
     let dh0 = (world.column_at(0, 0).head() - world.column_at(1, 0).head()).abs();
-    assert!(dh0 > MASS_EPSILON, "start with a small head gap");
+    assert!(dh0 > H_REST, "start with head gap above H_REST");
 
-    let n = 30usize;
+    let n = 40usize;
     let mut h_hist: Vec<(f64, f64)> = Vec::with_capacity(n + 1);
     h_hist.push((
         world.surface_water_m_at(0, 0),
@@ -1219,8 +1223,12 @@ fn d331_drowned_lake_no_period2() {
 
     let dh_final = (world.column_at(0, 0).head() - world.column_at(1, 0).head()).abs();
     assert!(
-        dh_final < 1e-4,
-        "1×2 heads should equalize: |ΔH|={dh_final} (start was {dh0})"
+        dh_final <= H_REST + MASS_EPSILON,
+        "1×2 heads should reach H_REST band: |ΔH|={dh_final} (start was {dh0}, H_REST={H_REST})"
+    );
+    assert!(
+        dh_final < dh0 - 1e-4,
+        "1×2 |ΔH| should shrink: start={dh0}, end={dh_final}"
     );
     assert!(h_hist.len() >= 6);
     for k in (h_hist.len() - 5)..h_hist.len() {
@@ -1265,4 +1273,157 @@ fn d331_drowned_lake_no_period2() {
             "A–V–B last ticks: |Δh_V|={dv} not < 1e-3 (tick {k}) — period-2?"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 4 — hydro rest (H_REST / V_REST floors + sleep)
+// ---------------------------------------------------------------------------
+
+/// D4: two cells with ΔH = 0.01 ≤ H_REST; after one tick both h unchanged.
+#[test]
+#[allow(non_snake_case)]
+fn d4_pond_below_H_rest_no_flux() {
+    // Empty soil ⇒ pond-only. Same z; ΔH = 0.01 ≤ H_REST=0.02.
+    let cols = vec![
+        Column::new(0.0, 0.11, vec![]),
+        Column::new(0.0, 0.10, vec![]),
+    ];
+    let mut world = World::grid(401, 2, 1, cols);
+    let h_a0 = world.surface_water_m_at(0, 0);
+    let h_b0 = world.surface_water_m_at(1, 0);
+    let dh = (world.column_at(0, 0).head() - world.column_at(1, 0).head()).abs();
+    assert!((dh - 0.01).abs() < 1e-12, "ΔH should be 0.01, got {dh}");
+    assert!(dh <= H_REST);
+
+    world.tick();
+
+    assert_approx_eq(world.surface_water_m_at(0, 0), h_a0, "h_a unchanged below H_REST");
+    assert_approx_eq(world.surface_water_m_at(1, 0), h_b0, "h_b unchanged below H_REST");
+}
+
+/// D4: 2×3 drowned lake like critic; ≤100 ticks → grid_at_rest; then h frozen.
+#[test]
+fn d4_drowned_lake_reaches_rest() {
+    // 3×2 critic layout: valley z=2, high z=8. Empty soil ⇒ pond-only (soil m already
+    // "frozen"); near-equal H around 8.15–8.25 equalizes into H_REST band then sleeps.
+    let mk = |z: f64, h: f64| Column::new(z, h, vec![]);
+    // Row-major y=0 valley, y=1 highland. Slight H spread like critic 8.11–8.21.
+    let cols = vec![
+        mk(2.0, 6.20), // (0,0) H=8.20
+        mk(2.0, 6.18), // (1,0) H=8.18
+        mk(2.0, 6.22), // (2,0) H=8.22
+        mk(8.0, 0.25), // (0,1) H=8.25
+        mk(8.0, 0.15), // (1,1) H=8.15
+        mk(8.0, 0.21), // (2,1) H=8.21
+    ];
+    let mut world = World::grid(404, 3, 2, cols);
+    let m0 = world.grid_water_mass();
+
+    let mut reached = false;
+    let mut n_rest = 0usize;
+    for n in 1..=100 {
+        world.tick();
+        assert_mass_close(world.grid_water_mass(), m0);
+        if world.grid_at_rest() {
+            reached = true;
+            n_rest = n;
+            break;
+        }
+    }
+    if !reached {
+        let mut heads = Vec::new();
+        for y in 0..2 {
+            for x in 0..3 {
+                heads.push(world.column_at(x, y).head());
+            }
+        }
+        panic!("grid_at_rest() should be true within 100 ticks; last heads: {heads:?}");
+    }
+
+    let mut h_snap = Vec::new();
+    for y in 0..2 {
+        for x in 0..3 {
+            h_snap.push(world.surface_water_m_at(x, y));
+        }
+    }
+
+    for _ in 0..10 {
+        world.tick();
+        assert_mass_close(world.grid_water_mass(), m0);
+        assert!(world.grid_at_rest(), "must stay at rest once reached (after {n_rest} ticks)");
+    }
+
+    let mut i = 0usize;
+    for y in 0..2 {
+        for x in 0..3 {
+            let b = world.surface_water_m_at(x, y);
+            let a = h_snap[i];
+            assert!(
+                (a - b).abs() <= MASS_EPSILON,
+                "h frozen after rest: cell {i} {a} → {b}"
+            );
+            i += 1;
+        }
+    }
+}
+
+/// D4: rest grid; add rain one cell; that cell not at_rest after wake tick.
+#[test]
+fn d4_rain_wakes_rest() {
+    // Flat saturated sand, equal ponds → immediately rests after a tick or two.
+    let z = 0.0;
+    let h = 0.10;
+    let cols = vec![
+        saturated_column(z, h),
+        saturated_column(z, h),
+        saturated_column(z, h),
+        saturated_column(z, h),
+    ];
+    let mut world = World::grid(405, 2, 2, cols);
+    for _ in 0..8 {
+        world.tick();
+    }
+    assert!(
+        world.grid_at_rest(),
+        "equal-H saturated grid should be at rest"
+    );
+
+    world.add_rain_at(0, 0, 0.05);
+    assert!(
+        !world.cell_at_rest(0, 0),
+        "add_rain must clear at_rest immediately"
+    );
+
+    world.tick(); // wake tick
+    assert!(
+        !world.cell_at_rest(0, 0),
+        "rained cell must not be at_rest after wake tick"
+    );
+}
+
+/// D4: rest path still conserves closed-grid mass (I3).
+#[test]
+fn d4_closed_mass_still_conserved() {
+    let cols = vec![
+        saturated_column(10.0, 0.0),
+        saturated_column(5.0, 0.0),
+        saturated_column(10.0, 0.0),
+        saturated_column(5.0, 0.0),
+    ];
+    let mut world = World::grid(406, 2, 2, cols);
+    let r = 0.35;
+    world.add_rain_at(0, 0, r);
+    let m0 = world.grid_water_mass();
+
+    for _ in 0..64 {
+        world.tick();
+        assert_mass_close(world.grid_water_mass(), m0);
+    }
+    // Drive toward rest and keep checking mass.
+    for _ in 0..64 {
+        world.tick();
+        assert_mass_close(world.grid_water_mass(), m0);
+    }
+    assert_mass_close(world.grid_water_mass(), m0);
+    let _ = V_REST; // floor is part of the rest path under test
 }
