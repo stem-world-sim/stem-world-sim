@@ -1,14 +1,16 @@
-//! Stem World Sim — Sprint 4.1 lake snap (soil pore-room + hydrostatic snap).
+//! Stem World Sim — Sprint 5 batched evaporation (closed basin).
 //!
 //! Water mass (A = 1): M = h_surf + sum_i (theta_i * L_i)
-//! Grid mass: sum of column M.
-//! Tick order: infiltrate → pond → soil (percolate+lateral) → lake_snap → at_rest/sleep.
+//! Grid mass: sum of column M. Closed basin: M + et_lost() == mass ever added.
+//! Tick order: infiltrate → pond → soil → lake_snap → at_rest; advance clock;
+//! if clock.tick % N_ET == 0: ET → lake_snap → rest again.
 //! Pond: every lower-H 4-neighbor with ΔH > H_REST, weights ∝ ΔH, each edge ≤ R_MAX
 //! and ≤ 0.5 ΔH; donor-scale then receiver-cap; drop V ≤ V_REST. Mass conserved.
 //! Soil percolate/lateral: V = min(old cap, unused pore room on receiver); unused=0 ⇒ V=0;
 //! blocked volume is NOT converted into pond inside the soil pass.
 //! Lake snap: 4-connected components with h > V_REST and intra |ΔH| ≤ H_REST snap to
 //! mean H* with Σh conserved; mark snapped cells at_rest. S04 sleep kept.
+//! ET: pond first (E_OPEN) else top-layer soil (E_SOIL, may go below θ_fc); skip ≤ V_REST.
 //! Unique-min-H chute revoked. Capillary stays.
 
 /// Absolute / relative tolerance for water-mass comparisons (f64).
@@ -22,6 +24,15 @@ pub const H_REST: f64 = 0.02;
 
 /// Soil / infiltrate / drain flux ignored if |V| ≤ V_REST (metres water). S04.
 pub const V_REST: f64 = 1e-4;
+
+/// Pond evaporation depth per ET-step (metres). S05.
+pub const E_OPEN: f64 = 0.02;
+
+/// Top-layer soil evaporation depth per ET-step (metres water). S05.
+pub const E_SOIL: f64 = 0.005;
+
+/// ET-step cadence: run evaporation when clock.tick % N_ET == 0 after advance. S05.
+pub const N_ET: u64 = 10;
 
 /// Soil texture: porosity, field capacity, infiltrate and drain rate limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -439,6 +450,8 @@ pub struct World {
     columns: Vec<Column>,
     /// Per-cell rest flag (updated end of each tick).
     at_rest: Vec<bool>,
+    /// Cumulative water depth evaporated (A = 1); closed-basin sink. S05.
+    et_lost: f64,
 }
 
 impl World {
@@ -451,6 +464,7 @@ impl World {
             height: 1,
             columns: vec![column],
             at_rest: vec![false],
+            et_lost: 0.0,
         }
     }
 
@@ -470,6 +484,7 @@ impl World {
             height,
             columns,
             at_rest: vec![false; n],
+            et_lost: 0.0,
         }
     }
 
@@ -612,15 +627,23 @@ impl World {
         self.columns.iter().map(Column::water_mass).sum()
     }
 
+    /// Cumulative ET sink (metres water, A = 1). I3: grid_water_mass() + et_lost()
+    /// equals mass ever added (initial + rain/additions).
+    pub fn et_lost(&self) -> f64 {
+        self.et_lost
+    }
+
     /// Infiltrate every column (rate-limited); no runoff/drain; advances clock.
     pub fn tick_infiltration(&mut self) {
         self.infiltrate_all();
         self.clock.advance();
     }
 
-    /// Full tick: infiltrate → pond → soil (percolate+lateral) → lake_snap → at_rest.
+    /// Full tick: infiltrate → pond → soil → lake_snap → at_rest; advance clock;
+    /// if clock.tick % N_ET == 0: ET → lake_snap → rest again (S05).
     /// S04: sleeping cells (at_rest and all 4-nbrs at_rest) skip hydro as donors.
     /// S04.1: soil flux capped by unused pore room; lake snap after soil.
+    /// S05: ET cadence is after advance; ticks 10,20,… run one ET-step (E*1, not E*N_ET).
     pub fn tick(&mut self) {
         let n = self.columns.len();
         let active = self.compute_active();
@@ -638,6 +661,16 @@ impl World {
             self.at_rest[i] = !busy[i];
         }
         self.clock.advance();
+
+        // S05 batched ET: after advance, when tick is a multiple of N_ET.
+        if self.clock.tick % N_ET == 0 {
+            let mut et_busy = vec![false; n];
+            self.et_pass(&mut et_busy);
+            self.lake_snap();
+            for i in 0..n {
+                self.at_rest[i] = !et_busy[i];
+            }
+        }
     }
 
     /// Active if !at_rest OR any 4-neighbor !at_rest (rule 5: sleep only when self
@@ -1058,6 +1091,40 @@ impl World {
                 // matched the scaled V); mass error is sub-ε after clamp.
                 let _ = placed;
             }
+        }
+    }
+
+    /// S05 batched evaporation: one ET-step (E*1). Pond first if h>0, else top soil.
+    /// Skip take ≤ V_REST. Wakes cells that lose > V_REST via `busy`.
+    fn et_pass(&mut self, busy: &mut [bool]) {
+        let n = self.columns.len();
+        for i in 0..n {
+            let take = {
+                let col = &self.columns[i];
+                if col.surface_water_m > 0.0 {
+                    col.surface_water_m.min(E_OPEN)
+                } else if let Some(top) = col.layers.first() {
+                    (top.theta * top.thickness_m).min(E_SOIL)
+                } else {
+                    0.0
+                }
+            };
+            if take <= V_REST {
+                continue;
+            }
+            busy[i] = true;
+            let col = &mut self.columns[i];
+            if col.surface_water_m > 0.0 {
+                col.surface_water_m = (col.surface_water_m - take).max(0.0);
+            } else if let Some(top) = col.layers.first_mut() {
+                let mass = (top.theta * top.thickness_m - take).max(0.0);
+                top.theta = if top.thickness_m > 0.0 {
+                    mass / top.thickness_m
+                } else {
+                    0.0
+                };
+            }
+            self.et_lost += take;
         }
     }
 
