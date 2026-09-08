@@ -1145,3 +1145,124 @@ fn d33_equal_H_no_flux() {
     assert_approx_eq(world.surface_water_m_at(0, 0), h_a0, "no net pond move A");
     assert_approx_eq(world.surface_water_m_at(1, 0), h_b0, "no net pond move B");
 }
+
+// ---------------------------------------------------------------------------
+// Sprint 3.3.1 — pond receiver cap (ε = MASS_EPSILON; R_MAX = 0.15)
+// Donor scale first, then receiver room = max(0, min(donor H) − H_j).
+// ---------------------------------------------------------------------------
+
+/// D331: 1×3 same-z; unequal donors A,B into empty mid R; after 1 tick
+/// H_R ≤ min(donor snapshot H); no head inversion past either donor.
+#[test]
+fn d331_multi_donor_no_head_inversion() {
+    // Empty layers ⇒ pond-only (no infiltrate / soil drain).
+    // A: h=0.40 H=0.40; R: h=0 H=0; B: h=0.25 H=0.25.
+    // Without receiver cap In≈0.275 > room=0.25 ⇒ H_R would pass min donor H.
+    let cols = vec![
+        Column::new(0.0, 0.40, vec![]), // A donor
+        Column::new(0.0, 0.0, vec![]),  // R receiver
+        Column::new(0.0, 0.25, vec![]), // B donor (lower H)
+    ];
+    let mut world = World::grid(3311, 3, 1, cols);
+    let m0 = world.grid_water_mass();
+    let h_a0 = world.column_at(0, 0).head();
+    let h_b0 = world.column_at(2, 0).head();
+    let min_donor_h = h_a0.min(h_b0);
+    assert!(h_a0 > world.column_at(1, 0).head());
+    assert!(h_b0 > world.column_at(1, 0).head());
+
+    world.tick();
+    assert_mass_close(world.grid_water_mass(), m0);
+
+    let h_r = world.column_at(1, 0).head();
+    assert!(
+        h_r <= min_donor_h + MASS_EPSILON,
+        "receiver H={h_r} must be ≤ min donor snapshot H={min_donor_h} (no head inversion)"
+    );
+    assert!(
+        world.surface_water_m_at(1, 0) > MASS_EPSILON,
+        "receiver should receive some pond"
+    );
+}
+
+/// D331: drowned lake that used to period-2 bounce — 1×2 near-equal H
+/// (high H≈8.37 vs valley H≈8.38) plus multi-donor A–V–B unequal donors.
+/// Empty soil ⇒ pond-only. After many ticks |H| gap shrinks; last |Δh| small.
+#[test]
+fn d331_drowned_lake_no_period2() {
+    // Critic-style near-equal heads on 1×2 (empty layers = pond-only).
+    // high: z=8 h=0.37 → H=8.37; valley: z=0 h=8.38 → H=8.38.
+    let cols_pair = vec![
+        Column::new(8.0, 0.37, vec![]),
+        Column::new(0.0, 8.38, vec![]),
+    ];
+    let mut world = World::grid(3312, 2, 1, cols_pair);
+    let m0 = world.grid_water_mass();
+    let dh0 = (world.column_at(0, 0).head() - world.column_at(1, 0).head()).abs();
+    assert!(dh0 > MASS_EPSILON, "start with a small head gap");
+
+    let n = 30usize;
+    let mut h_hist: Vec<(f64, f64)> = Vec::with_capacity(n + 1);
+    h_hist.push((
+        world.surface_water_m_at(0, 0),
+        world.surface_water_m_at(1, 0),
+    ));
+
+    for _ in 0..n {
+        world.tick();
+        assert_mass_close(world.grid_water_mass(), m0);
+        h_hist.push((
+            world.surface_water_m_at(0, 0),
+            world.surface_water_m_at(1, 0),
+        ));
+    }
+
+    let dh_final = (world.column_at(0, 0).head() - world.column_at(1, 0).head()).abs();
+    assert!(
+        dh_final < 1e-4,
+        "1×2 heads should equalize: |ΔH|={dh_final} (start was {dh0})"
+    );
+    assert!(h_hist.len() >= 6);
+    for k in (h_hist.len() - 5)..h_hist.len() {
+        let (ha0, hb0) = h_hist[k - 1];
+        let (ha1, hb1) = h_hist[k];
+        assert!(
+            (ha1 - ha0).abs() < 1e-4,
+            "last ticks: |Δh_high| not < 1e-4 (tick {k}) — period-2?"
+        );
+        assert!(
+            (hb1 - hb0).abs() < 1e-4,
+            "last ticks: |Δh_valley| not < 1e-4 (tick {k}) — period-2?"
+        );
+    }
+
+    // Multi-donor drowned A–V–B with unequal high ponds (receiver-cap case).
+    // Without cap, mid overshoots min donor H and period-2 bounces.
+    let cols3 = vec![
+        Column::new(8.0, 0.50, vec![]), // A H=8.50
+        Column::new(0.0, 8.20, vec![]), // V H=8.20
+        Column::new(8.0, 0.30, vec![]), // B H=8.30 (lower donor)
+    ];
+    let mut w3 = World::grid(3313, 3, 1, cols3);
+    let m3 = w3.grid_water_mass();
+    let dh3_0 = (w3.column_at(0, 0).head() - w3.column_at(1, 0).head()).abs();
+    let mut v_hist = Vec::with_capacity(41);
+    v_hist.push(w3.surface_water_m_at(1, 0));
+    for _ in 0..40 {
+        w3.tick();
+        assert_mass_close(w3.grid_water_mass(), m3);
+        v_hist.push(w3.surface_water_m_at(1, 0));
+    }
+    let dh3 = (w3.column_at(0, 0).head() - w3.column_at(1, 0).head()).abs();
+    assert!(
+        dh3 < dh3_0 - 1e-4,
+        "A–V–B |H| gap should shrink: start={dh3_0}, end={dh3}"
+    );
+    for k in (v_hist.len() - 5)..v_hist.len() {
+        let dv = (v_hist[k] - v_hist[k - 1]).abs();
+        assert!(
+            dv < 1e-3,
+            "A–V–B last ticks: |Δh_V|={dv} not < 1e-3 (tick {k}) — period-2?"
+        );
+    }
+}

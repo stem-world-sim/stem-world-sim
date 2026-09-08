@@ -1,9 +1,10 @@
-//! Stem World Sim — Sprint 3.3 pond head + R_max (profile-first soil unchanged).
+//! Stem World Sim — Sprint 3.3.1 pond receiver cap (S03.3 sender caps + receiver room).
 //!
 //! Water mass (A = 1): M = h_surf + sum_i (theta_i * L_i)
 //! Grid mass: sum of column M.
 //! Tick order: rate-limited infiltrate → pond pass → percolate → lateral → clock.
-//! Pond: every lower-H 4-neighbor, weights ∝ ΔH, each edge ≤ R_MAX and ≤ 0.5 ΔH.
+//! Pond: every lower-H 4-neighbor, weights ∝ ΔH, each edge ≤ R_MAX and ≤ 0.5 ΔH;
+//! donor-scale then receiver-cap so H_j after ≤ min donor snapshot H. Mass conserved.
 //! Unique-min-H chute revoked. Soil percolate/lateral stay S03.2. Capillary stays.
 
 /// Absolute / relative tolerance for water-mass comparisons (f64).
@@ -533,7 +534,7 @@ impl World {
         self.clock.advance();
     }
 
-    /// Full tick: infiltrate → pond pass (S03.3) → percolate → lateral; advances clock once.
+    /// Full tick: infiltrate → pond pass (S03.3.1) → percolate → lateral; advances clock once.
     pub fn tick(&mut self) {
         self.infiltrate_all();
         self.pond_pass();
@@ -589,9 +590,10 @@ impl World {
         }
     }
 
-    /// Simultaneous pond pass (S03.3): snapshot heads/depths, accumulate deltas, apply.
-    /// Every lower-H 4-neighbor gets weight ∝ ΔH; each edge ≤ R_MAX and ≤ 0.5 ΔH.
-    /// Unique-min-H chute revoked. Equal H ⇒ no flux. Closed boundary.
+    /// Simultaneous pond pass (S03.3 + S03.3.1 receiver cap):
+    /// Snapshot H and h. Candidate V_ij = min(h_i w_ij, 0.5 ΔH_ij, R_MAX); donor-scale if ΣV > h_i.
+    /// Then receiver cap: for each j, room = max(0, min(donor H) − H_j); if In > room scale by room/In.
+    /// Apply after both caps. Equal H ⇒ no flux. Closed boundary.
     fn pond_pass(&mut self) {
         let n = self.columns.len();
         if n == 0 {
@@ -604,7 +606,9 @@ impl World {
             .iter()
             .map(|c| c.surface_water_m)
             .collect();
-        let mut delta = vec![0.0f64; n];
+
+        // Edges after donor scale: (from, to, volume).
+        let mut edges: Vec<(usize, usize, f64)> = Vec::new();
 
         for y in 0..self.height {
             for x in 0..self.width {
@@ -656,17 +660,50 @@ impl World {
                     continue;
                 }
 
-                // If Σ V_j > h_i, scale all V_j by h_i / Σ V_j.
+                // Donor scale: if Σ V_j > h_i, scale all V_j by h_i / Σ V_j.
                 let scale = if sum_v > h_i { h_i / sum_v } else { 1.0 };
-                let mut total_out = 0.0;
                 for &(j, v_j) in &sends {
                     let v = v_j * scale;
                     if v > 0.0 {
-                        delta[j] += v;
-                        total_out += v;
+                        edges.push((i, j, v));
                     }
                 }
-                delta[i] -= total_out;
+            }
+        }
+
+        // S03.3.1 receiver cap: H_j after ≤ every donor snapshot H that sent to j.
+        // Group edge indices by receiver.
+        let mut incoming: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (eidx, &(_i, j, _v)) in edges.iter().enumerate() {
+            incoming[j].push(eidx);
+        }
+        for j in 0..n {
+            let idxs = &incoming[j];
+            if idxs.is_empty() {
+                continue;
+            }
+            let in_sum: f64 = idxs.iter().map(|&e| edges[e].2).sum();
+            if in_sum <= 0.0 {
+                continue;
+            }
+            let min_donor_h = idxs
+                .iter()
+                .map(|&e| heads[edges[e].0])
+                .fold(f64::INFINITY, f64::min);
+            let room = (min_donor_h - heads[j]).max(0.0);
+            if in_sum > room {
+                let scale = room / in_sum;
+                for &e in idxs {
+                    edges[e].2 *= scale;
+                }
+            }
+        }
+
+        let mut delta = vec![0.0f64; n];
+        for (i, j, v) in edges {
+            if v > 0.0 {
+                delta[i] -= v;
+                delta[j] += v;
             }
         }
 
