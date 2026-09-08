@@ -32,8 +32,8 @@
 </head>
 <body>
   <h1>D1 — 3×3 grid runoff</h1>
-  <p class="sub">Same rule as sim-core: infiltrate every cell, then one simultaneous surface pass. Neighbors are N, E, S, W. Download this file and open it locally.</p>
-  <p class="warn">Ridge = high elevation wall (z = 12) on the west. Water does not climb it. Click a cell, add rain, then press One tick — rain itself does not move water.</p>
+  <p class="sub">S02.1 rule: infiltrate all, then one surface pass. V = min(h, 0.5*(H-H*)), split among equal-lowest neighbors. Download and open locally.</p>
+  <p class="warn">Ridge = west z=12. Flat cells pool instead of swapping. Click cell → rain → One tick.</p>
   <div class="card row">
     <button class="pri" type="button" id="rain">Rain on selected</button>
     <button type="button" id="tick">One tick</button>
@@ -52,7 +52,7 @@
       <div class="map" id="map"></div>
       <div class="axis-x">W ← x → E</div>
     </div>
-    <p class="legend">Fill = pond depth h. Arrow = where that cell sent water last tick. Green border = selected.</p>
+    <p class="legend">Fill = pond h. Arrow = last send. Green = selected.</p>
   </div>
   <pre id="out">loading…</pre>
 <script>
@@ -96,20 +96,27 @@
       for (x = 0; x < W; x++) {
         i = idx(x, y);
         if (depths[i] <= 0) continue;
-        var bestJ = -1, bestH = 0, bestDir = '', k;
+        var cands = [], k, minH = null;
         for (k = 0; k < 4; k++) {
           var nx = x + OFFSETS[k][0], ny = y + OFFSETS[k][1], dir = OFFSETS[k][2];
           if (!inb(nx, ny)) continue;
           var j = idx(nx, ny);
           if (heads[j] >= heads[i]) continue;
-          if (bestJ < 0 || heads[j] < bestH) { bestJ = j; bestH = heads[j]; bestDir = dir; }
+          if (minH === null || heads[j] < minH) minH = heads[j];
+          cands.push({j:j, H:heads[j], dir:dir});
         }
-        if (bestJ >= 0) {
-          var vol = Math.min(depths[i], heads[i] - bestH);
-          if (vol > 0) {
-            delta[i] -= vol; delta[bestJ] += vol;
-            cells[i].sent = bestDir;
-            lastMoves.push({fx:x, fy:y, dir:bestDir, vol:vol});
+        var T = [], t;
+        for (t = 0; t < cands.length; t++) { if (cands[t].H === minH) T.push(cands[t]); }
+        if (T.length > 0) {
+          var V = Math.min(depths[i], 0.5 * (heads[i] - minH));
+          if (V > 0) {
+            var share = V / T.length;
+            delta[i] -= V;
+            cells[i].sent = T.length === 1 ? T[0].dir : '*';
+            for (t = 0; t < T.length; t++) {
+              delta[T[t].j] += share;
+              lastMoves.push({fx:x, fy:y, dir:T[t].dir, vol:share});
+            }
           }
         }
       }
@@ -159,9 +166,9 @@
     for (i = 0; i < 9; i++) tot += mass(cells[i]);
     var lines = [];
     lines.push('tick ' + tickN + '   selected (' + sel.x + ',' + sel.y + ')   grid M = ' + tot.toFixed(5));
-    lines.push('Rain adds to the selected cell only. One tick = infiltrate all 9, then one runoff pass.');
+    lines.push('S02.1: V = min(h, 0.5*(H-H*)), split among equal-lowest neighbors.');
     if (lastMoves.length === 0) {
-      lines.push('Last runoff: no surface moved (dry, soaked into soil, or no lower H neighbor).');
+      lines.push('Last runoff: no surface moved.');
     } else {
       lines.push('Last runoff:');
       for (var m = 0; m < lastMoves.length; m++) {
@@ -169,8 +176,6 @@
         lines.push('  (' + mv.fx + ',' + mv.fy + ') ' + glyph(mv.dir) + ' ' + mv.dir + '  vol=' + mv.vol.toFixed(4));
       }
     }
-    var ridgeM = mass(at(0,0)) + mass(at(0,1)) + mass(at(0,2));
-    lines.push('West ridge mass = ' + ridgeM.toFixed(4) + ' (starts ~0.18 unless you rain on it).');
     document.getElementById('out').textContent = lines.join('\n');
   }
   document.getElementById('R').addEventListener('input', function () {

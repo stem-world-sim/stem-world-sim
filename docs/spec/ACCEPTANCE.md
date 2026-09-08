@@ -18,8 +18,8 @@ Do not delete tests from earlier sprints.
 | `i2_isolated_column_mass_conserved` | I2 |
 | `i5_same_seed_same_script_same_state` | I5 |
 | `i6_queries_are_kernel_methods` | I6 |
-| `i3_closed_grid_mass_conserved` | I3 (S02+) |
-| `i4_disconnected_dry_stays_dry` | I4 (S02+) |
+| `i3_closed_grid_mass_conserved` | I3 |
+| `i4_disconnected_dry_stays_dry` | I4 |
 
 ## Sprint 1 — D0 column_rain
 
@@ -33,8 +33,17 @@ Do not delete tests from earlier sprints.
 
 | Rust test name | Script |
 |---|---|
-| `i3_closed_grid_mass_conserved` | rain on one cell of a closed 1x2 or 2x2; infiltrate+runoff; sum M constant |
-| `i4_disconnected_dry_stays_dry` | high+low connected pair plus an isolated dry column; isolated M unchanged |
-| `d1_pond_leaves_high_appears_low` | z_high > z_low; pond on high; after ticks high surface down and low M up |
+| `i3_closed_grid_mass_conserved` | rain on one cell of a closed 1x2 or 2x2; sum M constant |
+| `i4_disconnected_dry_stays_dry` | connected pair plus isolated dry; isolated M unchanged |
+| `d1_pond_leaves_high_appears_low` | z_high > z_low; pond on high; high surface down, low M up |
 | `d1_no_uphill_creation` | pond only on the low cell; high stays dry |
 | `d1_flat_equal_H_no_net_drain` | same z and same h; no net transfer |
+
+## Sprint 2.1 — head equalize
+
+Use saturated soil (θ = φ) so pond stays on the surface.
+
+| Rust test name | Script |
+|---|---|
+| `d1_flat_pair_equalizes_no_oscillation` | 1x2, same z, all pond on cell A; after ticks h_A ≈ h_B; one extra tick does not swap |
+| `d1_same_z_three_share` | 1x3 same z, rain on center; both ends gain surface water |
