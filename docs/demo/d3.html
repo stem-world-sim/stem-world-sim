@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>SWS D3 — profile first</title>
+<title>SWS D3 — pond head</title>
 <style>
 :root{color-scheme:dark;--bg:#12141a;--card:#1c2028;--ink:#e8eaef;--muted:#9aa3b2;--pond:#4aa3d8}
 *{box-sizing:border-box}body{margin:0 auto;max-width:44rem;padding:1rem;font:15px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--ink)}
@@ -9,13 +9,13 @@ h1{font-size:1.12rem;margin:0 0 .3rem}.sub,.warn{font-size:.82rem;color:var(--mu
 .card{background:var(--card);border-radius:12px;padding:.75rem;margin-bottom:.65rem}.row{display:flex;flex-wrap:wrap;gap:.35rem;align-items:center}
 button{appearance:none;border:0;border-radius:8px;padding:.48rem .65rem;font:inherit;background:#2c3544;color:var(--ink)}button.pri{background:#2e5a3c}
 .map{display:grid;grid-template-columns:repeat(3,1fr);gap:.4rem;max-width:26rem;margin:.3rem auto}
-.cell{position:relative;min-height:6.4rem;border:2px solid #2a303a;border-radius:10px;padding:.3rem;cursor:pointer;overflow:hidden}.cell.sel{border-color:#e8eaef}
-.pond{position:absolute;left:0;right:0;bottom:0;background:var(--pond);opacity:.82;pointer-events:none}.meta{position:relative;z-index:1;font-size:.66rem;line-height:1.25}
+.cell{position:relative;min-height:6.6rem;border:2px solid #2a303a;border-radius:10px;padding:.3rem;cursor:pointer;overflow:hidden}.cell.sel{border-color:#e8eaef}
+.pond{position:absolute;left:0;right:0;bottom:0;background:var(--pond);opacity:.82;pointer-events:none}.meta{position:relative;z-index:1;font-size:.64rem;line-height:1.25}
 pre{background:#0e1014;padding:.6rem;border-radius:8px;font-size:.7rem;white-space:pre-wrap;margin:.4rem 0 0}label{font-size:.82rem}input[type=range]{width:7.5rem}
 </style></head><body>
-<h1>D3 — S03.2 profile first</h1>
-<p class="sub">Two layers per tile. Water soaks down before it seeps. Open locally.</p>
-<p class="warn">Lighter=drier, darker=wetter (mean of top+bot). Blue=pond. Contact flux ≤ slower soil D_max.</p>
+<h1>D3 — S03.3 pond follows H</h1>
+<p class="sub">Two layers. Pond goes to every lower-H neighbor, ≤ R_max per edge. Open this file.</p>
+<p class="warn">Watch H = z+h, not just h. A 6 m valley pond is a lake when H ≈ highland. Equal H = no slosh.</p>
 <div class="card row">
 <button class="pri" type="button" id="rain">Rain selected</button>
 <button type="button" id="heavy">Heavy rain all high</button>
@@ -29,13 +29,13 @@ pre{background:#0e1014;padding:.6rem;border-radius:8px;font-size:.7rem;white-spa
 Sand     0.40  0.20   0.20   0.04
 Loam     0.45  0.225  0.05   0.01
 Clay     0.50  0.25   0.01   0.002
-Tick: infiltrate → pond runoff → percolate top→bot → leftover m lateral.
-Lateral fills neighbor soil first; pond only overflow. Flux ≤ min(D_i,D_j).
-θ_fc = gravity floor only. Plants/ET later can pull below it.</pre></div>
+R_max = 0.15 m / edge / tick. Pond: all lower-H edges, weight ∝ ΔH.
+Tick: infiltrate → pond → percolate top→bot → leftover m lateral.
+Soil still downslope-first. θ_fc = gravity floor only.</pre></div>
 <pre id="out">loading…</pre>
 <script>
 (function(){
-var W=3,Ht=2,L=0.15,EPS=1e-9,tickN=0,sel={x:0,y:1};
+var W=3,Ht=2,L=0.15,EPS=1e-9,RMAX=0.15,tickN=0,sel={x:0,y:1};
 var TX={sand:{name:'Sand',phi:0.40,I:0.20,D:0.04,hue:[196,163,92]},loam:{name:'Loam',phi:0.45,I:0.05,D:0.01,hue:[110,122,58]},clay:{name:'Clay',phi:0.50,I:0.01,D:0.002,hue:[148,72,48]}};
 var COLTX=['sand','loam','clay'],cells,lastLog=[];
 function idx(x,y){return y*W+x}function at(x,y){return cells[idx(x,y)]}function tex(c){return TX[c.tx]}
@@ -50,12 +50,34 @@ function make(tx,z,th){return{tx:tx,z:z,h:0,th:[th,th]}}
 function resetWorld(){cells=[];var x;for(x=0;x<3;x++)cells.push(make(COLTX[x],2,0.10));for(x=0;x<3;x++)cells.push(make(COLTX[x],8,0.10));tickN=0;lastLog=[];sel={x:0,y:1}}
 function infiltrate(c){var T=tex(c),rem=Math.min(c.h,T.I),k;
 for(k=0;k<2;k++){var room=Math.max(0,T.phi-c.th[k])*L;var take=Math.min(rem,room);c.th[k]+=take/L;rem-=take}c.h=Math.max(0,c.h-Math.min(c.h,T.I)+rem)}
-function runoff(){var n=6,heads=[],depths=[],d=[],i,x,y;for(i=0;i<n;i++){heads.push(head(cells[i]));depths.push(cells[i].h);d.push(0)}
-var off=[[0,1],[1,0],[0,-1],[-1,0]];
-for(y=0;y<Ht;y++)for(x=0;x<W;x++){i=idx(x,y);if(depths[i]<=0)continue;var cands=[],k,minH=null;
-for(k=0;k<4;k++){var nx=x+off[k][0],ny=y+off[k][1];if(nx<0||ny<0||nx>=W||ny>=Ht)continue;var j=idx(nx,ny);if(heads[j]>=heads[i])continue;if(minH===null||heads[j]<minH)minH=heads[j];cands.push({j:j,H:heads[j]})}
-var T=cands.filter(function(a){return a.H===minH});if(!T.length)continue;var V=Math.min(depths[i],0.5*(heads[i]-minH));if(V<=0)continue;d[i]-=V;var sh=V/T.length;T.forEach(function(a){d[a.j]+=sh})}
-for(i=0;i<n;i++){cells[i].h+=d[i];if(cells[i].h<0&&Math.abs(cells[i].h)<=EPS)cells[i].h=0}}
+function runoff(){
+  var n=6,heads=[],depths=[],d=[],i,x,y,k;
+  for(i=0;i<n;i++){heads.push(head(cells[i]));depths.push(cells[i].h);d.push(0)}
+  var off=[[0,1],[1,0],[0,-1],[-1,0]];
+  for(y=0;y<Ht;y++)for(x=0;x<W;x++){
+    i=idx(x,y); if(depths[i]<=0) continue;
+    var nbrs=[], sum=0;
+    for(k=0;k<4;k++){
+      var nx=x+off[k][0], ny=y+off[k][1];
+      if(nx<0||ny<0||nx>=W||ny>=Ht) continue;
+      var j=idx(nx,ny), dh=heads[i]-heads[j];
+      if(dh<=0) continue;
+      nbrs.push({j:j,dh:dh}); sum+=dh;
+    }
+    if(!nbrs.length || sum<=0) continue;
+    var planned=[], tot=0, p;
+    for(p=0;p<nbrs.length;p++){
+      var w=nbrs[p].dh/sum;
+      var v=Math.min(depths[i]*w, 0.5*nbrs[p].dh, RMAX);
+      if(v>0){ planned.push({j:nbrs[p].j,v:v}); tot+=v; }
+    }
+    if(tot>depths[i] && tot>0){ var s=depths[i]/tot; planned.forEach(function(a){a.v*=s}); tot=depths[i]; }
+    if(tot<=0) continue;
+    d[i]-=tot;
+    planned.forEach(function(a){ d[a.j]+=a.v; lastLog.push('pond →('+ (a.j%W)+','+Math.floor(a.j/W)+') '+a.v.toFixed(3)); });
+  }
+  for(i=0;i<n;i++){ cells[i].h+=d[i]; if(cells[i].h<0 && Math.abs(cells[i].h)<=EPS) cells[i].h=0; }
+}
 function addSoil(c,vol){var T=tex(c),k;for(k=0;k<2&&vol>0;k++){var room=Math.max(0,T.phi-c.th[k])*L;var s=Math.min(vol,room);c.th[k]+=s/L;vol-=s}c.h+=vol}
 function takeMobile(c,vol){var k;for(k=0;k<2&&vol>0;k++){var av=layerMob(c,k);var t=Math.min(vol,av);c.th[k]-=t/L;vol-=t}}
 function percolate(c){var T=tex(c),bud=T.D,fcv=fc(c);
@@ -69,23 +91,24 @@ var send=[];for(i=0;i<n;i++)send.push([]);
 for(y=0;y<Ht;y++)for(x=0;x<W;x++){i=idx(x,y);var mi=snapM[i];if(mi<=0||remD[i]<=0)continue;var lower=[],flat=[];
 for(k=0;k<4;k++){var nx=x+off[k][0],ny=y+off[k][1];if(nx<0||ny<0||nx>=W||ny>=Ht)continue;var j=idx(nx,ny);if(snapZ[j]>snapZ[i])continue;if(snapZ[j]<snapZ[i])lower.push(j);else if(snapM[j]<mi)flat.push(j)}
 if(lower.length){var minz=snapZ[lower[0]],t;for(t=1;t<lower.length;t++)if(snapZ[lower[t]]<minz)minz=snapZ[lower[t]];
-var T=lower.filter(function(j){return snapZ[j]===minz});var cap=remD[i],left=Math.min(cap,mi),sh=left/T.length;
+var T=lower.filter(function(j){return snapZ[j]===minz});var sh=Math.min(remD[i],mi)/T.length;
 T.forEach(function(j){var v=Math.min(sh,Math.min(remD[i],tex(cells[j]).D));if(v>0){send[i].push({j:j,v:v});lastLog.push('down '+tex(cells[i]).name+' '+v.toFixed(3))}})}
 else if(flat.length){var left=Math.min(remD[i],mi);
 flat.forEach(function(j){var contact=Math.min(remD[i],tex(cells[j]).D);var v=Math.min(contact,left,0.5*(mi-snapM[j]));if(v<=0)return;left-=v;send[i].push({j:j,v:v});lastLog.push('interflow ('+(j%W)+','+Math.floor(j/W)+') '+v.toFixed(3))})}}
 for(i=0;i<n;i++)send[i].forEach(function(s){takeMobile(cells[i],s.v);addSoil(cells[s.j],s.v)})}
 function tick(){lastLog=[];var i;for(i=0;i<6;i++)infiltrate(cells[i]);runoff();drain();tickN+=1}
 function draw(){document.getElementById('rV').textContent=parseFloat(document.getElementById('R').value).toFixed(2);var html='',y,x,tot=0,Tphi;
-for(y=Ht-1;y>=0;y--)for(x=0;x<W;x++){var c=at(x,y);tot+=mass(c);Tphi=tex(c).phi;var pct=Math.min(72,(c.h/0.4)*72);
+for(y=Ht-1;y>=0;y--)for(x=0;x<W;x++){var c=at(x,y);tot+=mass(c);Tphi=tex(c).phi;var pct=Math.min(72,(c.h/0.8)*72);
 html+='<div class="cell'+(sel.x===x&&sel.y===y?' sel':'')+'" data-x="'+x+'" data-y="'+y+'" style="background:'+color(c)+'">';
 html+='<div class="pond" style="height:'+pct+'%"></div><div class="meta">'+tex(c).name+(y===1?' high':' valley');
-html+='<br>z '+c.z+'  top '+Math.round(c.th[0]/Tphi*100)+'% bot '+Math.round(c.th[1]/Tphi*100)+'%';
+html+='<br>z '+c.z+' H '+head(c).toFixed(2);
+html+='<br>top '+Math.round(c.th[0]/Tphi*100)+'% bot '+Math.round(c.th[1]/Tphi*100)+'%';
 html+='<br>h '+c.h.toFixed(3)+'  m '+mob(c).toFixed(3)+'</div></div>'}
 var map=document.getElementById('map');map.innerHTML=html;var nodes=map.querySelectorAll('.cell'),n;
 for(n=0;n<nodes.length;n++)nodes[n].onclick=function(ev){sel.x=+ev.currentTarget.getAttribute('data-x');sel.y=+ev.currentTarget.getAttribute('data-y');draw()};
 var lines=['tick '+tickN+'  grid M='+tot.toFixed(4)+'  ('+sel.x+','+sel.y+') '+tex(at(sel.x,sel.y)).name];
-lines.push('S03.2: percolate then lateral; soil first; min(D_i,D_j)');
-if(!lastLog.length)lines.push('Last: none.');else lines=lines.concat(lastLog.slice(0,10));
+lines.push('S03.3: pond all lower-H, ≤R_max=0.15. Equal H → 0.');
+if(!lastLog.length)lines.push('Last: none.');else lines=lines.concat(lastLog.slice(0,12));
 document.getElementById('out').textContent=lines.join('\n')}
 document.getElementById('R').oninput=function(){document.getElementById('rV').textContent=parseFloat(this.value).toFixed(2)};
 document.getElementById('rain').onclick=function(){at(sel.x,sel.y).h+=parseFloat(document.getElementById('R').value);lastLog=[];draw()};
