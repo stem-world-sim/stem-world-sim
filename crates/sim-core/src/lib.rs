@@ -1,4 +1,4 @@
-//! Stem World Sim — Sprint 2 (D1) slope runoff on a 4-neighbor grid.
+//! Stem World Sim — Sprint 2.1 (D1) head-equalize runoff on a 4-neighbor grid.
 //!
 //! Water mass (A = 1): M = h_surf + sum_i (theta_i * L_i)
 //! Grid mass: sum of column M.
@@ -318,7 +318,8 @@ impl World {
     }
 
     /// Simultaneous runoff pass: snapshot heads/depths, accumulate deltas, apply.
-    /// Each cell sends at most once. Closed boundary (no flux off-grid).
+    /// S02.1 head-equalize: send half-drop volume split equally across all lowest-H
+    /// downhill neighbors. Closed boundary (no flux off-grid).
     fn runoff_pass(&mut self) {
         let n = self.columns.len();
         if n == 0 {
@@ -342,9 +343,8 @@ impl World {
                 }
                 let h_head = heads[i];
 
-                // Candidates: neighbors with strictly lower H. Pick lowest H;
-                // ties broken by N, E, S, W scan order (first among minimal H).
-                let mut best: Option<(usize, f64)> = None; // (nbr_idx, H_nbr)
+                // S = 4-neighbors with strictly lower H.
+                let mut lower: Vec<(usize, f64)> = Vec::new();
                 for &(dx, dy) in &NEIGHBOR_OFFSETS {
                     let nx = x as i32 + dx;
                     let ny = y as i32 + dy;
@@ -353,22 +353,35 @@ impl World {
                     }
                     let j = ny as usize * self.width + nx as usize;
                     let h_nbr = heads[j];
-                    if h_nbr >= h_head {
-                        continue;
-                    }
-                    match best {
-                        None => best = Some((j, h_nbr)),
-                        Some((_, best_h)) if h_nbr < best_h => best = Some((j, h_nbr)),
-                        Some(_) => {} // equal or higher than current best H: keep earlier (N,E,S,W)
+                    if h_nbr < h_head {
+                        lower.push((j, h_nbr));
                     }
                 }
+                if lower.is_empty() {
+                    continue;
+                }
 
-                if let Some((j, h_nbr)) = best {
-                    let vol = h_i.min(h_head - h_nbr);
-                    if vol > 0.0 {
-                        delta[i] -= vol;
-                        delta[j] += vol;
-                    }
+                // H* = min H in S; T = every neighbor in S with H == H*.
+                let h_star = lower.iter().map(|&(_, h)| h).fold(f64::INFINITY, f64::min);
+                let targets: Vec<usize> = lower
+                    .into_iter()
+                    .filter(|&(_, h)| h == h_star)
+                    .map(|(j, _)| j)
+                    .collect();
+                let n_t = targets.len();
+                if n_t == 0 {
+                    continue;
+                }
+
+                // V = min(h_i, 0.5 * (H_i - H*)); split equally across |T|.
+                let v = h_i.min(0.5 * (h_head - h_star));
+                if v <= 0.0 {
+                    continue;
+                }
+                let share = v / n_t as f64;
+                delta[i] -= v;
+                for j in targets {
+                    delta[j] += share;
                 }
             }
         }
