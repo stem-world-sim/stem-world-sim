@@ -1,28 +1,82 @@
-//! Stem World Sim — Sprint 2.1 (D1) head-equalize runoff on a 4-neighbor grid.
+//! Stem World Sim — Sprint 3 water mechanics on a 4-neighbor grid.
 //!
 //! Water mass (A = 1): M = h_surf + sum_i (theta_i * L_i)
 //! Grid mass: sum of column M.
-//! Tick order: infiltrate every column (S01 capacity-step), then one runoff pass.
-//! Only surface water moves laterally. Soil theta does not jump sideways.
+//! Tick order: rate-limited infiltrate → S02.1 runoff → gravity drain → clock.
+//! Mobile soil water (θ > θ_fc) may drain downhill; capillary water stays put.
 
 /// Absolute / relative tolerance for water-mass comparisons (f64).
 pub const MASS_EPSILON: f64 = 1e-9;
 
-/// One soil layer: thickness L, volumetric moisture theta, porosity phi.
+/// Soil texture: porosity, field capacity, infiltrate and drain rate limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Texture {
+    Sand,
+    Loam,
+    Clay,
+}
+
+impl Texture {
+    /// Porosity φ (volume fraction).
+    pub fn porosity(self) -> f64 {
+        match self {
+            Texture::Sand => 0.40,
+            Texture::Loam => 0.45,
+            Texture::Clay => 0.50,
+        }
+    }
+
+    /// Field capacity θ_fc = 0.50 * φ.
+    pub fn theta_fc(self) -> f64 {
+        0.50 * self.porosity()
+    }
+
+    /// Max infiltrate depth per tick (metres water, A = 1).
+    pub fn i_max(self) -> f64 {
+        match self {
+            Texture::Sand => 0.20,
+            Texture::Loam => 0.05,
+            Texture::Clay => 0.01,
+        }
+    }
+
+    /// Max gravity-drain depth per tick (metres water, A = 1).
+    pub fn d_max(self) -> f64 {
+        match self {
+            Texture::Sand => 0.04,
+            Texture::Loam => 0.01,
+            Texture::Clay => 0.002,
+        }
+    }
+}
+
+/// One soil layer: thickness L, volumetric moisture theta, texture (φ from table).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SoilLayer {
     pub thickness_m: f64,
     pub theta: f64,
     pub porosity: f64,
+    pub texture: Texture,
 }
 
 impl SoilLayer {
-    pub fn new(thickness_m: f64, theta: f64, porosity: f64) -> Self {
+    /// Build a layer from texture; porosity is the texture's φ.
+    pub fn new(thickness_m: f64, theta: f64, texture: Texture) -> Self {
         Self {
             thickness_m,
             theta,
-            porosity,
+            porosity: texture.porosity(),
+            texture,
         }
+    }
+
+    /// Alias for [`SoilLayer::new`].
+    pub fn with_texture(thickness_m: f64, theta: f64, texture: Texture) -> Self {
+        Self::new(thickness_m, theta, texture)
+    }
+
+    pub fn theta_fc(&self) -> f64 {
+        self.texture.theta_fc()
     }
 
     /// Remaining pore water volume (depth equivalent) in this layer: (phi - theta) * L.
@@ -33,6 +87,11 @@ impl SoilLayer {
     /// Water mass stored in this layer: theta * L (A = 1).
     pub fn water_mass(&self) -> f64 {
         self.theta * self.thickness_m
+    }
+
+    /// Mobile water depth above field capacity: max(0, θ - θ_fc) * L.
+    pub fn mobile_water_m(&self) -> f64 {
+        (self.theta - self.theta_fc()).max(0.0) * self.thickness_m
     }
 }
 
@@ -53,6 +112,22 @@ impl Column {
         }
     }
 
+    /// Column texture: top layer, or Sand if empty (World::new default).
+    pub fn texture(&self) -> Texture {
+        self.layers
+            .first()
+            .map(|l| l.texture)
+            .unwrap_or(Texture::Sand)
+    }
+
+    pub fn i_max(&self) -> f64 {
+        self.texture().i_max()
+    }
+
+    pub fn d_max(&self) -> f64 {
+        self.texture().d_max()
+    }
+
     /// Hydraulic head H = elevation_m + surface_water_m.
     pub fn head(&self) -> f64 {
         self.elevation_m + self.surface_water_m
@@ -64,9 +139,19 @@ impl Column {
             + self.layers.iter().map(SoilLayer::water_mass).sum::<f64>()
     }
 
+    /// Soil-only water mass (no surface).
+    pub fn soil_water_mass(&self) -> f64 {
+        self.layers.iter().map(SoilLayer::water_mass).sum()
+    }
+
     /// Total remaining pore capacity across all layers (depth equivalent).
     pub fn remaining_pore_capacity_m(&self) -> f64 {
         self.layers.iter().map(SoilLayer::remaining_pore_m).sum()
+    }
+
+    /// Total mobile soil water depth: sum max(0, θ - θ_fc) * L.
+    pub fn mobile_water_m(&self) -> f64 {
+        self.layers.iter().map(SoilLayer::mobile_water_m).sum()
     }
 
     /// True when surface is dry (within ε) or no pore space remains.
@@ -74,22 +159,46 @@ impl Column {
         self.surface_water_m <= MASS_EPSILON || self.remaining_pore_capacity_m() <= MASS_EPSILON
     }
 
-    /// One capacity-step infiltration on this column (no clock).
+    /// Rate-limited capacity-step infiltration (no clock).
+    /// budget = min(h_surf, I_max); fill top-down into remaining pores.
     fn infiltrate_step(&mut self) {
-        let mut remaining = self.surface_water_m;
+        let mut budget = self.surface_water_m.min(self.i_max());
+        let mut remaining_surface = self.surface_water_m;
         for layer in &mut self.layers {
-            if remaining <= 0.0 {
+            if budget <= 0.0 {
                 break;
             }
             let capacity = layer.remaining_pore_m();
             if capacity <= 0.0 {
                 continue;
             }
-            let fill = remaining.min(capacity);
+            let fill = budget.min(capacity);
             layer.theta += fill / layer.thickness_m;
-            remaining -= fill;
+            budget -= fill;
+            remaining_surface -= fill;
         }
-        self.surface_water_m = remaining;
+        self.surface_water_m = remaining_surface.max(0.0);
+    }
+
+    /// Remove up to `amount` metres of mobile water (θ → θ_fc), top-down.
+    fn remove_mobile_water(&mut self, mut amount: f64) {
+        for layer in &mut self.layers {
+            if amount <= 0.0 {
+                break;
+            }
+            let mobile = layer.mobile_water_m();
+            if mobile <= 0.0 {
+                continue;
+            }
+            let take = amount.min(mobile);
+            layer.theta -= take / layer.thickness_m;
+            // Numerical guard: never go below θ_fc from fp noise.
+            let fc = layer.theta_fc();
+            if layer.theta < fc {
+                layer.theta = fc;
+            }
+            amount -= take;
+        }
     }
 }
 
@@ -115,7 +224,7 @@ impl Default for Clock {
     }
 }
 
-/// Neighbor offsets: N, E, S, W (y increases north).
+/// Neighbor offsets: N, E, S, W (y increases north). NESW tie-break order.
 const NEIGHBOR_OFFSETS: [(i32, i32); 4] = [
     (0, 1),  // N
     (1, 0),  // E
@@ -125,6 +234,7 @@ const NEIGHBOR_OFFSETS: [(i32, i32); 4] = [
 
 /// World / Sim: seed + clock + regular 4-neighbor grid of columns.
 /// S01 1-column world = grid 1×1; single-cell queries operate on (0,0).
+/// Default texture for unspecified layers: Sand.
 #[derive(Clone, Debug, PartialEq)]
 pub struct World {
     seed: u64,
@@ -277,21 +387,22 @@ impl World {
         self.columns.iter().map(Column::water_mass).sum()
     }
 
-    /// Infiltrate every column (S01 capacity-step); no runoff; advances clock.
+    /// Infiltrate every column (rate-limited); no runoff/drain; advances clock.
     pub fn tick_infiltration(&mut self) {
         self.infiltrate_all();
         self.clock.advance();
     }
 
-    /// Full tick: infiltrate all columns, then one runoff pass; advances clock once.
+    /// Full tick: infiltrate → runoff (S02.1) → gravity drain; advances clock once.
     pub fn tick(&mut self) {
         self.infiltrate_all();
         self.runoff_pass();
+        self.gravity_drain_pass();
         self.clock.advance();
     }
 
     /// Tick until every column is quiescent (surface dry or saturated).
-    /// Each step runs a full tick (infiltrate + runoff). On 1×1 runoff is a no-op.
+    /// Bound accounts for Sand I_max rate limiting plus runoff redistribute.
     pub fn tick_until_surface_dry_or_saturated(&mut self) {
         let max_layers = self
             .columns
@@ -299,10 +410,30 @@ impl World {
             .map(|c| c.layers.len())
             .max()
             .unwrap_or(0);
-        // Extra steps allow runoff to redistribute then re-infiltrate.
-        let max_steps = max_layers.saturating_add(2).max(1).saturating_mul(
-            self.width.saturating_mul(self.height).max(1),
-        );
+        let max_h = self
+            .columns
+            .iter()
+            .map(|c| c.surface_water_m)
+            .fold(0.0_f64, f64::max);
+        let min_i_max = self
+            .columns
+            .iter()
+            .map(|c| c.i_max())
+            .fold(f64::INFINITY, f64::min);
+        let min_i_max = if min_i_max.is_finite() && min_i_max > 0.0 {
+            min_i_max
+        } else {
+            Texture::Sand.i_max()
+        };
+        // ceil(h / I_max) infiltrate steps + layers + runoff slack, × grid size.
+        let infil_ticks = ((max_h / min_i_max).ceil() as usize).saturating_add(1);
+        let cells = self.width.saturating_mul(self.height).max(1);
+        let max_steps = infil_ticks
+            .saturating_add(max_layers)
+            .saturating_add(8)
+            .saturating_mul(cells)
+            .max(64);
+
         for _ in 0..max_steps {
             if self.columns.iter().all(Column::is_quiescent) {
                 break;
@@ -394,6 +525,67 @@ impl World {
             }
         }
     }
+
+    /// Simultaneous gravity drain: mobile soil water (θ > θ_fc) to lower-z neighbor surface.
+    /// m = min(D_max, m_avail). Lowest z wins; NESW tie-break. No lower-z neighbor ⇒ no-op.
+    fn gravity_drain_pass(&mut self) {
+        let n = self.columns.len();
+        if n == 0 {
+            return;
+        }
+
+        let elevations: Vec<f64> = self.columns.iter().map(|c| c.elevation_m).collect();
+        let mobiles: Vec<f64> = self.columns.iter().map(Column::mobile_water_m).collect();
+        let d_maxes: Vec<f64> = self.columns.iter().map(Column::d_max).collect();
+
+        // Planned transfers: (from_idx, to_idx, amount)
+        let mut transfers: Vec<(usize, usize, f64)> = Vec::new();
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let i = y * self.width + x;
+                let m_avail = mobiles[i];
+                if m_avail <= 0.0 {
+                    continue;
+                }
+                let m = m_avail.min(d_maxes[i]);
+                if m <= 0.0 {
+                    continue;
+                }
+
+                let z_i = elevations[i];
+                // Strictly lower z; lowest z wins; NESW if tied.
+                let mut best: Option<(usize, f64)> = None;
+                for &(dx, dy) in &NEIGHBOR_OFFSETS {
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    if nx < 0 || ny < 0 || nx as usize >= self.width || ny as usize >= self.height {
+                        continue;
+                    }
+                    let j = ny as usize * self.width + nx as usize;
+                    let z_nbr = elevations[j];
+                    if z_nbr < z_i {
+                        match best {
+                            None => best = Some((j, z_nbr)),
+                            Some((_, bz)) if z_nbr < bz => best = Some((j, z_nbr)),
+                            // equal z: keep first (NESW order)
+                            _ => {}
+                        }
+                    }
+                }
+
+                if let Some((j, _)) = best {
+                    transfers.push((i, j, m));
+                }
+                // else: 1×1 or pit — keep m in place
+            }
+        }
+
+        for (from, to, m) in transfers {
+            self.columns[from].remove_mobile_water(m);
+            self.columns[to].surface_water_m += m;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -405,7 +597,10 @@ mod unit_smoke {
         let col = Column::new(
             0.0,
             0.1,
-            vec![SoilLayer::new(0.5, 0.2, 0.4), SoilLayer::new(0.3, 0.1, 0.35)],
+            vec![
+                SoilLayer::new(0.5, 0.2, Texture::Sand),
+                SoilLayer::new(0.3, 0.1, Texture::Loam),
+            ],
         );
         let expected = 0.1 + 0.2 * 0.5 + 0.1 * 0.3;
         assert!((col.water_mass() - expected).abs() < MASS_EPSILON);
@@ -415,5 +610,13 @@ mod unit_smoke {
     fn head_is_elevation_plus_surface() {
         let col = Column::new(10.0, 0.25, vec![]);
         assert!((col.head() - 10.25).abs() < MASS_EPSILON);
+    }
+
+    #[test]
+    fn texture_table_sand_defaults() {
+        assert!((Texture::Sand.porosity() - 0.40).abs() < MASS_EPSILON);
+        assert!((Texture::Sand.theta_fc() - 0.20).abs() < MASS_EPSILON);
+        assert!((Texture::Sand.i_max() - 0.20).abs() < MASS_EPSILON);
+        assert!((Texture::Sand.d_max() - 0.04).abs() < MASS_EPSILON);
     }
 }
