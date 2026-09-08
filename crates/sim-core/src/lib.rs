@@ -1,13 +1,16 @@
-//! Stem World Sim — Sprint 3.2 profile-first percolation + lateral drain.
+//! Stem World Sim — Sprint 3.3 pond head + R_max (profile-first soil unchanged).
 //!
 //! Water mass (A = 1): M = h_surf + sum_i (theta_i * L_i)
 //! Grid mass: sum of column M.
-//! Tick order: rate-limited infiltrate → S02.1 runoff → percolate → lateral → clock.
-//! Mobile soil water (θ > θ_fc) percolates within-column first, then laterally/downhill
-//! into neighbor soil (overflow → surface). Capillary stays. Contact flux ≤ min(D_i, D_j).
+//! Tick order: rate-limited infiltrate → pond pass → percolate → lateral → clock.
+//! Pond: every lower-H 4-neighbor, weights ∝ ΔH, each edge ≤ R_MAX and ≤ 0.5 ΔH.
+//! Unique-min-H chute revoked. Soil percolate/lateral stay S03.2. Capillary stays.
 
 /// Absolute / relative tolerance for water-mass comparisons (f64).
 pub const MASS_EPSILON: f64 = 1e-9;
+
+/// Max pond flux per edge per tick (metres water, A = 1). S03.3.
+pub const R_MAX: f64 = 0.15;
 
 /// Soil texture: porosity, field capacity, infiltrate and drain rate limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -530,17 +533,17 @@ impl World {
         self.clock.advance();
     }
 
-    /// Full tick: infiltrate → runoff (S02.1) → percolate → lateral; advances clock once.
+    /// Full tick: infiltrate → pond pass (S03.3) → percolate → lateral; advances clock once.
     pub fn tick(&mut self) {
         self.infiltrate_all();
-        self.runoff_pass();
+        self.pond_pass();
         let percolated = self.percolate_all();
         self.lateral_drain_pass(&percolated);
         self.clock.advance();
     }
 
     /// Tick until every column is quiescent (surface dry or saturated).
-    /// Bound accounts for Sand I_max rate limiting plus runoff redistribute.
+    /// Bound accounts for Sand I_max rate limiting plus pond redistribute.
     pub fn tick_until_surface_dry_or_saturated(&mut self) {
         let max_layers = self
             .columns
@@ -563,7 +566,7 @@ impl World {
         } else {
             Texture::Sand.i_max()
         };
-        // ceil(h / I_max) infiltrate steps + layers + runoff slack, × grid size.
+        // ceil(h / I_max) infiltrate steps + layers + pond slack, × grid size.
         let infil_ticks = ((max_h / min_i_max).ceil() as usize).saturating_add(1);
         let cells = self.width.saturating_mul(self.height).max(1);
         let max_steps = infil_ticks
@@ -586,10 +589,10 @@ impl World {
         }
     }
 
-    /// Simultaneous runoff pass: snapshot heads/depths, accumulate deltas, apply.
-    /// S02.1 head-equalize: send half-drop volume split equally across all lowest-H
-    /// downhill neighbors. Closed boundary (no flux off-grid).
-    fn runoff_pass(&mut self) {
+    /// Simultaneous pond pass (S03.3): snapshot heads/depths, accumulate deltas, apply.
+    /// Every lower-H 4-neighbor gets weight ∝ ΔH; each edge ≤ R_MAX and ≤ 0.5 ΔH.
+    /// Unique-min-H chute revoked. Equal H ⇒ no flux. Closed boundary.
+    fn pond_pass(&mut self) {
         let n = self.columns.len();
         if n == 0 {
             return;
@@ -612,7 +615,7 @@ impl World {
                 }
                 let h_head = heads[i];
 
-                // S = 4-neighbors with strictly lower H.
+                // Every 4-neighbor with strictly lower H (no unique-min-H).
                 let mut lower: Vec<(usize, f64)> = Vec::new();
                 for &(dx, dy) in &NEIGHBOR_OFFSETS {
                     let nx = x as i32 + dx;
@@ -623,35 +626,47 @@ impl World {
                     let j = ny as usize * self.width + nx as usize;
                     let h_nbr = heads[j];
                     if h_nbr < h_head {
-                        lower.push((j, h_nbr));
+                        let d_h = h_head - h_nbr;
+                        if d_h > 0.0 {
+                            lower.push((j, d_h));
+                        }
                     }
                 }
                 if lower.is_empty() {
                     continue;
                 }
 
-                // H* = min H in S; T = every neighbor in S with H == H*.
-                let h_star = lower.iter().map(|&(_, h)| h).fold(f64::INFINITY, f64::min);
-                let targets: Vec<usize> = lower
-                    .into_iter()
-                    .filter(|&(_, h)| h == h_star)
-                    .map(|(j, _)| j)
-                    .collect();
-                let n_t = targets.len();
-                if n_t == 0 {
+                let sum_delta: f64 = lower.iter().map(|&(_, d)| d).sum();
+                if sum_delta <= 0.0 {
                     continue;
                 }
 
-                // V = min(h_i, 0.5 * (H_i - H*)); split equally across |T|.
-                let v = h_i.min(0.5 * (h_head - h_star));
-                if v <= 0.0 {
+                // Desired send: V_j = min(h_i * w_j, 0.5 * Δ_j, R_MAX)
+                let mut sends: Vec<(usize, f64)> = Vec::with_capacity(lower.len());
+                let mut sum_v = 0.0;
+                for &(j, d_h) in &lower {
+                    let w = d_h / sum_delta;
+                    let v_j = (h_i * w).min(0.5 * d_h).min(R_MAX);
+                    if v_j > 0.0 {
+                        sends.push((j, v_j));
+                        sum_v += v_j;
+                    }
+                }
+                if sum_v <= 0.0 {
                     continue;
                 }
-                let share = v / n_t as f64;
-                delta[i] -= v;
-                for j in targets {
-                    delta[j] += share;
+
+                // If Σ V_j > h_i, scale all V_j by h_i / Σ V_j.
+                let scale = if sum_v > h_i { h_i / sum_v } else { 1.0 };
+                let mut total_out = 0.0;
+                for &(j, v_j) in &sends {
+                    let v = v_j * scale;
+                    if v > 0.0 {
+                        delta[j] += v;
+                        total_out += v;
+                    }
                 }
+                delta[i] -= total_out;
             }
         }
 

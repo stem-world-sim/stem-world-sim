@@ -1,12 +1,12 @@
 # Oracle RUNLOG
 
 ```
-sprint: S03.2
+sprint: S03.3
 result: green
-branch: feat/s03.2-profile-first
+branch: feat/s03.3-pond-head-cap
 date: 2026-09-08 (PT)
-epsilon: 1e-9 relative on f64 water mass
-invariants encoded: I1, I2, I3, I4, I5, I6 + D0 + D1 + D3 + D31 + D32 (profile-first percolation)
+epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15 m/edge/tick
+invariants encoded: I1, I2, I3, I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 (pond head + R_max)
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -35,5 +35,9 @@ tests:
   - d32_no_percolate_below_fc
   - d32_downslope_fills_soil_before_pond
   - d32_contact_limited_by_slower_soil
-notes: Split gravity_drain_pass into percolate_all() then lateral_drain_pass() after S02.1 runoff. Percolate: per column, snapshot θ, mobile in layer k fills pore in k+1…; shared texture → one D_max budget; never below θ_fc. Column D_max shared with lateral (remaining after percolate). Lateral on leftover m: same candidates as S03.1; contact flux ≤ min(D_rem_i,D_j); equal-z half-diff of leftover m; total ≤ rem D and m; receiver soil top-down (overflow → surface). Downslope no longer dumps to surface when neighbor has pore. Capillary ≤θ_fc stays. Pond S02.1 and infiltrate ≤ I_max unchanged. d31 asserts soil M / any-layer θ (profile may park water deep). Prefer sand in d32_*; ε=MASS_EPSILON.
+  - d33_steep_face_does_not_empty_in_one_tick
+  - d33_same_z_gets_pond_when_face_capped
+  - d33_drowned_lake_heads_equalize_no_oscillation
+  - d33_equal_H_no_flux
+notes: Replaced unique-min-H S02.1 runoff with S03.3 pond_pass. Snapshot H and h; every lower-H 4-neighbor gets w∝ΔH; V_j=min(h_i*w_j, 0.5*Δ_j, R_MAX); scale if ΣV>h_i; simultaneous apply. Equal H ⇒ Δ=0 ⇒ no flux. Soil percolate/lateral stay S03.2; infiltrate unchanged. Tick: infiltrate → pond → percolate → lateral. pub const R_MAX=0.15. Older equalization loops bumped (R_max may bind). Prefer sand in d33_*; soils at φ for pond-only; ε=MASS_EPSILON.
 ```
