@@ -19,10 +19,10 @@
     .axis-y { writing-mode: vertical-rl; transform: rotate(180deg); color: var(--muted); font-size: .7rem; text-align: center; }
     .axis-x { grid-column: 2; color: var(--muted); font-size: .7rem; text-align: center; }
     .map { display: grid; grid-template-columns: repeat(3, 1fr); grid-template-rows: repeat(3, 5.6rem); gap: .35rem; }
-    .cell { position: relative; border: 2px solid #2a303a; border-radius: 8px; padding: .25rem .3rem; background: #0e1014; cursor: pointer; overflow: hidden; }
+    .cell { position: relative; border: 2px solid #2a303a; border-radius: 8px; padding: .25rem .3rem; cursor: pointer; overflow: hidden; }
     .cell.sel { border-color: #7dcea0; }
-    .cell .pondbar { position: absolute; left: 0; right: 0; bottom: 0; background: var(--pond); opacity: .85; pointer-events: none; }
-    .cell .meta { position: relative; z-index: 1; font-size: .68rem; line-height: 1.25; }
+    .cell .pondbar { position: absolute; left: 0; right: 0; bottom: 0; background: var(--pond); opacity: .8; pointer-events: none; }
+    .cell .meta { position: relative; z-index: 1; font-size: .66rem; line-height: 1.25; }
     .cell .arrow { position: absolute; right: .2rem; top: .15rem; font-size: .9rem; z-index: 1; }
     .legend { font-size: .78rem; color: var(--muted); }
     pre { background: #0e1014; padding: .65rem; border-radius: 8px; font-size: .72rem; white-space: pre-wrap; margin: 0; }
@@ -32,8 +32,8 @@
 </head>
 <body>
   <h1>D1 — 3×3 grid runoff</h1>
-  <p class="sub">S02.1 rule: infiltrate all, then one surface pass. V = min(h, 0.5*(H-H*)), split among equal-lowest neighbors. Download and open locally.</p>
-  <p class="warn">Ridge = west z=12. Flat cells pool instead of swapping. Click cell → rain → One tick.</p>
+  <p class="sub">S02.1: infiltrate then pool. Tile color is soil θ/φ. Blue is pond only. Download and open locally.</p>
+  <p class="warn">Green = drier soil. Yellow = saturated soil. Blue rising from the bottom = surface water. Rain still soaks instantly (T-HYD-01 not in kernel yet).</p>
   <div class="card row">
     <button class="pri" type="button" id="rain">Rain on selected</button>
     <button type="button" id="tick">One tick</button>
@@ -52,7 +52,7 @@
       <div class="map" id="map"></div>
       <div class="axis-x">W ← x → E</div>
     </div>
-    <p class="legend">Fill = pond h. Arrow = last send. Green = selected.</p>
+    <p class="legend">Green → yellow = soil filling. Blue = pond. Arrow = last surface send.</p>
   </div>
   <pre id="out">loading…</pre>
 <script>
@@ -64,6 +64,16 @@
   function at(x, y) { return cells[idx(x, y)]; }
   function inb(x, y) { return x >= 0 && y >= 0 && x < W && y < Ht; }
   function head(c) { return c.z + c.h; }
+  function satFrac(c) {
+    return (c.layers[0].theta + c.layers[1].theta) / (2 * PHI);
+  }
+  function soilColor(frac) {
+    var t = Math.max(0, Math.min(1, frac));
+    var r = Math.round(40 + t * 175);
+    var g = Math.round(95 + t * 85);
+    var b = Math.round(40 + t * 20);
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
   function mass(c) { return c.h + c.layers[0].theta * L + c.layers[1].theta * L; }
   function makeCell(z, theta) { return { z: z, h: 0, layers: [{theta: theta}, {theta: theta}], sent: '' }; }
   function slopeTerrain() {
@@ -140,9 +150,10 @@
     for (y = Ht - 1; y >= 0; y--) {
       for (x = 0; x < W; x++) {
         var c = at(x, y);
+        var sat = satFrac(c);
         var pct = Math.min(70, (c.h / 0.4) * 70);
         var selc = (sel.x === x && sel.y === y) ? ' sel' : '';
-        html += '<div class="cell' + selc + '" data-x="' + x + '" data-y="' + y + '">';
+        html += '<div class="cell' + selc + '" data-x="' + x + '" data-y="' + y + '" style="background:' + soilColor(sat) + '">';
         html += '<div class="pondbar" style="height:' + pct + '%"></div>';
         html += '<div class="arrow">' + glyph(c.sent) + '</div>';
         html += '<div class="meta">(' + x + ',' + y + ')';
@@ -150,7 +161,7 @@
         else if (y === 2 && x === 1) html += ' high';
         else if (y === 0 && x >= 1) html += ' low';
         html += '<br>z ' + c.z.toFixed(0) + '  h ' + c.h.toFixed(3);
-        html += '<br>H ' + head(c).toFixed(3) + '</div></div>';
+        html += '<br>soil ' + Math.round(sat * 100) + '%  H ' + head(c).toFixed(3) + '</div></div>';
       }
     }
     map.innerHTML = html;
@@ -166,10 +177,9 @@
     for (i = 0; i < 9; i++) tot += mass(cells[i]);
     var lines = [];
     lines.push('tick ' + tickN + '   selected (' + sel.x + ',' + sel.y + ')   grid M = ' + tot.toFixed(5));
-    lines.push('S02.1: V = min(h, 0.5*(H-H*)), split among equal-lowest neighbors.');
-    if (lastMoves.length === 0) {
-      lines.push('Last runoff: no surface moved.');
-    } else {
+    lines.push('Soil % = theta/phi. Pond soaks in one tick until pores are full (kernel is still instant fill).');
+    if (lastMoves.length === 0) lines.push('Last runoff: no surface moved.');
+    else {
       lines.push('Last runoff:');
       for (var m = 0; m < lastMoves.length; m++) {
         var mv = lastMoves[m];
