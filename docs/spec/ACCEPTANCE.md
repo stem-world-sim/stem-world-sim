@@ -1,11 +1,9 @@
 # Acceptance tests (named)
 
 Oracle must implement these as Rust tests. Function names are the contract.
-`cargo test --workspace` must print these names. Missing name = sprint not done.
-
+`cargo test --workspace` must print these names.
 ε: 1e-9 relative on f64 water mass. A = 1.
-M_column = h_surf + sum theta_i * L_i. Grid mass = sum of column M.
-Do not delete tests from earlier sprints.
+M = h_surf + sum theta_i * L_i. Do not delete older tests.
 
 ## Always on
 
@@ -30,21 +28,29 @@ Do not delete tests from earlier sprints.
 
 | Rust test name | Script |
 |---|---|
-| `d1_pond_leaves_high_appears_low` | pond on high; high surface down, low M up |
+| `d1_pond_leaves_high_appears_low` | pond on high; low M up |
 | `d1_no_uphill_creation` | pond only on low; high stays dry |
 | `d1_flat_equal_H_no_net_drain` | same z same h; no net pond transfer |
-| `d1_flat_pair_equalizes_no_oscillation` | 1x2 same z; heads equalize; no swap |
+| `d1_flat_pair_equalizes_no_oscillation` | 1x2 same z; heads equalize |
 | `d1_same_z_three_share` | 1x3 same z; rain center; both ends gain surface |
 
 ## Sprint 3 — water mechanics
 
-Use Sand default unless the test names clay/loam. After drain ticks, grid mass still conserved (I3).
+| Rust test name | Script |
+|---|---|
+| `d3_clay_ponds_before_sand` | same R; after 1 tick clay has more h than sand |
+| `d3_infiltrate_respects_I_max` | after 1 tick infiltrated depth ≤ I_max |
+| `d3_hill_soil_drains_to_valley` | slope; high starts θ=φ; high θ falls toward fc; low M rises |
+| `d3_below_fc_does_not_drain` | high at θ_fc; high M unchanged |
+| `d3_no_soil_drain_uphill` | low at φ; high does not gain from low |
+| `d3_pond_moves_faster_than_soil` | after 2 ticks more valley mass from pond case than soil case |
+
+## Sprint 3.1 — equal-z interflow
+
+Use a 1x2 flat (same z). Prefer sand unless named.
 
 | Rust test name | Script |
 |---|---|
-| `d3_clay_ponds_before_sand` | same R, same z, 1x1; after 1 tick clay has more h_surf than sand |
-| `d3_infiltrate_respects_I_max` | sand 1x1; R large; after 1 tick, infiltrated depth ≤ I_max_sand + ε |
-| `d3_hill_soil_drains_to_valley` | 1x2, z_high > z_low, both start θ=φ (sand); after enough ticks high θ drops toward θ_fc and low M rises |
-| `d3_below_fc_does_not_drain` | 1x2 slope; high θ = θ_fc; after ticks high M unchanged (no leak) |
-| `d3_no_soil_drain_uphill` | 1x2; low starts θ=φ, high dry-ish; high does not gain soil/pond from low drain |
-| `d3_pond_moves_faster_than_soil` | same slope; case A pond-only on high (soils at fc); case B no pond, high at φ; after 2 ticks more mass arrives in the valley from A than from B |
+| `d31_equal_z_mobile_shares` | both sand; A starts θ=φ, B at θ_fc; after ticks B θ rises and A θ falls; no oscillation swap |
+| `d31_equal_z_below_fc_no_share` | A at θ_fc, B drier; A M unchanged |
+| `d31_downslope_beats_equal_z` | 3 cells: high wet, two lows same z; drain prefers the lower-z neighbor over a same-z highland neighbor |
