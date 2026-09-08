@@ -1995,3 +1995,164 @@ fn d6_cap_eight() {
     world.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
     assert_eq!(world.occupant_count(0, 0), 1);
 }
+
+
+// ---------------------------------------------------------------------------
+// Sprint 7 — shade scales ET (ε = MASS_EPSILON = 1e-9)
+// S = clamp(sum alive shade, 0, 1); E_eff = E*(1-S). PlantStub shade default 0.25.
+// ---------------------------------------------------------------------------
+
+/// D7: no occupants; one ET-step; pond loss == E_OPEN.
+#[test]
+fn d7_bare_et_unchanged() {
+    let h0 = 0.10;
+    let mut world = World::new(701, saturated_column(0.0, h0));
+    assert_eq!(world.occupant_count(0, 0), 0);
+    let m0 = closed_mass(&world);
+
+    tick_through_next_et(&mut world);
+
+    let h1 = world.surface_water_m();
+    assert_approx_eq(h0 - h1, E_OPEN, "bare pond drop == E_OPEN");
+    assert_approx_eq(world.et_lost(), E_OPEN, "et_lost == E_OPEN");
+    assert_approx_eq(world.extract_lost(), 0.0, "no extract on bare cell");
+    assert_mass_close(closed_mass(&world), m0);
+}
+
+/// D7: one alive PlantStub, h>0; pond loss == 0.75 * E_OPEN.
+#[test]
+fn d7_one_plant_cuts_pond_et() {
+    let h0 = 0.10;
+    let mut world = World::new(702, saturated_column(0.0, h0));
+    world.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+    assert_approx_eq(
+        world.column_at(0, 0).occupants[0].shade,
+        0.25,
+        "PlantStub default shade",
+    );
+    let m0 = closed_mass(&world);
+
+    tick_through_next_et(&mut world);
+
+    let h1 = world.surface_water_m();
+    let expected = 0.75 * E_OPEN;
+    assert_approx_eq(h0 - h1, expected, "one plant pond drop == 0.75*E_OPEN");
+    assert_approx_eq(world.et_lost(), expected, "et_lost == 0.75*E_OPEN");
+    assert_mass_close(closed_mass(&world), m0);
+}
+
+/// D7: two alive; pond loss == 0.50 * E_OPEN.
+#[test]
+fn d7_two_sum() {
+    let h0 = 0.10;
+    let mut world = World::new(703, saturated_column(0.0, h0));
+    world.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+    world.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+    let m0 = closed_mass(&world);
+
+    tick_through_next_et(&mut world);
+
+    let h1 = world.surface_water_m();
+    let expected = 0.50 * E_OPEN;
+    assert_approx_eq(h0 - h1, expected, "two plants pond drop == 0.50*E_OPEN");
+    assert_approx_eq(world.et_lost(), expected, "et_lost == 0.50*E_OPEN");
+    assert_mass_close(closed_mass(&world), m0);
+}
+
+/// D7: four alive; pond loss == 0 (S capped at 1).
+#[test]
+fn d7_shade_cap_one() {
+    let h0 = 0.10;
+    let mut world = World::new(704, saturated_column(0.0, h0));
+    for _ in 0..4 {
+        world.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+    }
+    let m0 = closed_mass(&world);
+
+    tick_through_next_et(&mut world);
+
+    let h1 = world.surface_water_m();
+    assert_approx_eq(h0 - h1, 0.0, "four plants: pond ET fully shaded");
+    assert_approx_eq(world.et_lost(), 0.0, "et_lost == 0 when S=1");
+    // Uptake still runs (plants drink soil, not pond).
+    assert!(world.extract_lost() > MASS_EPSILON, "uptake still runs under full shade");
+    assert_mass_close(closed_mass(&world), m0);
+}
+
+/// D7: wilted occupant contributes 0 shade; pond loss == E_OPEN.
+#[test]
+fn d7_wilt_no_shade() {
+    let h0 = 0.10;
+    let mut world = World::new(705, saturated_column(0.0, h0));
+    let mut occ = Occupant::plant_stub();
+    occ.alive = false;
+    assert_approx_eq(occ.shade, 0.25, "wilted stub still has shade field 0.25");
+    world.add_occupant(0, 0, occ).unwrap();
+    assert!(!world.plant_at(0, 0));
+    let m0 = closed_mass(&world);
+
+    tick_through_next_et(&mut world);
+
+    let h1 = world.surface_water_m();
+    assert_approx_eq(h0 - h1, E_OPEN, "wilted shade ignored: pond drop == E_OPEN");
+    assert_approx_eq(world.et_lost(), E_OPEN, "et_lost == E_OPEN with wilted only");
+    assert_approx_eq(world.extract_lost(), 0.0, "wilted does not extract");
+    assert_mass_close(closed_mass(&world), m0);
+}
+
+/// D7: planted, wet top, h=0; extract still P_MAX (uptake unchanged by shade).
+#[test]
+fn d7_uptake_unchanged() {
+    let tex = Texture::Sand;
+    let fc = tex.theta_fc();
+    let col = Column::new(
+        0.0,
+        0.0,
+        vec![
+            SoilLayer::new(0.3, fc, tex),
+            SoilLayer::new(0.5, fc, tex),
+        ],
+    );
+    let mut world = World::new(706, col);
+    world.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+    assert!(world.surface_water_m() <= MASS_EPSILON);
+    let m0 = closed_mass(&world);
+
+    tick_through_next_et(&mut world);
+
+    assert_approx_eq(world.extract_lost(), P_MAX, "shade does not change uptake");
+    // Soil ET still runs at 0.75 * E_SOIL.
+    assert_approx_eq(world.et_lost(), 0.75 * E_SOIL, "shaded soil ET");
+    assert_mass_close(closed_mass(&world), m0);
+}
+
+/// D7: M + et_lost + extract_lost conserved with shade active.
+#[test]
+fn d7_ledger() {
+    let tex = Texture::Sand;
+    let col = Column::new(
+        0.0,
+        0.20,
+        vec![
+            SoilLayer::new(0.3, tex.porosity(), tex),
+            SoilLayer::new(0.5, 0.25, tex),
+        ],
+    );
+    let mut world = World::new(707, col);
+    world.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+    world.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+    let rain = 0.15;
+    world.add_rain(rain);
+    let m0 = closed_mass(&world);
+
+    for _ in 0..40 {
+        world.tick();
+        assert_mass_close(closed_mass(&world), m0);
+    }
+    assert!(world.et_lost() > MASS_EPSILON, "some ET under partial shade");
+    assert!(world.extract_lost() > MASS_EPSILON, "plants extract");
+    assert_mass_close(
+        world.grid_water_mass() + world.et_lost() + world.extract_lost(),
+        m0,
+    );
+}
