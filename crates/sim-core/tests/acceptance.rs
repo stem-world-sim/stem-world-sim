@@ -331,3 +331,78 @@ fn d1_flat_equal_H_no_net_drain() {
     assert_approx_eq(world.surface_water_m_at(0, 0), surf0_a, "no net drain A");
     assert_approx_eq(world.surface_water_m_at(1, 0), surf0_b, "no net drain B");
 }
+
+// ---------------------------------------------------------------------------
+// Sprint 2.1 — D1 head-equalize (pool, no ping-pong)
+// ε: 1e-9 relative on f64 water mass (MASS_EPSILON).
+// Saturated soil (θ=φ) so pond stays on surface.
+// ---------------------------------------------------------------------------
+
+/// S02.1: 1×2 same z, all pond on A; after enough ticks h_A ≈ h_B;
+/// one extra tick does not swap (surfaces stay ≈ equal).
+#[test]
+fn d1_flat_pair_equalizes_no_oscillation() {
+    let pond = 0.2;
+    let z = 0.0;
+    let cols = vec![
+        saturated_column(z, pond), // A — all pond
+        saturated_column(z, 0.0),  // B — dry
+    ];
+    let mut world = World::grid(31, 2, 1, cols);
+    let m0 = world.grid_water_mass();
+
+    // Half-drop on flat: each tick moves half the remaining ΔH, so equalizes gradually.
+    for _ in 0..64 {
+        world.tick();
+        assert_mass_close(world.grid_water_mass(), m0);
+    }
+
+    let h_a = world.surface_water_m_at(0, 0);
+    let h_b = world.surface_water_m_at(1, 0);
+    assert_approx_eq(h_a, h_b, "surfaces should equalize");
+    assert!(
+        (h_a - pond * 0.5).abs() <= MASS_EPSILON.max(1e-6),
+        "each cell should hold ~half the pond: h_a={h_a} expected≈{}",
+        pond * 0.5
+    );
+
+    // One extra tick must not swap / oscillate.
+    world.tick();
+    let h_a2 = world.surface_water_m_at(0, 0);
+    let h_b2 = world.surface_water_m_at(1, 0);
+    assert_approx_eq(h_a2, h_b2, "after extra tick surfaces still equal");
+    assert_approx_eq(h_a2, h_a, "A must not swap away");
+    assert_approx_eq(h_b2, h_b, "B must not swap away");
+    assert_mass_close(world.grid_water_mass(), m0);
+}
+
+/// S02.1: 1×3 same z, rain on center; both ends gain surface water.
+#[test]
+fn d1_same_z_three_share() {
+    let z = 0.0;
+    let cols = vec![
+        saturated_column(z, 0.0),
+        saturated_column(z, 0.0),
+        saturated_column(z, 0.0),
+    ];
+    let mut world = World::grid(37, 3, 1, cols);
+    let rain = 0.4;
+    world.add_rain_at(1, 0, rain); // center
+    let m0 = world.grid_water_mass();
+
+    for _ in 0..64 {
+        world.tick();
+        assert_mass_close(world.grid_water_mass(), m0);
+    }
+
+    let h_left = world.surface_water_m_at(0, 0);
+    let h_right = world.surface_water_m_at(2, 0);
+    assert!(
+        h_left > MASS_EPSILON,
+        "left end should gain surface water, got {h_left}"
+    );
+    assert!(
+        h_right > MASS_EPSILON,
+        "right end should gain surface water, got {h_right}"
+    );
+}
