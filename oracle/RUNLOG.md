@@ -1,12 +1,13 @@
 # Oracle RUNLOG
 
 ```
-sprint: S04.1
+sprint: S05
 result: green
-branch: feat/s04.1-lake-snap
+branch: feat/s05-evaporation
 date: 2026-09-08 (PT)
 epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15; H_REST=0.02 m; V_REST=1e-4 m
-invariants encoded: I1, I2, I3, I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 (lake snap)
+constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10
+invariants encoded: I1, I2, I3(+et_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -49,5 +50,11 @@ tests:
   - d41_valley_lake_snaps
   - d41_snap_conserves_mass
   - d41_high_dry_not_in_valley_component
-notes: S04.1 soil percolate/lateral V=min(old cap, unused pore room); unused=0 ⇒ V=0; blocked volume not converted to pond in soil pass (fill_soil_only). After infiltrate+pond+soil: lake_snap on 4-connected components with h>V_REST and intra |ΔH|≤H_REST, only when every member has non-empty soil at φ. N≥2 always snap; N=1 also needs no mobile path to lower-z. H*=(Σh+Σz)/N; h_i=max(0,H*-z_i); Σh conserved (tiny renorm). Tick: infiltrate→pond→soil→lake_snap→at_rest(!busy). S04 sleep kept. Empty-soil pond grids keep H_REST sleep without snap. d3_hill valley starts at θ_fc (pore room) under new cap. Mass conserved; no sinks.
+  - d5_no_edge_leak
+  - d5_pond_evaps_before_soil
+  - d5_soil_evaps_below_fc
+  - d5_bot_untouched
+  - d5_batch_not_every_tick
+  - d5_mass_et_accounts
+notes: S05 closed basin — water leaves only via batched ET. Query et_lost(). Tick order: infiltrate→pond→soil→lake_snap→at_rest; clock.advance(); if tick%N_ET==0 then ET→lake_snap→rest (so ET on ticks 10,20,…). On ET-step apply E*1 (not E*N_ET). Pond first if h>0 (min(h,E_OPEN)); else top soil min(θL,E_SOIL) may go below θ_fc; bot untouched; skip take≤V_REST; ET wakes only cells that lose >V_REST. I3/mass asserts use grid_water_mass()+et_lost(). No edge flux. No new spatial state. Older long scripts capped <N_ET where absolute θ/h freezes would conflict with ET; mass-conservation scripts keep closed_mass.
 ```

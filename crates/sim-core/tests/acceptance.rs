@@ -4,7 +4,7 @@
 //! Cell area A = 1. Column water mass M = h_surf + sum(theta_i * L_i).
 //! Grid mass: sum of column M.
 
-use sim_core::{Column, SoilLayer, Texture, World, H_REST, MASS_EPSILON, R_MAX, V_REST};
+use sim_core::{Column, SoilLayer, Texture, World, E_OPEN, E_SOIL, H_REST, MASS_EPSILON, N_ET, R_MAX, V_REST};
 
 fn assert_mass_close(actual: f64, expected: f64) {
     let scale = expected.abs().max(1.0);
@@ -22,6 +22,12 @@ fn assert_approx_eq(a: f64, b: f64, label: &str) {
         (a - b).abs() <= tol,
         "{label}: {a} != {b} (tol={tol})"
     );
+}
+
+
+/// Closed-basin inventory: on-grid water + cumulative ET (I3 / S05).
+fn closed_mass(world: &World) -> f64 {
+    world.grid_water_mass() + world.et_lost()
 }
 
 /// Default Sand column (φ = 0.40). `porosity` arg kept for call-site shape; ignored — Sand φ used.
@@ -107,7 +113,7 @@ fn i2_isolated_column_mass_conserved() {
     let r = 0.2;
     world.add_rain(r);
     world.tick_until_surface_dry_or_saturated();
-    let m_final = world.water_mass();
+    let m_final = world.water_mass() + world.et_lost();
     assert_mass_close(m_final, m0 + r);
 }
 
@@ -150,6 +156,8 @@ fn i6_queries_are_kernel_methods() {
     // S04 rest queries are also kernel methods.
     let _cell_rest = world.cell_at_rest(0, 0);
     let _grid_rest = world.grid_at_rest();
+    // S05 ET sink query.
+    let _et = world.et_lost();
 
     assert!(mass >= 0.0);
     assert!(surf >= 0.0);
@@ -174,8 +182,8 @@ fn d0_rain_fits_in_pores_surface_dries() {
     world.tick_until_surface_dry_or_saturated();
 
     assert_approx_eq(world.surface_water_m(), 0.0, "surface should be dry");
-    assert!(world.water_mass() > m0);
-    assert_mass_close(world.water_mass(), m0 + r);
+    assert!(world.water_mass() + world.et_lost() > m0);
+    assert_mass_close(world.water_mass() + world.et_lost(), m0 + r);
     // Water entered soil: some theta increased / pore decreased
     assert!(world.remaining_pore_capacity_m() < pore0 - MASS_EPSILON);
 }
@@ -214,7 +222,7 @@ fn d0_novice_all_rain_vanishes_is_false() {
     world.add_rain(r);
     world.tick_until_surface_dry_or_saturated();
 
-    let m_final = world.water_mass();
+    let m_final = world.water_mass() + world.et_lost();
     let surface_dry = world.surface_water_m() <= MASS_EPSILON;
     let mass_lost = (m_final - (m0 + r)).abs() > MASS_EPSILON * (m0 + r).abs().max(1.0);
 
@@ -252,9 +260,9 @@ fn i3_closed_grid_mass_conserved() {
 
     for _ in 0..8 {
         world.tick(); // infiltrate + runoff + gravity drain
-        assert_mass_close(world.grid_water_mass(), m0);
+        assert_mass_close(closed_mass(&world), m0);
     }
-    assert_mass_close(world.grid_water_mass(), m0);
+    assert_mass_close(closed_mass(&world), m0);
 }
 
 /// I4: high+low connected pair plus isolated dry column; isolated M unchanged.
@@ -385,10 +393,10 @@ fn d1_flat_pair_equalizes_no_oscillation() {
     let mut world = World::grid(31, 2, 1, cols);
     let m0 = world.grid_water_mass();
 
-    // Half-drop + R_max: equalizes gradually; more ticks if R_max binds on larger ponds.
-    for _ in 0..128 {
+    // Half-drop + R_max: equalizes in a few ticks. Stay < N_ET so ET does not eat the pond.
+    for _ in 0..8 {
         world.tick();
-        assert_mass_close(world.grid_water_mass(), m0);
+        assert_mass_close(closed_mass(&world), m0);
     }
 
     let h_a = world.surface_water_m_at(0, 0);
@@ -407,7 +415,7 @@ fn d1_flat_pair_equalizes_no_oscillation() {
     assert_approx_eq(h_a2, h_b2, "after extra tick surfaces still equal");
     assert_approx_eq(h_a2, h_a, "A must not swap away");
     assert_approx_eq(h_b2, h_b, "B must not swap away");
-    assert_mass_close(world.grid_water_mass(), m0);
+    assert_mass_close(closed_mass(&world), m0);
 }
 
 /// S02.1: 1×3 same z, rain on center; both ends gain surface water.
@@ -424,9 +432,10 @@ fn d1_same_z_three_share() {
     world.add_rain_at(1, 0, rain); // center
     let m0 = world.grid_water_mass();
 
-    for _ in 0..128 {
+    // Stay under N_ET so pond remains to share to the ends.
+    for _ in 0..8 {
         world.tick();
-        assert_mass_close(world.grid_water_mass(), m0);
+        assert_mass_close(closed_mass(&world), m0);
     }
 
     let h_left = world.surface_water_m_at(0, 0);
@@ -519,9 +528,10 @@ fn d3_hill_soil_drains_to_valley() {
         .collect();
 
     // Mobile ≈ 0.16 m; D_max = 0.04 → need ≥ 4 drain ticks (+ infiltrate of arrivals).
-    for _ in 0..32 {
+    // Cap < N_ET so gravity-drain ≥θ_fc is not confounded by soil ET.
+    for _ in 0..9 {
         world.tick();
-        assert_mass_close(world.grid_water_mass(), m0);
+        assert_mass_close(closed_mass(&world), m0);
     }
 
     let col_high = world.column_at(0, 0);
@@ -557,9 +567,10 @@ fn d3_below_fc_does_not_drain() {
     let m_high0 = world.water_mass_at(0, 0);
     let m0 = world.grid_water_mass();
 
-    for _ in 0..16 {
+    // < N_ET: soil ET would otherwise lower cell mass without lateral drain.
+    for _ in 0..9 {
         world.tick();
-        assert_mass_close(world.grid_water_mass(), m0);
+        assert_mass_close(closed_mass(&world), m0);
     }
 
     assert_mass_close(world.water_mass_at(0, 0), m_high0);
@@ -584,9 +595,9 @@ fn d3_no_soil_drain_uphill() {
     let soil_high0 = world.column_at(0, 0).soil_water_mass();
     let m0 = world.grid_water_mass();
 
-    for _ in 0..16 {
+    for _ in 0..9 {
         world.tick();
-        assert_mass_close(world.grid_water_mass(), m0);
+        assert_mass_close(closed_mass(&world), m0);
     }
 
     assert_mass_close(world.water_mass_at(0, 0), m_high0);
@@ -670,10 +681,10 @@ fn d31_equal_z_mobile_shares() {
     let soil_b0 = world.column_at(1, 0).soil_water_mass();
     let soil_a0 = world.column_at(0, 0).soil_water_mass();
 
-    // Mobile ≈ 0.16 m; D_max = 0.04 → several ticks to share.
-    for _ in 0..32 {
+    // Mobile ≈ 0.16 m; D_max = 0.04 → several ticks to share. Cap < N_ET (no soil ET).
+    for _ in 0..9 {
         world.tick();
-        assert_mass_close(world.grid_water_mass(), m0);
+        assert_mass_close(closed_mass(&world), m0);
     }
 
     let col_a = world.column_at(0, 0);
@@ -716,7 +727,7 @@ fn d31_equal_z_mobile_shares() {
     let soil_a = col_a.soil_water_mass();
     let soil_b = col_b.soil_water_mass();
     world.tick();
-    assert_mass_close(world.grid_water_mass(), m0);
+    assert_mass_close(closed_mass(&world), m0);
     let soil_a1 = world.column_at(0, 0).soil_water_mass();
     let soil_b1 = world.column_at(1, 0).soil_water_mass();
     // If A was wetter, it should still be ≥ B (or equal within ε); never swap roles.
@@ -752,9 +763,9 @@ fn d31_equal_z_below_fc_no_share() {
     let mobile_a0 = world.column_at(0, 0).mobile_water_m();
     let m0 = world.grid_water_mass();
 
-    for _ in 0..16 {
+    for _ in 0..9 {
         world.tick();
-        assert_mass_close(world.grid_water_mass(), m0);
+        assert_mass_close(closed_mass(&world), m0);
     }
 
     assert_mass_close(world.water_mass_at(0, 0), m_a0);
@@ -788,7 +799,7 @@ fn d31_downslope_beats_equal_z() {
 
     for _ in 0..8 {
         world.tick();
-        assert_mass_close(world.grid_water_mass(), m0);
+        assert_mass_close(closed_mass(&world), m0);
     }
 
     let valley_gain = world.water_mass_at(0, 1) - m_valley0;
@@ -849,7 +860,7 @@ fn d32_top_percolates_before_lateral() {
     let m_b0 = world.water_mass_at(1, 0);
 
     world.tick();
-    assert_mass_close(world.grid_water_mass(), m0);
+    assert_mass_close(closed_mass(&world), m0);
 
     let theta_a_bot1 = world.column_at(0, 0).layers[1].theta;
     let internal_fill = (theta_a_bot1 - theta_a_bot0) * world.column_at(0, 0).layers[1].thickness_m;
@@ -930,7 +941,7 @@ fn d32_downslope_fills_soil_before_pond() {
     let h_low0 = world.surface_water_m_at(1, 0);
 
     world.tick();
-    assert_mass_close(world.grid_water_mass(), m0);
+    assert_mass_close(closed_mass(&world), m0);
 
     let m_gain = world.water_mass_at(1, 0) - m_low0;
     assert!(m_gain > MASS_EPSILON, "low column should gain mass, gain={m_gain}");
@@ -983,7 +994,7 @@ fn d32_contact_limited_by_slower_soil() {
     let m_clay0 = world.water_mass_at(1, 0);
 
     world.tick();
-    assert_mass_close(world.grid_water_mass(), m0);
+    assert_mass_close(closed_mass(&world), m0);
 
     let flux = world.water_mass_at(1, 0) - m_clay0;
     assert!(
@@ -1016,7 +1027,7 @@ fn d33_steep_face_does_not_empty_in_one_tick() {
     assert!((h0 - pond).abs() <= MASS_EPSILON);
 
     world.tick();
-    assert_mass_close(world.grid_water_mass(), m0);
+    assert_mass_close(closed_mass(&world), m0);
 
     let h1 = world.surface_water_m_at(0, 0);
     let lost = h0 - h1;
@@ -1051,7 +1062,7 @@ fn d33_same_z_gets_pond_when_face_capped() {
     let m0 = world.grid_water_mass();
 
     world.tick();
-    assert_mass_close(world.grid_water_mass(), m0);
+    assert_mass_close(closed_mass(&world), m0);
 
     let h_b = world.surface_water_m_at(1, 0);
     assert!(
@@ -1080,7 +1091,8 @@ fn d33_drowned_lake_heads_equalize_no_oscillation() {
     let dh0 = (world.column_at(0, 0).head() - world.column_at(1, 0).head()).abs();
     assert!(dh0 > MASS_EPSILON, "start with a small head gap");
 
-    let n = 20usize;
+    // End just before an ET tick so last-Δh checks are hydro-only (S05).
+    let n = 19usize;
     let mut h_hist: Vec<(f64, f64)> = Vec::with_capacity(n + 1);
     h_hist.push((
         world.surface_water_m_at(0, 0),
@@ -1089,7 +1101,7 @@ fn d33_drowned_lake_heads_equalize_no_oscillation() {
 
     for _ in 0..n {
         world.tick();
-        assert_mass_close(world.grid_water_mass(), m0);
+        assert_mass_close(closed_mass(&world), m0);
         h_hist.push((
             world.surface_water_m_at(0, 0),
             world.surface_water_m_at(1, 0),
@@ -1102,7 +1114,7 @@ fn d33_drowned_lake_heads_equalize_no_oscillation() {
         "|H_high-H_low| should shrink: start={dh0}, end={dh_final}"
     );
 
-    // Last 3 ticks: each |h| change < 1e-4 on both cells.
+    // Last 3 hydro ticks (no ET): each |h| change < 1e-4 on both cells.
     assert!(h_hist.len() >= 4);
     for k in (h_hist.len() - 3)..h_hist.len() {
         let (ha0, hb0) = h_hist[k - 1];
@@ -1177,7 +1189,7 @@ fn d331_multi_donor_no_head_inversion() {
     assert!(h_b0 > world.column_at(1, 0).head());
 
     world.tick();
-    assert_mass_close(world.grid_water_mass(), m0);
+    assert_mass_close(closed_mass(&world), m0);
 
     let h_r = world.column_at(1, 0).head();
     assert!(
@@ -1207,7 +1219,8 @@ fn d331_drowned_lake_no_period2() {
     let dh0 = (world.column_at(0, 0).head() - world.column_at(1, 0).head()).abs();
     assert!(dh0 > H_REST, "start with head gap above H_REST");
 
-    let n = 40usize;
+    // End before ET tick 40 so freeze checks are hydro-only.
+    let n = 39usize;
     let mut h_hist: Vec<(f64, f64)> = Vec::with_capacity(n + 1);
     h_hist.push((
         world.surface_water_m_at(0, 0),
@@ -1216,7 +1229,7 @@ fn d331_drowned_lake_no_period2() {
 
     for _ in 0..n {
         world.tick();
-        assert_mass_close(world.grid_water_mass(), m0);
+        assert_mass_close(closed_mass(&world), m0);
         h_hist.push((
             world.surface_water_m_at(0, 0),
             world.surface_water_m_at(1, 0),
@@ -1258,9 +1271,9 @@ fn d331_drowned_lake_no_period2() {
     let dh3_0 = (w3.column_at(0, 0).head() - w3.column_at(1, 0).head()).abs();
     let mut v_hist = Vec::with_capacity(41);
     v_hist.push(w3.surface_water_m_at(1, 0));
-    for _ in 0..40 {
+    for _ in 0..39 {
         w3.tick();
-        assert_mass_close(w3.grid_water_mass(), m3);
+        assert_mass_close(w3.grid_water_mass() + w3.et_lost(), m3);
         v_hist.push(w3.surface_water_m_at(1, 0));
     }
     let dh3 = (w3.column_at(0, 0).head() - w3.column_at(1, 0).head()).abs();
@@ -1325,7 +1338,7 @@ fn d4_drowned_lake_reaches_rest() {
     let mut n_rest = 0usize;
     for n in 1..=100 {
         world.tick();
-        assert_mass_close(world.grid_water_mass(), m0);
+        assert_mass_close(closed_mass(&world), m0);
         if world.grid_at_rest() {
             reached = true;
             n_rest = n;
@@ -1349,9 +1362,16 @@ fn d4_drowned_lake_reaches_rest() {
         }
     }
 
-    for _ in 0..10 {
+    // Between ET-steps, sleep holds and h is frozen. Stop before the next ET wake.
+    let t = world.tick_count();
+    let safe = if t % N_ET == 0 {
+        N_ET - 1
+    } else {
+        N_ET - (t % N_ET) - 1
+    };
+    for _ in 0..safe {
         world.tick();
-        assert_mass_close(world.grid_water_mass(), m0);
+        assert_mass_close(closed_mass(&world), m0);
         assert!(world.grid_at_rest(), "must stay at rest once reached (after {n_rest} ticks)");
     }
 
@@ -1419,14 +1439,14 @@ fn d4_closed_mass_still_conserved() {
 
     for _ in 0..64 {
         world.tick();
-        assert_mass_close(world.grid_water_mass(), m0);
+        assert_mass_close(closed_mass(&world), m0);
     }
     // Drive toward rest and keep checking mass.
     for _ in 0..64 {
         world.tick();
-        assert_mass_close(world.grid_water_mass(), m0);
+        assert_mass_close(closed_mass(&world), m0);
     }
-    assert_mass_close(world.grid_water_mass(), m0);
+    assert_mass_close(closed_mass(&world), m0);
     let _ = V_REST; // floor is part of the rest path under test
 }
 
@@ -1469,7 +1489,7 @@ fn d41_no_soil_into_full() {
     );
 
     world.tick();
-    assert_mass_close(world.grid_water_mass(), m0);
+    assert_mass_close(closed_mass(&world), m0);
 
     for (i, layer) in world.column_at(1, 0).layers.iter().enumerate() {
         assert_approx_eq(layer.theta, theta_recv0[i], &format!("receiver θ[{i}] unchanged"));
@@ -1543,9 +1563,9 @@ fn d41_snap_conserves_mass() {
     let m0 = world.grid_water_mass();
     for _ in 0..5 {
         world.tick();
-        assert_mass_close(world.grid_water_mass(), m0);
+        assert_mass_close(closed_mass(&world), m0);
     }
-    assert_mass_close(world.grid_water_mass(), m0);
+    assert_mass_close(closed_mass(&world), m0);
 }
 
 /// D41: z=8 dry high next to z=2 lake; high h stays 0 (not pulled into valley component).
@@ -1562,11 +1582,190 @@ fn d41_high_dry_not_in_valley_component() {
 
     for _ in 0..5 {
         world.tick();
-        assert_mass_close(world.grid_water_mass(), m0);
+        assert_mass_close(closed_mass(&world), m0);
         assert!(
             world.surface_water_m_at(1, 0) <= MASS_EPSILON,
             "high dry cell must keep h=0, got {}",
             world.surface_water_m_at(1, 0)
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 5 — batched evaporation (closed basin)
+// ET when clock.tick % N_ET == 0 after advance (ticks 10,20,…). E*1 per ET-step.
+// ---------------------------------------------------------------------------
+
+/// Advance until the next ET-step completes (clock.tick % N_ET == 0 after tick).
+fn tick_through_next_et(world: &mut World) {
+    loop {
+        world.tick();
+        if world.tick_count() % N_ET == 0 {
+            break;
+        }
+    }
+}
+
+/// D5: pond against map edge; many ticks; M + et_lost conserved; no off-grid dump.
+#[test]
+fn d5_no_edge_leak() {
+    // Corner/edge pond on a 2×2 map — missing neighbors are glass.
+    let cols = vec![
+        saturated_column(0.0, 0.5), // (0,0) edge pond
+        saturated_column(0.0, 0.0),
+        saturated_column(0.0, 0.0),
+        saturated_column(0.0, 0.0),
+    ];
+    let mut world = World::grid(501, 2, 2, cols);
+    let m0 = world.grid_water_mass();
+    assert_approx_eq(world.et_lost(), 0.0, "et starts at 0");
+
+    for _ in 0..50 {
+        world.tick();
+        assert_mass_close(closed_mass(&world), m0);
+    }
+    assert!(world.et_lost() > MASS_EPSILON, "ET should have removed some water");
+    assert_mass_close(closed_mass(&world), m0);
+}
+
+/// D5: h>0 and wet top; one ET-step; h dropped, θ_top unchanged.
+#[test]
+fn d5_pond_evaps_before_soil() {
+    let h0 = 0.10;
+    // Saturated soil so pond stays on surface (no infiltrate room).
+    let mut world = World::new(502, saturated_column(0.0, h0));
+    let theta_top0 = world.column_at(0, 0).layers[0].theta;
+    let m0 = world.grid_water_mass();
+
+    tick_through_next_et(&mut world);
+
+    let h1 = world.surface_water_m();
+    assert!(
+        (h0 - h1 - E_OPEN).abs() <= 1e-9 || (h1 < h0 - MASS_EPSILON),
+        "pond should drop by ~E_OPEN: h0={h0} h1={h1} E_OPEN={E_OPEN}"
+    );
+    assert!(
+        (h0 - h1 - E_OPEN).abs() <= MASS_EPSILON.max(1e-9),
+        "exact pond take: expected drop {E_OPEN}, got {}",
+        h0 - h1
+    );
+    assert_approx_eq(
+        world.column_at(0, 0).layers[0].theta,
+        theta_top0,
+        "θ_top unchanged when pond evaporates",
+    );
+    assert_mass_close(closed_mass(&world), m0);
+    assert!(world.et_lost() > V_REST);
+}
+
+/// D5: h=0, top at θ_fc; enough ET-steps; θ_top < θ_fc.
+#[test]
+fn d5_soil_evaps_below_fc() {
+    let tex = Texture::Sand;
+    let fc = tex.theta_fc();
+    let cols = vec![field_capacity_column(0.0, 0.0)];
+    let mut world = World::grid(503, 1, 1, cols);
+    assert!(world.surface_water_m() <= MASS_EPSILON);
+    let m0 = world.grid_water_mass();
+
+    // Each ET takes E_SOIL from top (L=0.3) → Δθ = E_SOIL/0.3 per ET.
+    assert!(E_SOIL > V_REST, "E_SOIL must exceed V_REST to actually evaporate");
+    // A few ET-steps push θ below fc.
+    for _ in 0..30 {
+        world.tick();
+        assert_mass_close(closed_mass(&world), m0);
+    }
+
+    let theta_top = world.column_at(0, 0).layers[0].theta;
+    assert!(
+        theta_top < fc - MASS_EPSILON,
+        "θ_top should fall below θ_fc={fc}, got {theta_top}"
+    );
+    assert!(world.et_lost() > MASS_EPSILON);
+}
+
+/// D5: top dries; bot stays.
+#[test]
+fn d5_bot_untouched() {
+    let tex = Texture::Sand;
+    let fc = tex.theta_fc();
+    let col = Column::new(
+        0.0,
+        0.0,
+        vec![
+            SoilLayer::new(0.3, fc, tex),
+            SoilLayer::new(0.5, fc, tex),
+        ],
+    );
+    let mut world = World::new(504, col);
+    let theta_bot0 = world.column_at(0, 0).layers[1].theta;
+    let m0 = world.grid_water_mass();
+
+    // Enough ET to dry the top layer (θ*L = fc*0.3 = 0.06; E_SOIL=0.005 → 12 ET-steps).
+    for _ in 0..(N_ET as usize * 15) {
+        world.tick();
+        assert_mass_close(closed_mass(&world), m0);
+    }
+
+    let top = &world.column_at(0, 0).layers[0];
+    let bot = &world.column_at(0, 0).layers[1];
+    assert!(
+        top.theta * top.thickness_m <= V_REST + MASS_EPSILON
+            || top.theta < fc * 0.5,
+        "top should be substantially dried, θ={}",
+        top.theta
+    );
+    assert_approx_eq(bot.theta, theta_bot0, "bot layer untouched by ET");
+}
+
+/// D5: N_et hydro ticks with no ET-step in between; M unchanged until the ET tick.
+#[test]
+fn d5_batch_not_every_tick() {
+    let mut world = World::new(505, saturated_column(0.0, 0.25));
+    let m0 = world.grid_water_mass();
+    assert_eq!(world.tick_count(), 0);
+    assert_approx_eq(world.et_lost(), 0.0, "no ET yet");
+
+    // Ticks 1..N_ET-1: hydro only, no ET.
+    for i in 1..N_ET {
+        world.tick();
+        assert_eq!(world.tick_count(), i);
+        assert_approx_eq(world.et_lost(), 0.0, &format!("no ET before tick {N_ET}"));
+        assert_mass_close(world.grid_water_mass(), m0);
+        assert_mass_close(closed_mass(&world), m0);
+    }
+
+    // Tick N_ET: ET fires.
+    world.tick();
+    assert_eq!(world.tick_count(), N_ET);
+    assert!(
+        world.et_lost() > V_REST,
+        "ET-step at tick {N_ET} should evaporate, et_lost={}",
+        world.et_lost()
+    );
+    assert!(
+        world.grid_water_mass() < m0 - V_REST,
+        "on-grid M should drop on the ET tick"
+    );
+    assert_mass_close(closed_mass(&world), m0);
+    assert_approx_eq(world.et_lost(), E_OPEN, "one pond ET-step takes E_OPEN");
+}
+
+/// D5: rain then ET; M + et_lost == initial + rain.
+#[test]
+fn d5_mass_et_accounts() {
+    let mut world = World::new(506, saturated_column(1.0, 0.0));
+    let m_initial = world.grid_water_mass();
+    let rain = 0.30;
+    world.add_rain(rain);
+    let m0 = world.grid_water_mass(); // initial + rain
+    assert_mass_close(m0, m_initial + rain);
+
+    for _ in 0..40 {
+        world.tick();
+        assert_mass_close(closed_mass(&world), m0);
+    }
+
+    assert!(world.et_lost() > MASS_EPSILON, "rain then ET should lose some water");
+    assert_mass_close(world.grid_water_mass() + world.et_lost(), m_initial + rain);
 }
