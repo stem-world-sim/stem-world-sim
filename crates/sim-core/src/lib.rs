@@ -1,10 +1,11 @@
-//! Stem World Sim — Sprint 8 awake set + catch-up (closed basin).
+//! Stem World Sim — Sprint 9 region observe + scoped catch-up (closed basin).
 //!
 //! Water mass (A = 1): M = h_surf + sum_i (theta_i * L_i)
 //! Grid mass: sum of column M. Closed basin: M + et_lost() + extract_lost() == mass ever added.
 //! Tick order: infiltrate → pond → soil → lake_snap → at_rest/awake prune; advance clock;
 //! if clock.tick % N_ET == 0: ET → occupants → lake_snap → rest/awake again.
-//! Hydro visits only the awake set. Rain / add_occupant / flux / catch_up wake cell+4-nbrs.
+//! Hydro + sinks visit observed-chunk cells ∪ awake set. CHUNK=8; ignore only if at_rest.
+//! Rain / add_occupant / flux / catch_up wake cell+4-nbrs.
 //! After a tick, at_rest cells whose 4-neighbors are also at_rest leave the awake set.
 //! Pond: every lower-H 4-neighbor with ΔH > H_REST, weights ∝ ΔH, each edge ≤ R_MAX
 //! and ≤ 0.5 ΔH; donor-scale then receiver-cap; drop V ≤ V_REST. Mass conserved.
@@ -16,6 +17,7 @@
 //! S = clamp(sum alive shade, 0, 1); E_eff = E * (1 - S). PlantStub shade default 0.25.
 //! Occupants: per-cell list ≤ MAX_OCCUPANTS; PlantStub uptake by root mask; wilt at T_WILT.
 //! catch_up(K, rain): source → settle ≤ T_SETTLE hydro → one batched K-sink pass.
+//! catch_up_chunk: same order on one chunk + 1-cell halo; other chunks unchanged.
 //! Unique-min-H chute revoked. Capillary stays.
 
 /// Absolute / relative tolerance for water-mass comparisons (f64).
@@ -53,6 +55,9 @@ pub const T_WILT: u32 = 3;
 
 /// Max live hydro settle ticks inside [`World::catch_up`]. S08.
 pub const T_SETTLE: u64 = 64;
+
+/// Chunk edge length in cells (`chunk_id(x,y) = (x/CHUNK, y/CHUNK)`). S09.
+pub const CHUNK: usize = 8;
 
 /// Soil texture: porosity, field capacity, infiltrate and drain rate limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +147,16 @@ impl Occupant {
 /// Error when [`World::add_occupant`] would exceed [`MAX_OCCUPANTS`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OccupantsFull;
+
+/// Returned by [`World::ignore_chunk`] when any cell in the chunk is not at_rest. S09.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChunkBusy;
+
+#[derive(Clone, Debug, PartialEq)]
+struct ChunkState {
+    observed: bool,
+    t_away: u64,
+}
 
 /// One soil layer: thickness L, volumetric moisture theta, texture (φ from table).
 #[derive(Clone, Debug, PartialEq)]
@@ -521,8 +536,14 @@ pub struct World {
     columns: Vec<Column>,
     /// Per-cell rest flag (updated end of each tick).
     at_rest: Vec<bool>,
-    /// Explicit awake set: hydro visits only these cells. S08.
+    /// Explicit awake set. S08.
     awake: Vec<bool>,
+    /// Chunk grid (CHUNK×CHUNK cells); visit = observed ∪ awake. S09.
+    n_chunk_x: usize,
+    n_chunk_y: usize,
+    chunks: Vec<ChunkState>,
+    /// Cells in the visit set of the last [`Self::hydro_step`]. S09.
+    last_hydro_visits: usize,
     /// Cumulative water depth evaporated (A = 1); closed-basin sink. S05.
     et_lost: f64,
     /// Cumulative water depth extracted by occupants (A = 1). S06.
@@ -532,6 +553,7 @@ pub struct World {
 impl World {
     /// S01 constructor: 1×1 grid with the given column.
     pub fn new(seed: u64, column: Column) -> Self {
+        let (n_chunk_x, n_chunk_y, chunks) = Self::make_chunks(1, 1);
         Self {
             seed,
             clock: Clock::new(),
@@ -540,6 +562,10 @@ impl World {
             columns: vec![column],
             at_rest: vec![false],
             awake: vec![true],
+            n_chunk_x,
+            n_chunk_y,
+            chunks,
+            last_hydro_visits: 0,
             et_lost: 0.0,
             extract_lost: 0.0,
         }
@@ -554,6 +580,7 @@ impl World {
             "columns.len() must equal width * height"
         );
         let n = columns.len();
+        let (n_chunk_x, n_chunk_y, chunks) = Self::make_chunks(width, height);
         Self {
             seed,
             clock: Clock::new(),
@@ -562,6 +589,10 @@ impl World {
             columns,
             at_rest: vec![false; n],
             awake: vec![true; n],
+            n_chunk_x,
+            n_chunk_y,
+            chunks,
+            last_hydro_visits: 0,
             et_lost: 0.0,
             extract_lost: 0.0,
         }
@@ -706,6 +737,192 @@ impl World {
         self.awake.iter().filter(|&&a| a).count()
     }
 
+    /// S09: number of chunks currently marked observed.
+    pub fn observed_chunk_count(&self) -> usize {
+        self.chunks.iter().filter(|c| c.observed).count()
+    }
+
+    /// S09: cells visited by the most recent hydro step (observed ∪ awake).
+    pub fn last_hydro_visits(&self) -> usize {
+        self.last_hydro_visits
+    }
+
+    /// S09: mark chunk (cx, cy) observed and reset t_away.
+    pub fn observe_chunk(&mut self, cx: usize, cy: usize) {
+        let i = self.chunk_index(cx, cy);
+        self.chunks[i].observed = true;
+        self.chunks[i].t_away = 0;
+    }
+
+    /// S09: ignore chunk if every cell is at_rest; else Err and stay observed.
+    pub fn ignore_chunk(&mut self, cx: usize, cy: usize) -> Result<(), ChunkBusy> {
+        let i = self.chunk_index(cx, cy);
+        if !self.chunk_cells_at_rest(cx, cy) {
+            return Err(ChunkBusy);
+        }
+        self.chunks[i].observed = false;
+        self.chunks[i].t_away = 0;
+        Ok(())
+    }
+
+    /// S09: S08 catch-up order on chunk (cx,cy) plus a 1-cell (4-neighbor) halo.
+    /// Other chunks' cells are not sourced or sink-processed.
+    pub fn catch_up_chunk(&mut self, cx: usize, cy: usize, k: u32, rain_per_step: f64) {
+        debug_assert!(rain_per_step >= 0.0, "rain_per_step must be non-negative");
+        let _ = self.chunk_index(cx, cy); // bounds check
+        let region = self.chunk_halo_mask(cx, cy);
+        let n = self.columns.len();
+        let k_u = k as u64;
+
+        if k > 0 {
+            let add = (k as f64) * rain_per_step;
+            if add > 0.0 {
+                for i in 0..n {
+                    if region[i] {
+                        self.columns[i].surface_water_m += add;
+                        self.wake_idx(i);
+                    }
+                }
+            }
+        }
+
+        // Settle: donors = awake ∩ region; receivers clipped to region so pond
+        // may leave the chunk into the halo but not cascade across far chunks.
+        if k > 0 || self.awake.iter().any(|&a| a) {
+            for _ in 0..T_SETTLE {
+                let mut active = vec![false; n];
+                let mut any = false;
+                for i in 0..n {
+                    if region[i] && self.awake[i] {
+                        active[i] = true;
+                        any = true;
+                    }
+                }
+                if !any {
+                    break;
+                }
+                self.hydro_step_active(&active, Some(&region));
+            }
+        }
+
+        if k > 0 {
+            let mut sink_busy = vec![false; n];
+            for _ in 0..k {
+                self.et_pass(&mut sink_busy, Some(&region));
+                self.occupant_pass(&mut sink_busy, Some(&region));
+            }
+            self.lake_snap();
+            for i in 0..n {
+                if !region[i] {
+                    continue;
+                }
+                self.at_rest[i] = !sink_busy[i];
+                if sink_busy[i] {
+                    self.awake[i] = true;
+                }
+            }
+            self.prune_awake();
+        }
+
+        // Catch-up clears away-time for this chunk (still ignored unless observed).
+        let ci = self.chunk_index(cx, cy);
+        self.chunks[ci].t_away = 0;
+
+        self.clock.tick = self.clock.tick.saturating_add(k_u.saturating_mul(N_ET));
+    }
+
+    fn make_chunks(width: usize, height: usize) -> (usize, usize, Vec<ChunkState>) {
+        let n_chunk_x = (width + CHUNK - 1) / CHUNK;
+        let n_chunk_y = (height + CHUNK - 1) / CHUNK;
+        // Default observed=true so W*H<=12 (and larger) stay live; tests ignore explicitly.
+        let chunks = vec![
+            ChunkState {
+                observed: true,
+                t_away: 0,
+            };
+            n_chunk_x * n_chunk_y
+        ];
+        (n_chunk_x, n_chunk_y, chunks)
+    }
+
+    fn chunk_index(&self, cx: usize, cy: usize) -> usize {
+        assert!(
+            cx < self.n_chunk_x && cy < self.n_chunk_y,
+            "chunk ({cx},{cy}) out of bounds {}x{}",
+            self.n_chunk_x,
+            self.n_chunk_y
+        );
+        cy * self.n_chunk_x + cx
+    }
+
+    fn chunk_id_of_cell(&self, x: usize, y: usize) -> (usize, usize) {
+        (x / CHUNK, y / CHUNK)
+    }
+
+    fn chunk_observed_at_cell(&self, x: usize, y: usize) -> bool {
+        let (cx, cy) = self.chunk_id_of_cell(x, y);
+        self.chunks[self.chunk_index(cx, cy)].observed
+    }
+
+    fn chunk_cells_at_rest(&self, cx: usize, cy: usize) -> bool {
+        let x0 = cx * CHUNK;
+        let y0 = cy * CHUNK;
+        let x1 = ((cx + 1) * CHUNK).min(self.width);
+        let y1 = ((cy + 1) * CHUNK).min(self.height);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if !self.at_rest[y * self.width + x] {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Cells in chunk (cx,cy) plus any cell that is a 4-neighbor of a chunk cell.
+    fn chunk_halo_mask(&self, cx: usize, cy: usize) -> Vec<bool> {
+        let n = self.columns.len();
+        let mut in_chunk = vec![false; n];
+        let x0 = cx * CHUNK;
+        let y0 = cy * CHUNK;
+        let x1 = ((cx + 1) * CHUNK).min(self.width);
+        let y1 = ((cy + 1) * CHUNK).min(self.height);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                in_chunk[y * self.width + x] = true;
+            }
+        }
+        let mut region = in_chunk.clone();
+        for y in y0..y1 {
+            for x in x0..x1 {
+                for &(dx, dy) in &NEIGHBOR_OFFSETS {
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    if nx < 0 || ny < 0 || nx as usize >= self.width || ny as usize >= self.height {
+                        continue;
+                    }
+                    region[ny as usize * self.width + nx as usize] = true;
+                }
+            }
+        }
+        region
+    }
+
+    /// Visit mask for live ticks: observed-chunk cells ∪ awake set.
+    fn visit_mask(&self) -> Vec<bool> {
+        let n = self.columns.len();
+        let mut v = vec![false; n];
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let i = y * self.width + x;
+                if self.awake[i] || self.chunk_observed_at_cell(x, y) {
+                    v[i] = true;
+                }
+            }
+        }
+        v
+    }
+
     /// Grid water mass = sum of column M (I3).
     pub fn grid_water_mass(&self) -> f64 {
         self.columns.iter().map(Column::water_mass).sum()
@@ -779,16 +996,26 @@ impl World {
         self.hydro_step();
         self.clock.advance();
 
+        // S09: ignored chunks accumulate away-time each live tick.
+        for ch in &mut self.chunks {
+            if !ch.observed {
+                ch.t_away = ch.t_away.saturating_add(1);
+            }
+        }
+
         // S05/S06 sink batch: after advance, when tick is a multiple of N_ET.
-        // Live sinks still scan all cells (cheap early-outs) so S05–S07 cadence holds;
-        // cells that actually lose water re-enter the awake set.
+        // S09: sinks only on observed ∪ awake (same visit set as hydro).
         if self.clock.tick % N_ET == 0 {
             let n = self.columns.len();
+            let active = self.visit_mask();
             let mut sink_busy = vec![false; n];
-            self.et_pass(&mut sink_busy);
-            self.occupant_pass(&mut sink_busy);
+            self.et_pass(&mut sink_busy, Some(&active));
+            self.occupant_pass(&mut sink_busy, Some(&active));
             self.lake_snap();
             for i in 0..n {
+                if !active[i] {
+                    continue;
+                }
                 self.at_rest[i] = !sink_busy[i];
                 if sink_busy[i] {
                     self.awake[i] = true;
@@ -837,8 +1064,8 @@ impl World {
         if k > 0 {
             let mut sink_busy = vec![false; n];
             for _ in 0..k {
-                self.et_pass(&mut sink_busy);
-                self.occupant_pass(&mut sink_busy);
+                self.et_pass(&mut sink_busy, None);
+                self.occupant_pass(&mut sink_busy, None);
             }
             self.lake_snap();
             for i in 0..n {
@@ -854,17 +1081,25 @@ impl World {
         self.clock.tick = self.clock.tick.saturating_add(k_u.saturating_mul(N_ET));
     }
 
-    /// Hydro-only step (no clock, no ET): infiltrate → pond → soil → snap → rest/awake.
+    /// Hydro-only step (no clock, no ET): visit = observed ∪ awake. S09.
     fn hydro_step(&mut self) {
+        let active = self.visit_mask();
+        self.hydro_step_active(&active, None);
+    }
+
+    /// Hydro-only step over an explicit active mask.
+    /// If `receiver_bound` is set, pond/soil edges may only deliver inside that mask
+    /// (used by [`Self::catch_up_chunk`] to keep flux inside chunk+halo).
+    fn hydro_step_active(&mut self, active: &[bool], receiver_bound: Option<&[bool]>) {
         let n = self.columns.len();
-        let active = self.awake.clone();
+        self.last_hydro_visits = active.iter().filter(|&&a| a).count();
         let mut busy = vec![false; n];
         let mut flux_recv = vec![false; n];
 
-        self.infiltrate_active(&active, &mut busy);
-        self.pond_pass(&active, &mut busy, &mut flux_recv);
-        let percolated = self.percolate_active(&active, &mut busy);
-        self.lateral_drain_pass(&percolated, &active, &mut busy, &mut flux_recv);
+        self.infiltrate_active(active, &mut busy);
+        self.pond_pass(active, &mut busy, &mut flux_recv, receiver_bound);
+        let percolated = self.percolate_active(active, &mut busy);
+        self.lateral_drain_pass(&percolated, active, &mut busy, &mut flux_recv, receiver_bound);
         self.lake_snap();
 
         for i in 0..n {
@@ -873,6 +1108,10 @@ impl World {
             }
         }
         for i in 0..n {
+            // Only update rest flags for cells we visited; ignored sleepers stay put.
+            if !active[i] {
+                continue;
+            }
             self.at_rest[i] = !busy[i];
             if busy[i] {
                 self.awake[i] = true;
@@ -1002,7 +1241,13 @@ impl World {
     /// Then receiver cap: for each j, room = max(0, min(donor H) − H_j); if In > room scale by room/In.
     /// After all scales, drop V ≤ V_REST. Only active cells donate; receivers may be sleeping.
     /// Apply after both caps. Equal H ⇒ no flux. Closed boundary.
-    fn pond_pass(&mut self, active: &[bool], busy: &mut [bool], flux_recv: &mut [bool]) {
+    fn pond_pass(
+        &mut self,
+        active: &[bool],
+        busy: &mut [bool],
+        flux_recv: &mut [bool],
+        receiver_bound: Option<&[bool]>,
+    ) {
         let n = self.columns.len();
         if n == 0 {
             return;
@@ -1039,6 +1284,11 @@ impl World {
                         continue;
                     }
                     let j = ny as usize * self.width + nx as usize;
+                    if let Some(bound) = receiver_bound {
+                        if !bound[j] {
+                            continue;
+                        }
+                    }
                     let h_nbr = heads[j];
                     if h_nbr < h_head {
                         let d_h = h_head - h_nbr;
@@ -1165,6 +1415,7 @@ impl World {
         active: &[bool],
         busy: &mut [bool],
         flux_recv: &mut [bool],
+        receiver_bound: Option<&[bool]>,
     ) {
         let n = self.columns.len();
         if n == 0 {
@@ -1209,6 +1460,11 @@ impl World {
                         continue;
                     }
                     let j = ny as usize * self.width + nx as usize;
+                    if let Some(bound) = receiver_bound {
+                        if !bound[j] {
+                            continue;
+                        }
+                    }
                     let z_nbr = elevations[j];
                     if z_nbr < z_i {
                         lower.push((j, z_nbr));
@@ -1338,9 +1594,14 @@ impl World {
     /// S05/S07 batched evaporation: one ET-step (E*1). Pond first if h>0, else top soil.
     /// S = clamp(sum alive shade, 0, 1); E_eff = E * (1 - S). Dead/wilted shade = 0.
     /// Skip take ≤ V_REST. Wakes cells that lose > V_REST via `busy`.
-    fn et_pass(&mut self, busy: &mut [bool]) {
+    fn et_pass(&mut self, busy: &mut [bool], active: Option<&[bool]>) {
         let n = self.columns.len();
         for i in 0..n {
+            if let Some(mask) = active {
+                if !mask[i] {
+                    continue;
+                }
+            }
             let (take, from_pond) = {
                 let col = &self.columns[i];
                 let sum_shade: f64 = col
@@ -1382,9 +1643,14 @@ impl World {
     /// S06 occupant extract after ET on the same sink cadence. Alive occupants in
     /// insert order: demand u = uptake_max; take min(u*root[k], θ_k*L) per layer
     /// (below θ_fc OK). No pond drink. Wilt after T_WILT consecutive dry steps.
-    fn occupant_pass(&mut self, busy: &mut [bool]) {
+    fn occupant_pass(&mut self, busy: &mut [bool], active: Option<&[bool]>) {
         let n = self.columns.len();
         for i in 0..n {
+            if let Some(mask) = active {
+                if !mask[i] {
+                    continue;
+                }
+            }
             // Collect per-occupant totals then mutate layers / dry_steps.
             let occ_len = self.columns[i].occupants.len();
             if occ_len == 0 {
