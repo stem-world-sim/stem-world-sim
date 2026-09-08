@@ -1,14 +1,14 @@
 # SPEC – Named invariants and demo predicates
 
-**Version:** 0.3
-**Date:** 2026-09-07
+**Version:** 0.4
+**Date:** 2026-09-08
 **Status:** Fast-clock input. Oracle implements what is named here. Oracle does not edit this file.
 
-ε suggested 1e-9 relative for f64 mass. Document ε in the test. A = 1.
+ε suggested 1e-9 relative for f64 mass. A = 1.
 
 ## Active slice
 
-Sprint 2 (see `docs/sprints/CURRENT.md`). D2–D3 scheduled, not active.
+Sprint 2.1 (see `docs/sprints/CURRENT.md`).
 
 ### Shared quantities
 
@@ -31,6 +31,14 @@ Sprint 2 (see `docs/sprints/CURRENT.md`). D2–D3 scheduled, not active.
 
 **I6** Win/fail numbers come from kernel queries only.
 
+### Surface routing (S02.1)
+
+Tick: infiltrate all columns, then one simultaneous runoff pass. Surface only.
+A cell may send only to 4-neighbors with strictly lower H.
+Among those, take the set T with the lowest H and split
+V = min(h_i, 0.5 * (H_i - H*)) equally across T.
+Closed boundary.
+
 ### Not yet
 
 Evapotranspiration, aquifers, Navier-Stokes, plant genetics, orbits, stoichiometry, heat.
@@ -38,7 +46,5 @@ Evapotranspiration, aquifers, Navier-Stokes, plant genetics, orbits, stoichiomet
 ## Demo predicates
 
 **D0 column_rain** — S01, still must pass.
-
-**D1 slope_runoff** — S02. Surface water follows lower H. See ACCEPTANCE.md and S02-slope-runoff.md.
-
+**D1 slope_runoff** — S02 + S02.1 pooling.
 **D2 plant_thirst**, **D3 proxy_farm** — later.
