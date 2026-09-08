@@ -4,7 +4,7 @@
 //! Cell area A = 1. Column water mass M = h_surf + sum(theta_i * L_i).
 //! Grid mass: sum of column M.
 
-use sim_core::{Column, SoilLayer, World, MASS_EPSILON};
+use sim_core::{Column, SoilLayer, Texture, World, MASS_EPSILON};
 
 fn assert_mass_close(actual: f64, expected: f64) {
     let scale = expected.abs().max(1.0);
@@ -24,26 +24,53 @@ fn assert_approx_eq(a: f64, b: f64, label: &str) {
     );
 }
 
-fn default_column(theta: f64, porosity: f64) -> Column {
+/// Default Sand column (φ = 0.40). `porosity` arg kept for call-site shape; ignored — Sand φ used.
+fn default_column(theta: f64, _porosity: f64) -> Column {
     Column::new(
         10.0,
         0.0,
         vec![
-            SoilLayer::new(0.3, theta, porosity),
-            SoilLayer::new(0.5, theta, porosity),
+            SoilLayer::new(0.3, theta, Texture::Sand),
+            SoilLayer::new(0.5, theta, Texture::Sand),
         ],
     )
 }
 
-/// Saturated soil so pond stays on the surface for runoff tests.
+/// Saturated Sand soil (θ = φ) so pond stays on the surface for runoff tests.
 fn saturated_column(elevation_m: f64, surface_water_m: f64) -> Column {
-    let phi = 0.4;
+    let tex = Texture::Sand;
+    let phi = tex.porosity();
     Column::new(
         elevation_m,
         surface_water_m,
         vec![
-            SoilLayer::new(0.3, phi, phi),
-            SoilLayer::new(0.5, phi, phi),
+            SoilLayer::new(0.3, phi, tex),
+            SoilLayer::new(0.5, phi, tex),
+        ],
+    )
+}
+
+/// Column at field capacity (θ = θ_fc) — no mobile soil water; pore space remains.
+fn field_capacity_column(elevation_m: f64, surface_water_m: f64) -> Column {
+    let tex = Texture::Sand;
+    let fc = tex.theta_fc();
+    Column::new(
+        elevation_m,
+        surface_water_m,
+        vec![
+            SoilLayer::new(0.3, fc, tex),
+            SoilLayer::new(0.5, fc, tex),
+        ],
+    )
+}
+
+fn textured_column(elevation_m: f64, surface_water_m: f64, theta: f64, texture: Texture) -> Column {
+    Column::new(
+        elevation_m,
+        surface_water_m,
+        vec![
+            SoilLayer::new(0.3, theta, texture),
+            SoilLayer::new(0.5, theta, texture),
         ],
     )
 }
@@ -95,8 +122,9 @@ fn i5_same_seed_same_script_same_state() {
         w.tick_until_surface_dry_or_saturated();
     };
 
-    let mut a = World::new(seed, default_column(0.1, 0.35));
-    let mut b = World::new(seed, default_column(0.1, 0.35));
+    // Sand default (phi 0.4); prior 0.35 porosity migrated to Texture::Sand.
+    let mut a = World::new(seed, default_column(0.1, 0.4));
+    let mut b = World::new(seed, default_column(0.1, 0.4));
     script(&mut a);
     script(&mut b);
 
@@ -109,7 +137,8 @@ fn i5_same_seed_same_script_same_state() {
 /// I6: win/fail numbers come from kernel query methods only.
 #[test]
 fn i6_queries_are_kernel_methods() {
-    let mut world = World::new(1, default_column(0.2, 0.45));
+    // Sand default; prior 0.45 porosity migrated to Texture::Sand.
+    let mut world = World::new(1, default_column(0.2, 0.4));
     world.add_rain(0.08);
     world.tick_until_surface_dry_or_saturated();
 
@@ -205,7 +234,7 @@ fn d0_novice_all_rain_vanishes_is_false() {
 // ε: 1e-9 relative on f64 water mass (MASS_EPSILON).
 // ---------------------------------------------------------------------------
 
-/// I3: closed grid, no sink — rain on one cell; infiltrate+runoff; sum M constant ±ε.
+/// I3: closed grid, no sink — rain on one cell; infiltrate+runoff+drain; sum M constant ±ε.
 #[test]
 fn i3_closed_grid_mass_conserved() {
     // 1×2 closed grid; rain on x=0.
@@ -219,20 +248,21 @@ fn i3_closed_grid_mass_conserved() {
     let m0 = world.grid_water_mass();
 
     for _ in 0..8 {
-        world.tick(); // infiltrate all + runoff
+        world.tick(); // infiltrate + runoff + gravity drain
         assert_mass_close(world.grid_water_mass(), m0);
     }
     assert_mass_close(world.grid_water_mass(), m0);
 }
 
 /// I4: high+low connected pair plus isolated dry column; isolated M unchanged.
+/// Isolated cell uses θ = θ_fc so gravity drain does not empty it downhill.
 #[test]
 fn i4_disconnected_dry_stays_dry() {
     // 1×3: elevations [10, 5, 100]; rain on x=0 → runoff 0→1; x=2 stays dry.
     let cols = vec![
         saturated_column(10.0, 0.0),
         saturated_column(5.0, 0.0),
-        saturated_column(100.0, 0.0),
+        field_capacity_column(100.0, 0.0), // no mobile water → no gravity drain
     ];
     let mut world = World::grid(13, 3, 1, cols);
     let m_isolated0 = world.water_mass_at(2, 0);
@@ -272,7 +302,7 @@ fn d1_pond_leaves_high_appears_low() {
     let h_high0 = world.surface_water_m_at(0, 0);
     assert!(h_high0 > MASS_EPSILON);
 
-    for _ in 0..8 {
+    for _ in 0..16 {
         world.tick();
     }
 
@@ -289,11 +319,12 @@ fn d1_pond_leaves_high_appears_low() {
 }
 
 /// D1: pond only on the low cell; high stays dry (no uphill creation).
+/// High at θ_fc so gravity drain does not move its mass downhill.
 #[test]
 fn d1_no_uphill_creation() {
     let cols = vec![
-        saturated_column(10.0, 0.0), // high dry
-        saturated_column(5.0, 0.4),  // low with pond
+        field_capacity_column(10.0, 0.0), // high dry, no mobile
+        saturated_column(5.0, 0.4),       // low with pond
     ];
     let mut world = World::grid(19, 2, 1, cols);
     let m_high0 = world.water_mass_at(0, 0);
@@ -335,7 +366,7 @@ fn d1_flat_equal_H_no_net_drain() {
 // ---------------------------------------------------------------------------
 // Sprint 2.1 — D1 head-equalize (pool, no ping-pong)
 // ε: 1e-9 relative on f64 water mass (MASS_EPSILON).
-// Saturated soil (θ=φ) so pond stays on surface.
+// Saturated soil (θ=φ) so pond stays on surface. Same z ⇒ no gravity drain.
 // ---------------------------------------------------------------------------
 
 /// S02.1: 1×2 same z, all pond on A; after enough ticks h_A ≈ h_B;
@@ -404,5 +435,198 @@ fn d1_same_z_three_share() {
     assert!(
         h_right > MASS_EPSILON,
         "right end should gain surface water, got {h_right}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 3 — water mechanics (D3)
+// ε: 1e-9 relative on f64 water mass (MASS_EPSILON).
+// Sand default unless named clay/loam.
+// ---------------------------------------------------------------------------
+
+/// D3: same R, same z, 1×1; after 1 tick clay has more h_surf than sand (I_max).
+#[test]
+fn d3_clay_ponds_before_sand() {
+    let r = 0.15;
+    let z = 0.0;
+    let theta = 0.1;
+
+    let mut sand = World::new(101, textured_column(z, 0.0, theta, Texture::Sand));
+    let mut clay = World::new(101, textured_column(z, 0.0, theta, Texture::Clay));
+    sand.add_rain(r);
+    clay.add_rain(r);
+
+    sand.tick();
+    clay.tick();
+
+    let h_sand = sand.surface_water_m();
+    let h_clay = clay.surface_water_m();
+    assert!(
+        h_clay > h_sand + MASS_EPSILON,
+        "clay should pond more than sand after 1 tick: clay={h_clay} sand={h_sand}"
+    );
+    assert_mass_close(sand.water_mass(), sand.column_at(0, 0).water_mass());
+}
+
+/// D3: sand 1×1; R large; after 1 tick, soil mass increase ≤ I_max_sand + ε.
+#[test]
+#[allow(non_snake_case)] // contract name uses I_max
+fn d3_infiltrate_respects_I_max() {
+    let tex = Texture::Sand;
+    let i_max = tex.i_max();
+    let mut world = World::new(103, textured_column(0.0, 0.0, 0.1, tex));
+    let soil0 = world.column_at(0, 0).soil_water_mass();
+    let r = 1.0; // large rain
+    world.add_rain(r);
+    world.tick();
+
+    let soil1 = world.column_at(0, 0).soil_water_mass();
+    let infiltrated = soil1 - soil0;
+    assert!(
+        infiltrated <= i_max + MASS_EPSILON,
+        "infiltrated={infiltrated} exceeds I_max={i_max}"
+    );
+    assert!(
+        infiltrated > MASS_EPSILON,
+        "some water should have infiltrated"
+    );
+    assert_mass_close(world.water_mass(), soil0 + r);
+}
+
+/// D3: 1×2 slope; both start θ=φ (sand); high θ drops toward θ_fc; low M rises.
+#[test]
+fn d3_hill_soil_drains_to_valley() {
+    let tex = Texture::Sand;
+    let phi = tex.porosity();
+    let fc = tex.theta_fc();
+    let cols = vec![
+        textured_column(10.0, 0.0, phi, tex), // high saturated
+        textured_column(5.0, 0.0, phi, tex),  // low saturated
+    ];
+    let mut world = World::grid(107, 2, 1, cols);
+    let m0 = world.grid_water_mass();
+    let m_low0 = world.water_mass_at(1, 0);
+    let theta_high0: Vec<f64> = world
+        .column_at(0, 0)
+        .layers
+        .iter()
+        .map(|l| l.theta)
+        .collect();
+
+    // Mobile ≈ 0.16 m; D_max = 0.04 → need ≥ 4 drain ticks (+ infiltrate of arrivals).
+    for _ in 0..32 {
+        world.tick();
+        assert_mass_close(world.grid_water_mass(), m0);
+    }
+
+    let col_high = world.column_at(0, 0);
+    for (i, layer) in col_high.layers.iter().enumerate() {
+        assert!(
+            layer.theta < theta_high0[i] - MASS_EPSILON,
+            "high layer {i} theta should drop: was {}, now {}",
+            theta_high0[i],
+            layer.theta
+        );
+        assert!(
+            layer.theta + MASS_EPSILON >= fc,
+            "high layer {i} must not go below θ_fc={fc}, got {}",
+            layer.theta
+        );
+    }
+    assert!(
+        world.water_mass_at(1, 0) > m_low0 + MASS_EPSILON,
+        "valley mass should rise"
+    );
+}
+
+/// D3: 1×2 slope; high θ = θ_fc; after ticks high M unchanged (no leak).
+#[test]
+fn d3_below_fc_does_not_drain() {
+    let tex = Texture::Sand;
+    let fc = tex.theta_fc();
+    let cols = vec![
+        textured_column(10.0, 0.0, fc, tex), // high at field capacity
+        textured_column(5.0, 0.0, fc, tex),  // low at field capacity
+    ];
+    let mut world = World::grid(109, 2, 1, cols);
+    let m_high0 = world.water_mass_at(0, 0);
+    let m0 = world.grid_water_mass();
+
+    for _ in 0..16 {
+        world.tick();
+        assert_mass_close(world.grid_water_mass(), m0);
+    }
+
+    assert_mass_close(world.water_mass_at(0, 0), m_high0);
+    assert!(
+        world.surface_water_m_at(1, 0) <= MASS_EPSILON,
+        "no drain should create valley pond"
+    );
+}
+
+/// D3: 1×2; low starts θ=φ, high dry-ish (θ≤θ_fc); high does not gain from low drain.
+#[test]
+fn d3_no_soil_drain_uphill() {
+    let tex = Texture::Sand;
+    let phi = tex.porosity();
+    let fc = tex.theta_fc();
+    let cols = vec![
+        textured_column(10.0, 0.0, fc * 0.5, tex), // high dry-ish
+        textured_column(5.0, 0.0, phi, tex),       // low saturated
+    ];
+    let mut world = World::grid(113, 2, 1, cols);
+    let m_high0 = world.water_mass_at(0, 0);
+    let soil_high0 = world.column_at(0, 0).soil_water_mass();
+    let m0 = world.grid_water_mass();
+
+    for _ in 0..16 {
+        world.tick();
+        assert_mass_close(world.grid_water_mass(), m0);
+    }
+
+    assert_mass_close(world.water_mass_at(0, 0), m_high0);
+    assert_mass_close(world.column_at(0, 0).soil_water_mass(), soil_high0);
+    assert!(
+        world.surface_water_m_at(0, 0) <= MASS_EPSILON,
+        "high must not gain pond from uphill-forbidden drain"
+    );
+}
+
+/// D3: pond moves faster than soil — after 2 ticks more valley mass from pond-only (A) than soil-drain (B).
+#[test]
+fn d3_pond_moves_faster_than_soil() {
+    let tex = Texture::Sand;
+    let phi = tex.porosity();
+    let fc = tex.theta_fc();
+    // Pond larger than I_max so some surface remains after rate-limited infiltrate
+    // (soils at fc still have pore space). Pond runoff is the fast path.
+    let pond = 0.5;
+
+    // Case A: pond-only on high, soils at fc (no initial mobile soil).
+    let cols_a = vec![
+        textured_column(10.0, pond, fc, tex),
+        textured_column(5.0, 0.0, fc, tex),
+    ];
+    let mut world_a = World::grid(127, 2, 1, cols_a);
+    let m_low_a0 = world_a.water_mass_at(1, 0);
+
+    // Case B: no pond, high at φ (mobile soil only).
+    let cols_b = vec![
+        textured_column(10.0, 0.0, phi, tex),
+        textured_column(5.0, 0.0, fc, tex),
+    ];
+    let mut world_b = World::grid(127, 2, 1, cols_b);
+    let m_low_b0 = world_b.water_mass_at(1, 0);
+
+    for _ in 0..2 {
+        world_a.tick();
+        world_b.tick();
+    }
+
+    let gained_a = world_a.water_mass_at(1, 0) - m_low_a0;
+    let gained_b = world_b.water_mass_at(1, 0) - m_low_b0;
+    assert!(
+        gained_a > gained_b + MASS_EPSILON,
+        "pond path should deliver more to valley after 2 ticks: A={gained_a} B={gained_b}"
     );
 }
