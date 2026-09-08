@@ -1,12 +1,12 @@
 # Oracle RUNLOG
 
 ```
-sprint: S03.1
+sprint: S03.2
 result: green
-branch: feat/s03.1-lateral-interflow
-date: 2026-09-07 (PT)
+branch: feat/s03.2-profile-first
+date: 2026-09-08 (PT)
 epsilon: 1e-9 relative on f64 water mass
-invariants encoded: I1, I2, I3, I4, I5, I6 + D0 + D1 + D3 + D31 (lateral interflow)
+invariants encoded: I1, I2, I3, I4, I5, I6 + D0 + D1 + D3 + D31 + D32 (profile-first percolation)
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -31,5 +31,9 @@ tests:
   - d31_equal_z_mobile_shares
   - d31_equal_z_below_fc_no_share
   - d31_downslope_beats_equal_z
-notes: Replaced gravity_drain_pass with simultaneous S03+S03.1. Candidates = lower-z OR (equal-z && m_nbr < m_i); never z_nbr > z_i. If any lower-z: V=min(D_max,m_i) split equally across all at min_z → neighbor surface. Else flat: per poorer equal-z neighbor V_j=min(D_max/|P|, 0.5*(m_i-m_nbr)), total ≤ D_max and m_i; add to neighbor soil (excess over φ → surface). Column mobile = sum layers; remove mobile top-down; soil fill top-down to φ. Pond S02.1 unchanged. Capillary ≤θ_fc stays. Prefer sand in d31_*; ε=MASS_EPSILON.
+  - d32_top_percolates_before_lateral
+  - d32_no_percolate_below_fc
+  - d32_downslope_fills_soil_before_pond
+  - d32_contact_limited_by_slower_soil
+notes: Split gravity_drain_pass into percolate_all() then lateral_drain_pass() after S02.1 runoff. Percolate: per column, snapshot θ, mobile in layer k fills pore in k+1…; shared texture → one D_max budget; never below θ_fc. Column D_max shared with lateral (remaining after percolate). Lateral on leftover m: same candidates as S03.1; contact flux ≤ min(D_rem_i,D_j); equal-z half-diff of leftover m; total ≤ rem D and m; receiver soil top-down (overflow → surface). Downslope no longer dumps to surface when neighbor has pore. Capillary ≤θ_fc stays. Pond S02.1 and infiltrate ≤ I_max unchanged. d31 asserts soil M / any-layer θ (profile may park water deep). Prefer sand in d32_*; ε=MASS_EPSILON.
 ```
