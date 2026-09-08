@@ -3,156 +3,195 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>SWS D1 — slope runoff</title>
+  <title>SWS D1 — 3×3 slope runoff</title>
   <style>
-    :root { color-scheme: dark; --bg:#12141a; --card:#1c2028; --ink:#e8eaef; --muted:#9aa3b2; --pond:#5b9fd6; --soil:#c4a574; --pore:#3d4a3a; }
+    :root { color-scheme: dark; --bg:#12141a; --card:#1c2028; --ink:#e8eaef; --muted:#9aa3b2; --pond:#5b9fd6; }
     * { box-sizing: border-box; }
-    body { margin: 0 auto; max-width: 44rem; padding: 1rem; font: 16px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--ink); }
-    h1 { font-size: 1.15rem; margin: 0 0 .35rem; }
+    body { margin: 0 auto; max-width: 48rem; padding: 1rem; font: 15px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--ink); }
+    h1 { font-size: 1.15rem; margin: 0 0 .3rem; }
     .sub, .warn { font-size: .85rem; color: var(--muted); margin: 0 0 .7rem; }
-    .warn { background: #3a2a18; border: 1px solid #7a5a28; padding: .6rem .75rem; border-radius: 8px; color: #f0d9a8; }
-    .card { background: var(--card); border-radius: 12px; padding: .9rem; margin-bottom: .75rem; }
-    .row { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .5rem; }
-    button { appearance: none; border: 0; border-radius: 8px; padding: .55rem .75rem; font: inherit; background: #2c3544; color: var(--ink); }
+    .warn { background: #3a2a18; border: 1px solid #7a5a28; padding: .55rem .7rem; border-radius: 8px; color: #f0d9a8; }
+    .card { background: var(--card); border-radius: 12px; padding: .8rem; margin-bottom: .7rem; }
+    .row { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; }
+    button { appearance: none; border: 0; border-radius: 8px; padding: .5rem .7rem; font: inherit; background: #2c3544; color: var(--ink); }
     button.pri { background: #2e5a3c; }
-    .grid { display: flex; gap: .6rem; align-items: flex-end; min-height: 210px; }
-    .cell { flex: 1; display: flex; flex-direction: column; align-items: stretch; }
-    .cell h2 { font-size: .75rem; margin: 0 0 .3rem; color: var(--muted); text-align: center; }
-    .stack { height: 160px; display: flex; flex-direction: column; justify-content: flex-end; background: #0e1014; border: 1px solid #2a303a; border-radius: 8px; overflow: hidden; }
-    .pond { background: var(--pond); width: 100%; }
-    .layer { display: flex; height: 28%; }
-    .wet { background: var(--soil); }
-    .empty { background: var(--pore); }
-    pre { background: #0e1014; padding: .7rem; border-radius: 8px; font-size: .75rem; white-space: pre-wrap; }
+    .mapwrap { display: grid; grid-template-columns: 1.4rem 1fr; grid-template-rows: 1fr 1.2rem; gap: .25rem; max-width: 26rem; margin: .4rem auto; }
+    .axis-y { writing-mode: vertical-rl; transform: rotate(180deg); color: var(--muted); font-size: .7rem; text-align: center; }
+    .axis-x { grid-column: 2; color: var(--muted); font-size: .7rem; text-align: center; }
+    .map { display: grid; grid-template-columns: repeat(3, 1fr); grid-template-rows: repeat(3, 5.6rem); gap: .35rem; }
+    .cell { position: relative; border: 2px solid #2a303a; border-radius: 8px; padding: .25rem .3rem; background: #0e1014; cursor: pointer; overflow: hidden; }
+    .cell.sel { border-color: #7dcea0; }
+    .cell .pondbar { position: absolute; left: 0; right: 0; bottom: 0; background: var(--pond); opacity: .85; pointer-events: none; }
+    .cell .meta { position: relative; z-index: 1; font-size: .68rem; line-height: 1.25; }
+    .cell .arrow { position: absolute; right: .2rem; top: .15rem; font-size: .9rem; z-index: 1; }
+    .legend { font-size: .78rem; color: var(--muted); }
+    pre { background: #0e1014; padding: .65rem; border-radius: 8px; font-size: .72rem; white-space: pre-wrap; margin: 0; }
+    label { font-size: .85rem; }
+    input[type=range] { width: 8rem; }
   </style>
 </head>
 <body>
-  <h1>D1 slope runoff</h1>
-  <p class="sub">Three columns in a line: High → Low → Ridge. Tick = infiltrate all, then one surface runoff pass. Download this file and open locally.</p>
-  <p class="warn">Critic instrument. Matches S02 rule (H = z+h, send min(h, ΔH) to lowest neighbor). cargo test wins if they disagree.</p>
+  <h1>D1 — 3×3 grid runoff</h1>
+  <p class="sub">Same rule as sim-core: infiltrate every cell, then one simultaneous surface pass. Neighbors are N, E, S, W. Download this file and open it locally.</p>
+  <p class="warn">Ridge = high elevation wall (z = 12) on the west. Water does not climb it. Click a cell, add rain, then press One tick — rain itself does not move water.</p>
   <div class="card row">
-    <button class="pri" type="button" id="down">Rain on high + ticks</button>
-    <button type="button" id="up">Rain on low only</button>
-    <button type="button" id="flat">Flat equal H</button>
+    <button class="pri" type="button" id="rain">Rain on selected</button>
     <button type="button" id="tick">One tick</button>
-    <button type="button" id="reset">Reset slope</button>
+    <button type="button" id="reset">Reset terrain</button>
+    <label>R <span id="rV">0.20</span> m <input id="R" type="range" min="0.02" max="0.50" step="0.02" value="0.20"></label>
   </div>
-  <div class="card grid" id="grid"></div>
+  <div class="card row">
+    <button type="button" id="presetHigh">Select high (1,2)</button>
+    <button type="button" id="presetLow">Select low (1,0)</button>
+    <button type="button" id="presetRidge">Select ridge (0,1)</button>
+    <button type="button" id="presetFlat">Flatten z=5</button>
+  </div>
+  <div class="card">
+    <div class="mapwrap">
+      <div class="axis-y">N ↑ y increases north</div>
+      <div class="map" id="map"></div>
+      <div class="axis-x">W ← x → E</div>
+    </div>
+    <p class="legend">Fill = pond depth h. Arrow = where that cell sent water last tick. Green border = selected.</p>
+  </div>
   <pre id="out">loading…</pre>
 <script>
 (function () {
-  var EPS = 1e-9;
-  var cells;
-  function layer(theta, phi, L) { return { theta: theta, phi: phi, L: L }; }
-  function col(z, h, theta) {
-    return { z: z, h: h, layers: [layer(theta, 0.4, 0.3), layer(theta, 0.4, 0.3)] };
+  var W = 3, Ht = 3, EPS = 1e-9, PHI = 0.4, L = 0.3;
+  var OFFSETS = [[0,1,'N'],[1,0,'E'],[0,-1,'S'],[-1,0,'W']];
+  var cells, sel = {x:1, y:2}, lastMoves = [], tickN = 0;
+  function idx(x, y) { return y * W + x; }
+  function at(x, y) { return cells[idx(x, y)]; }
+  function inb(x, y) { return x >= 0 && y >= 0 && x < W && y < Ht; }
+  function head(c) { return c.z + c.h; }
+  function mass(c) { return c.h + c.layers[0].theta * L + c.layers[1].theta * L; }
+  function makeCell(z, theta) { return { z: z, h: 0, layers: [{theta: theta}, {theta: theta}], sent: '' }; }
+  function slopeTerrain() {
+    var z = [12,2,2, 12,5,5, 12,8,7];
+    var out = [], i;
+    for (i = 0; i < 9; i++) out.push(makeCell(z[i], 0.10));
+    return out;
   }
-  function mass(c) {
-    var s = c.h, i;
-    for (i = 0; i < c.layers.length; i++) s += c.layers[i].theta * c.layers[i].L;
-    return s;
-  }
-  function pore(c) {
-    var s = 0, i;
-    for (i = 0; i < c.layers.length; i++) {
-      var ly = c.layers[i];
-      s += Math.max(0, ly.phi - ly.theta) * ly.L;
-    }
-    return s;
+  function flatTerrain() {
+    var out = [], i;
+    for (i = 0; i < 9; i++) out.push(makeCell(5, 0.20));
+    return out;
   }
   function infiltrate(c) {
     var rem = c.h, i;
-    for (i = 0; i < c.layers.length; i++) {
+    for (i = 0; i < 2; i++) {
       if (rem <= 0) break;
-      var ly = c.layers[i];
-      var cap = Math.max(0, ly.phi - ly.theta) * ly.L;
+      var cap = Math.max(0, PHI - c.layers[i].theta) * L;
       var fill = Math.min(rem, cap);
-      if (ly.L > 0) ly.theta += fill / ly.L;
+      c.layers[i].theta += fill / L;
       rem -= fill;
     }
     c.h = rem;
   }
-  function head(c) { return c.z + c.h; }
-  function runoff(arr) {
-    var n = arr.length;
-    var heads = [], depths = [], delta = [], i;
-    for (i = 0; i < n; i++) { heads.push(head(arr[i])); depths.push(arr[i].h); delta.push(0); }
-    for (i = 0; i < n; i++) {
-      if (depths[i] <= 0) continue;
-      var bestJ = -1, bestH = 0;
-      var nbrs = [];
-      if (i + 1 < n) nbrs.push(i + 1);
-      if (i - 1 >= 0) nbrs.push(i - 1);
-      var k;
-      for (k = 0; k < nbrs.length; k++) {
-        var j = nbrs[k];
-        if (heads[j] >= heads[i]) continue;
-        if (bestJ < 0 || heads[j] < bestH) { bestJ = j; bestH = heads[j]; }
-      }
-      if (bestJ >= 0) {
-        var vol = Math.min(depths[i], heads[i] - bestH);
-        if (vol > 0) { delta[i] -= vol; delta[bestJ] += vol; }
+  function runoff() {
+    var heads = [], depths = [], delta = [], i, x, y;
+    lastMoves = [];
+    for (i = 0; i < 9; i++) { heads.push(head(cells[i])); depths.push(cells[i].h); delta.push(0); cells[i].sent = ''; }
+    for (y = 0; y < Ht; y++) {
+      for (x = 0; x < W; x++) {
+        i = idx(x, y);
+        if (depths[i] <= 0) continue;
+        var bestJ = -1, bestH = 0, bestDir = '', k;
+        for (k = 0; k < 4; k++) {
+          var nx = x + OFFSETS[k][0], ny = y + OFFSETS[k][1], dir = OFFSETS[k][2];
+          if (!inb(nx, ny)) continue;
+          var j = idx(nx, ny);
+          if (heads[j] >= heads[i]) continue;
+          if (bestJ < 0 || heads[j] < bestH) { bestJ = j; bestH = heads[j]; bestDir = dir; }
+        }
+        if (bestJ >= 0) {
+          var vol = Math.min(depths[i], heads[i] - bestH);
+          if (vol > 0) {
+            delta[i] -= vol; delta[bestJ] += vol;
+            cells[i].sent = bestDir;
+            lastMoves.push({fx:x, fy:y, dir:bestDir, vol:vol});
+          }
+        }
       }
     }
-    for (i = 0; i < n; i++) {
-      arr[i].h += delta[i];
-      if (arr[i].h < 0 && Math.abs(arr[i].h) <= EPS) arr[i].h = 0;
+    for (i = 0; i < 9; i++) {
+      cells[i].h += delta[i];
+      if (cells[i].h < 0 && Math.abs(cells[i].h) <= EPS) cells[i].h = 0;
     }
   }
   function tick() {
-    var i;
-    for (i = 0; i < cells.length; i++) infiltrate(cells[i]);
-    runoff(cells);
+    var i; for (i = 0; i < 9; i++) infiltrate(cells[i]);
+    runoff(); tickN += 1;
   }
-  function slopeWorld() {
-    return [col(10, 0, 0.1), col(5, 0, 0.1), col(20, 0, 0.1)];
+  function glyph(dir) {
+    return dir === 'N' ? '↑' : dir === 'S' ? '↓' : dir === 'E' ? '→' : dir === 'W' ? '←' : '';
   }
-  function names() { return ['High z=10', 'Low z=5', 'Ridge z=20']; }
   function draw() {
-    var g = document.getElementById('grid');
-    var html = '', i, tot = 0;
-    for (i = 0; i < cells.length; i++) {
-      var c = cells[i];
-      tot += mass(c);
-      var pondPct = Math.min(50, (c.h / 0.5) * 50);
-      var ly = '';
-      var L;
-      for (L = 0; L < c.layers.length; L++) {
-        var wet = c.layers[L].phi > 0 ? (c.layers[L].theta / c.layers[L].phi) * 100 : 0;
-        ly += '<div class="layer"><div class="wet" style="width:' + wet + '%"></div><div class="empty" style="width:' + (100 - wet) + '%"></div></div>';
+    document.getElementById('rV').textContent = parseFloat(document.getElementById('R').value).toFixed(2);
+    var map = document.getElementById('map');
+    var html = '', y, x;
+    for (y = Ht - 1; y >= 0; y--) {
+      for (x = 0; x < W; x++) {
+        var c = at(x, y);
+        var pct = Math.min(70, (c.h / 0.4) * 70);
+        var selc = (sel.x === x && sel.y === y) ? ' sel' : '';
+        html += '<div class="cell' + selc + '" data-x="' + x + '" data-y="' + y + '">';
+        html += '<div class="pondbar" style="height:' + pct + '%"></div>';
+        html += '<div class="arrow">' + glyph(c.sent) + '</div>';
+        html += '<div class="meta">(' + x + ',' + y + ')';
+        if (x === 0) html += ' ridge';
+        else if (y === 2 && x === 1) html += ' high';
+        else if (y === 0 && x >= 1) html += ' low';
+        html += '<br>z ' + c.z.toFixed(0) + '  h ' + c.h.toFixed(3);
+        html += '<br>H ' + head(c).toFixed(3) + '</div></div>';
       }
-      html += '<div class="cell"><h2>' + names()[i] + '</h2><div class="stack"><div class="pond" style="height:' + pondPct + '%"></div>' + ly + '</div></div>';
     }
-    g.innerHTML = html;
-    var lines = ['grid M = ' + tot.toFixed(5)];
-    for (i = 0; i < cells.length; i++) {
-      var c2 = cells[i];
-      lines.push(names()[i] + '  h=' + c2.h.toFixed(4) + '  M=' + mass(c2).toFixed(4) + '  pore=' + pore(c2).toFixed(4));
+    map.innerHTML = html;
+    var nodes = map.querySelectorAll('.cell');
+    for (var n = 0; n < nodes.length; n++) {
+      nodes[n].addEventListener('click', function (ev) {
+        sel.x = parseInt(ev.currentTarget.getAttribute('data-x'), 10);
+        sel.y = parseInt(ev.currentTarget.getAttribute('data-y'), 10);
+        draw();
+      });
     }
-    lines.push(cells[2].h <= EPS && mass(cells[2]) - 0.1 * 0.3 * 2 < 1e-6 ? 'Ridge still dry of extra water (I4).' : 'Check ridge.');
+    var tot = 0, i;
+    for (i = 0; i < 9; i++) tot += mass(cells[i]);
+    var lines = [];
+    lines.push('tick ' + tickN + '   selected (' + sel.x + ',' + sel.y + ')   grid M = ' + tot.toFixed(5));
+    lines.push('Rain adds to the selected cell only. One tick = infiltrate all 9, then one runoff pass.');
+    if (lastMoves.length === 0) {
+      lines.push('Last runoff: no surface moved (dry, soaked into soil, or no lower H neighbor).');
+    } else {
+      lines.push('Last runoff:');
+      for (var m = 0; m < lastMoves.length; m++) {
+        var mv = lastMoves[m];
+        lines.push('  (' + mv.fx + ',' + mv.fy + ') ' + glyph(mv.dir) + ' ' + mv.dir + '  vol=' + mv.vol.toFixed(4));
+      }
+    }
+    var ridgeM = mass(at(0,0)) + mass(at(0,1)) + mass(at(0,2));
+    lines.push('West ridge mass = ' + ridgeM.toFixed(4) + ' (starts ~0.18 unless you rain on it).');
     document.getElementById('out').textContent = lines.join('\n');
   }
-  function manyTicks(n) { var t; for (t = 0; t < n; t++) tick(); }
-  document.getElementById('reset').onclick = function () { cells = slopeWorld(); draw(); };
+  document.getElementById('R').addEventListener('input', function () {
+    document.getElementById('rV').textContent = parseFloat(this.value).toFixed(2);
+  });
+  document.getElementById('rain').onclick = function () {
+    at(sel.x, sel.y).h += parseFloat(document.getElementById('R').value);
+    lastMoves = [];
+    draw();
+  };
   document.getElementById('tick').onclick = function () { tick(); draw(); };
-  document.getElementById('down').onclick = function () {
-    cells = slopeWorld();
-    cells[0].h += 0.35;
-    manyTicks(8);
-    draw();
+  document.getElementById('reset').onclick = function () {
+    cells = slopeTerrain(); tickN = 0; lastMoves = []; sel = {x:1, y:2}; draw();
   };
-  document.getElementById('up').onclick = function () {
-    cells = slopeWorld();
-    cells[1].h += 0.25;
-    manyTicks(8);
-    draw();
+  document.getElementById('presetHigh').onclick = function () { sel = {x:1, y:2}; draw(); };
+  document.getElementById('presetLow').onclick = function () { sel = {x:1, y:0}; draw(); };
+  document.getElementById('presetRidge').onclick = function () { sel = {x:0, y:1}; draw(); };
+  document.getElementById('presetFlat').onclick = function () {
+    cells = flatTerrain(); tickN = 0; lastMoves = []; draw();
   };
-  document.getElementById('flat').onclick = function () {
-    cells = [col(5, 0.2, 0.35), col(5, 0.2, 0.35), col(5, 0.2, 0.35)];
-    manyTicks(4);
-    draw();
-  };
-  cells = slopeWorld();
+  cells = slopeTerrain();
   draw();
 })();
 </script>
