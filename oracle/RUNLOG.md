@@ -1,12 +1,12 @@
 # Oracle RUNLOG
 
 ```
-sprint: S04
+sprint: S04.1
 result: green
-branch: feat/s04-hydro-rest
+branch: feat/s04.1-lake-snap
 date: 2026-09-08 (PT)
 epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15; H_REST=0.02 m; V_REST=1e-4 m
-invariants encoded: I1, I2, I3, I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 (hydro rest)
+invariants encoded: I1, I2, I3, I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 (lake snap)
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -45,5 +45,9 @@ tests:
   - d4_drowned_lake_reaches_rest
   - d4_rain_wakes_rest
   - d4_closed_mass_still_conserved
-notes: H_REST=0.02 drop pond edges before weights; after donor+receiver scale drop V≤V_REST. Soil percolate/lateral skip V≤V_REST; infiltrate skip take≤V_REST. at_rest per cell end of tick if no supra-floor flux (pond/soil/infiltrate) as sender or receiver. Sleep next tick if self and all 4-nbrs at_rest (skip infiltrate/pond/drain as donors). Wake on add_rain/add_water (clears at_rest) or any non-rest neighbor. Queries cell_at_rest/grid_at_rest (I6). Mass conserved; no sinks. d331 near-eq assert bumped to ≤H_REST band (deadband). Tick order unchanged.
+  - d41_no_soil_into_full
+  - d41_valley_lake_snaps
+  - d41_snap_conserves_mass
+  - d41_high_dry_not_in_valley_component
+notes: S04.1 soil percolate/lateral V=min(old cap, unused pore room); unused=0 ⇒ V=0; blocked volume not converted to pond in soil pass (fill_soil_only). After infiltrate+pond+soil: lake_snap on 4-connected components with h>V_REST and intra |ΔH|≤H_REST, only when every member has non-empty soil at φ. N≥2 always snap; N=1 also needs no mobile path to lower-z. H*=(Σh+Σz)/N; h_i=max(0,H*-z_i); Σh conserved (tiny renorm). Tick: infiltrate→pond→soil→lake_snap→at_rest(!busy). S04 sleep kept. Empty-soil pond grids keep H_REST sleep without snap. d3_hill valley starts at θ_fc (pore room) under new cap. Mass conserved; no sinks.
 ```

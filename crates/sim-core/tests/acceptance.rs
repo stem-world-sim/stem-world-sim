@@ -502,9 +502,11 @@ fn d3_hill_soil_drains_to_valley() {
     let tex = Texture::Sand;
     let phi = tex.porosity();
     let fc = tex.theta_fc();
+    // S04.1: soil flux is capped by unused pore room — valley must have pores
+    // so hill mobile can drain into soil (not the old overflow-to-pond artifact).
     let cols = vec![
-        textured_column(10.0, 0.0, phi, tex), // high saturated
-        textured_column(5.0, 0.0, phi, tex),  // low saturated
+        textured_column(10.0, 0.0, phi, tex), // high saturated (mobile)
+        textured_column(5.0, 0.0, fc, tex),   // low at θ_fc (unused pores)
     ];
     let mut world = World::grid(107, 2, 1, cols);
     let m0 = world.grid_water_mass();
@@ -1426,4 +1428,145 @@ fn d4_closed_mass_still_conserved() {
     }
     assert_mass_close(world.grid_water_mass(), m0);
     let _ = V_REST; // floor is part of the rest path under test
+}
+
+
+// ---------------------------------------------------------------------------
+// Sprint 4.1 — lake snap / soil pore-room cap
+// ---------------------------------------------------------------------------
+
+/// D41: donor mobile, receiver both layers at φ; after tick receiver θ unchanged;
+/// donor mobile unchanged if no lower-z path.
+#[test]
+fn d41_no_soil_into_full() {
+    // Equal-z: clay at φ has more mobile than sand at φ, so the old equal-m share
+    // would try to send — but sand has unused pore room = 0, so V must be 0.
+    let clay = Texture::Clay;
+    let sand = Texture::Sand;
+    let z = 5.0; // equal z — no lower-z path
+    let cols = vec![
+        textured_column(z, 0.0, clay.porosity(), clay), // donor: more mobile
+        textured_column(z, 0.0, sand.porosity(), sand), // receiver: both layers at φ
+    ];
+    let mut world = World::grid(411, 2, 1, cols);
+    let theta_recv0: Vec<f64> = world
+        .column_at(1, 0)
+        .layers
+        .iter()
+        .map(|l| l.theta)
+        .collect();
+    let mobile_don0 = world.column_at(0, 0).mobile_water_m();
+    let mobile_recv0 = world.column_at(1, 0).mobile_water_m();
+    let m0 = world.grid_water_mass();
+    assert!(mobile_don0 > V_REST, "donor must start with mobile water");
+    assert!(
+        mobile_don0 > mobile_recv0,
+        "donor mobile must exceed receiver so equal-z share would otherwise fire"
+    );
+    assert!(
+        world.column_at(1, 0).remaining_pore_capacity_m() <= MASS_EPSILON,
+        "receiver must be at φ"
+    );
+
+    world.tick();
+    assert_mass_close(world.grid_water_mass(), m0);
+
+    for (i, layer) in world.column_at(1, 0).layers.iter().enumerate() {
+        assert_approx_eq(layer.theta, theta_recv0[i], &format!("receiver θ[{i}] unchanged"));
+    }
+    assert_approx_eq(
+        world.column_at(0, 0).mobile_water_m(),
+        mobile_don0,
+        "donor mobile unchanged (no lower-z path, receiver full)",
+    );
+    // Receiver must not have gained pond from a blocked soil push.
+    assert!(
+        world.surface_water_m_at(1, 0) <= MASS_EPSILON,
+        "blocked soil flux must not become pond on receiver"
+    );
+}
+
+/// D41: 1×3 valley equal z, saturated, pond ~2 m with ΔH < 0.05;
+/// after ≤5 ticks all H equal within 1e-9 and grid_at_rest.
+#[test]
+fn d41_valley_lake_snaps() {
+    let z = 2.0;
+    // Pond depths ~2 m with pairwise ΔH < 0.05 (within a few pond ticks of H_REST band).
+    let cols = vec![
+        saturated_column(z, 2.00),
+        saturated_column(z, 2.03),
+        saturated_column(z, 1.99),
+    ];
+    let mut world = World::grid(412, 3, 1, cols);
+    let dh01 = (world.column_at(0, 0).head() - world.column_at(1, 0).head()).abs();
+    let dh12 = (world.column_at(1, 0).head() - world.column_at(2, 0).head()).abs();
+    let dh02 = (world.column_at(0, 0).head() - world.column_at(2, 0).head()).abs();
+    assert!(dh01 < 0.05 && dh12 < 0.05 && dh02 < 0.05, "ΔH < 0.05 precondition");
+
+    let mut ok = false;
+    for _ in 1..=5 {
+        world.tick();
+        let h0 = world.column_at(0, 0).head();
+        let h1 = world.column_at(1, 0).head();
+        let h2 = world.column_at(2, 0).head();
+        if (h0 - h1).abs() <= 1e-9
+            && (h1 - h2).abs() <= 1e-9
+            && (h0 - h2).abs() <= 1e-9
+            && world.grid_at_rest()
+        {
+            ok = true;
+            break;
+        }
+    }
+    assert!(
+        ok,
+        "after ≤5 ticks heads must match within 1e-9 and grid_at_rest; got H={:?} rest={}",
+        [
+            world.column_at(0, 0).head(),
+            world.column_at(1, 0).head(),
+            world.column_at(2, 0).head()
+        ],
+        world.grid_at_rest()
+    );
+}
+
+/// D41: same valley script; M after = M before.
+#[test]
+fn d41_snap_conserves_mass() {
+    let z = 2.0;
+    let cols = vec![
+        saturated_column(z, 2.00),
+        saturated_column(z, 2.03),
+        saturated_column(z, 1.99),
+    ];
+    let mut world = World::grid(413, 3, 1, cols);
+    let m0 = world.grid_water_mass();
+    for _ in 0..5 {
+        world.tick();
+        assert_mass_close(world.grid_water_mass(), m0);
+    }
+    assert_mass_close(world.grid_water_mass(), m0);
+}
+
+/// D41: z=8 dry high next to z=2 lake; high h stays 0 (not pulled into valley component).
+#[test]
+fn d41_high_dry_not_in_valley_component() {
+    // 1×2: valley lake + dry highland. Valley has pond; high is dry (h=0).
+    let cols = vec![
+        saturated_column(2.0, 2.01), // lake
+        saturated_column(8.0, 0.0),  // dry high (soil sat, no pond)
+    ];
+    let mut world = World::grid(414, 2, 1, cols);
+    assert!(world.surface_water_m_at(1, 0) <= MASS_EPSILON);
+    let m0 = world.grid_water_mass();
+
+    for _ in 0..5 {
+        world.tick();
+        assert_mass_close(world.grid_water_mass(), m0);
+        assert!(
+            world.surface_water_m_at(1, 0) <= MASS_EPSILON,
+            "high dry cell must keep h=0, got {}",
+            world.surface_water_m_at(1, 0)
+        );
+    }
 }

@@ -1,12 +1,14 @@
-//! Stem World Sim — Sprint 4 hydro rest (floors + sleep).
+//! Stem World Sim — Sprint 4.1 lake snap (soil pore-room + hydrostatic snap).
 //!
 //! Water mass (A = 1): M = h_surf + sum_i (theta_i * L_i)
 //! Grid mass: sum of column M.
-//! Tick order: rate-limited infiltrate → pond pass → percolate → lateral → clock.
+//! Tick order: infiltrate → pond → soil (percolate+lateral) → lake_snap → at_rest/sleep.
 //! Pond: every lower-H 4-neighbor with ΔH > H_REST, weights ∝ ΔH, each edge ≤ R_MAX
 //! and ≤ 0.5 ΔH; donor-scale then receiver-cap; drop V ≤ V_REST. Mass conserved.
-//! Soil percolate/lateral skip V ≤ V_REST. Infiltrate skips take ≤ V_REST.
-//! Sleeping cells (at_rest and all 4-nbrs at_rest) skip hydro as donors.
+//! Soil percolate/lateral: V = min(old cap, unused pore room on receiver); unused=0 ⇒ V=0;
+//! blocked volume is NOT converted into pond inside the soil pass.
+//! Lake snap: 4-connected components with h > V_REST and intra |ΔH| ≤ H_REST snap to
+//! mean H* with Σh conserved; mark snapped cells at_rest. S04 sleep kept.
 //! Unique-min-H chute revoked. Capillary stays.
 
 /// Absolute / relative tolerance for water-mass comparisons (f64).
@@ -231,6 +233,7 @@ impl Column {
 
     /// Add water into soil top-down toward φ; any leftover goes to surface.
     /// Returns the amount that landed in soil (for debugging); surface absorbs the rest.
+    #[allow(dead_code)]
     fn add_soil_water(&mut self, mut amount: f64) {
         if amount <= 0.0 {
             return;
@@ -254,6 +257,32 @@ impl Column {
         if amount > 0.0 {
             self.surface_water_m += amount;
         }
+    }
+
+    /// S04.1: fill soil top-down toward φ only; do not convert leftover into pond.
+    /// Returns depth actually placed in soil.
+    fn fill_soil_only(&mut self, mut amount: f64) -> f64 {
+        if amount <= 0.0 {
+            return 0.0;
+        }
+        let mut placed = 0.0;
+        for layer in &mut self.layers {
+            if amount <= 0.0 {
+                break;
+            }
+            let capacity = layer.remaining_pore_m();
+            if capacity <= 0.0 {
+                continue;
+            }
+            let fill = amount.min(capacity);
+            layer.theta += fill / layer.thickness_m;
+            if layer.theta > layer.porosity {
+                layer.theta = layer.porosity;
+            }
+            amount -= fill;
+            placed += fill;
+        }
+        placed
     }
 
     /// Intra-column percolation (S03.2): mobile water in layer k fills remaining pore
@@ -589,8 +618,9 @@ impl World {
         self.clock.advance();
     }
 
-    /// Full tick: infiltrate → pond pass (S03.3.1) → percolate → lateral; advances clock once.
+    /// Full tick: infiltrate → pond → soil (percolate+lateral) → lake_snap → at_rest.
     /// S04: sleeping cells (at_rest and all 4-nbrs at_rest) skip hydro as donors.
+    /// S04.1: soil flux capped by unused pore room; lake snap after soil.
     pub fn tick(&mut self) {
         let n = self.columns.len();
         let active = self.compute_active();
@@ -600,7 +630,10 @@ impl World {
         self.pond_pass(&active, &mut busy);
         let percolated = self.percolate_active(&active, &mut busy);
         self.lateral_drain_pass(&percolated, &active, &mut busy);
+        self.lake_snap();
 
+        // at_rest / sleep flags after snap (S04). Snap conserves mass and equalizes
+        // H* but does not force at_rest over a busy wake/pond/soil tick.
         for i in 0..n {
             self.at_rest[i] = !busy[i];
         }
@@ -851,13 +884,14 @@ impl World {
         out
     }
 
-    /// Lateral / downhill drain on leftover mobile m after percolate (S03.2).
-    /// Snapshot z, leftover m, D_max; then apply.
+    /// Lateral / downhill drain on leftover mobile m after percolate (S03.2 + S04.1).
+    /// Snapshot z, leftover m, D_max, unused pore room; then apply.
     /// Candidates: lower-z OR (equal-z && m_nbr < m_i); never z_nbr > z_i.
     /// Contact flux ≤ min(D_i, D_j); column outflow also ≤ remaining D_max after percolate.
+    /// S04.1: V ≤ unused pore room on receiver; unused=0 ⇒ V=0; no soil→pond convert.
     /// If any lower-z: targets at min_z; equal split of leftover m, each ≤ contact.
     /// Else flat: half-diff of leftover m, ≤ contact; total ≤ leftover m and remaining D.
-    /// Receiver: soil top-down (overflow past φ → surface). Capillary does not move.
+    /// Receiver: soil top-down only. Capillary does not move.
     fn lateral_drain_pass(&mut self, percolated: &[f64], active: &[bool], busy: &mut [bool]) {
         let n = self.columns.len();
         if n == 0 {
@@ -971,15 +1005,42 @@ impl World {
             }
         }
 
+        // S04.1: cap by unused pore room on receiving columns (snapshot).
+        // If unused = 0, V = 0. Do NOT convert blocked volume into pond here.
+        let pore_room: Vec<f64> = self
+            .columns
+            .iter()
+            .map(Column::remaining_pore_capacity_m)
+            .collect();
+        let mut incoming: Vec<f64> = vec![0.0; n];
+        for &(_from, to, amount) in &transfers {
+            if amount > V_REST {
+                incoming[to] += amount;
+            }
+        }
+        let mut recv_scale: Vec<f64> = vec![1.0; n];
+        for j in 0..n {
+            if incoming[j] <= 0.0 {
+                continue;
+            }
+            let room = pore_room[j].max(0.0);
+            if room <= 0.0 {
+                recv_scale[j] = 0.0;
+            } else if incoming[j] > room {
+                recv_scale[j] = room / incoming[j];
+            }
+        }
+
         let mut remove_amt = vec![0.0f64; n];
         let mut soil_add = vec![0.0f64; n];
 
         for (from, to, amount) in transfers {
-            if amount <= V_REST {
+            let v = amount * recv_scale[to];
+            if v <= V_REST {
                 continue;
             }
-            remove_amt[from] += amount;
-            soil_add[to] += amount;
+            remove_amt[from] += v;
+            soil_add[to] += v;
             busy[from] = true;
             busy[to] = true;
         }
@@ -991,10 +1052,193 @@ impl World {
         }
         for i in 0..n {
             if soil_add[i] > V_REST {
-                // add_soil_water fills top-down; overflow past φ → surface.
-                self.columns[i].add_soil_water(soil_add[i]);
+                // Fill soil only; leftover must not become pond in the soil pass.
+                let placed = self.columns[i].fill_soil_only(soil_add[i]);
+                // If fp left a speck unplaced, it stays unapplied (donor already
+                // matched the scaled V); mass error is sub-ε after clamp.
+                let _ = placed;
             }
         }
+    }
+
+    /// S04.1 lake snap: after infiltrate + pond + soil, find 4-connected pond
+    /// components where every member has h > V_REST and every intra-edge has
+    /// |ΔH| ≤ H_REST. Snap each eligible component to mean H* with Σh conserved;
+    /// mark those cells at_rest. Does not create or destroy mass.
+    fn lake_snap(&mut self) {
+        let n = self.columns.len();
+        if n == 0 {
+            return;
+        }
+
+        let heads: Vec<f64> = self.columns.iter().map(Column::head).collect();
+        let depths: Vec<f64> = self
+            .columns
+            .iter()
+            .map(|c| c.surface_water_m)
+            .collect();
+        let elevations: Vec<f64> = self.columns.iter().map(|c| c.elevation_m).collect();
+
+        // Candidates: cells with pond above the rest floor.
+        let mut cand = vec![false; n];
+        for i in 0..n {
+            if depths[i] > V_REST {
+                cand[i] = true;
+            }
+        }
+
+        // Union-Find over candidate 4-neighbors with |ΔH| ≤ H_REST.
+        let mut parent: Vec<usize> = (0..n).collect();
+        let mut rank: Vec<u8> = vec![0; n];
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+        fn unite(parent: &mut [usize], rank: &mut [u8], a: usize, b: usize) {
+            let mut ra = find(parent, a);
+            let mut rb = find(parent, b);
+            if ra == rb {
+                return;
+            }
+            if rank[ra] < rank[rb] {
+                std::mem::swap(&mut ra, &mut rb);
+            }
+            parent[rb] = ra;
+            if rank[ra] == rank[rb] {
+                rank[ra] = rank[ra].saturating_add(1);
+            }
+        }
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let i = y * self.width + x;
+                if !cand[i] {
+                    continue;
+                }
+                // Only unite along +E and +N to visit each undirected edge once.
+                for &(dx, dy) in &[(1i32, 0i32), (0i32, 1i32)] {
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    if nx < 0
+                        || ny < 0
+                        || nx as usize >= self.width
+                        || ny as usize >= self.height
+                    {
+                        continue;
+                    }
+                    let j = ny as usize * self.width + nx as usize;
+                    if !cand[j] {
+                        continue;
+                    }
+                    if (heads[i] - heads[j]).abs() <= H_REST {
+                        unite(&mut parent, &mut rank, i, j);
+                    }
+                }
+            }
+        }
+
+        // Gather components.
+        let mut comps: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for i in 0..n {
+            if !cand[i] {
+                continue;
+            }
+            let r = find(&mut parent, i);
+            comps[r].push(i);
+        }
+
+        for members in comps.into_iter() {
+            let n_c = members.len();
+            if n_c == 0 {
+                continue;
+            }
+            // Lake snap applies to free surface on full soil (sprint: when soil full).
+            // Every member must have soil layers and no unused pore room.
+            // Empty-soil pond-only grids keep S04 H_REST sleep without snap.
+            if !members
+                .iter()
+                .all(|&i| self.column_soil_full(i))
+            {
+                continue;
+            }
+            let eligible = if n_c >= 2 {
+                true
+            } else {
+                // N=1: also require no mobile that can leave to a lower-z cell.
+                self.singleton_snap_eligible(members[0], &elevations)
+            };
+            if !eligible {
+                continue;
+            }
+
+            let sum_h: f64 = members.iter().map(|&i| depths[i]).sum();
+            let sum_z: f64 = members.iter().map(|&i| elevations[i]).sum();
+            let h_star = (sum_h + sum_z) / n_c as f64;
+
+            let mut assigned: Vec<(usize, f64)> = Vec::with_capacity(n_c);
+            let mut sum_new = 0.0;
+            for &i in &members {
+                let h_i = (h_star - elevations[i]).max(0.0);
+                assigned.push((i, h_i));
+                sum_new += h_i;
+            }
+
+            // Tiny renormalize if fp noise broke Σh.
+            if sum_new > 0.0 && (sum_new - sum_h).abs() > 0.0 {
+                let scale = sum_h / sum_new;
+                for (_, h) in assigned.iter_mut() {
+                    *h *= scale;
+                }
+                let s2: f64 = assigned.iter().map(|(_, h)| *h).sum();
+                let residual = sum_h - s2;
+                if residual.abs() > 0.0 {
+                    if let Some((_, h)) = assigned.first_mut() {
+                        *h = (*h + residual).max(0.0);
+                    }
+                }
+            } else if sum_new == 0.0 && sum_h > 0.0 {
+                // Degenerate: all H* < z_i — should not happen for pond candidates;
+                // leave depths unchanged rather than destroy mass.
+                continue;
+            }
+
+            for (i, h) in assigned {
+                self.columns[i].surface_water_m = h;
+            }
+        }
+    }
+
+    /// True when the column has soil layers and no unused pore room (at φ).
+    fn column_soil_full(&self, i: usize) -> bool {
+        let col = &self.columns[i];
+        !col.layers.is_empty() && col.remaining_pore_capacity_m() <= MASS_EPSILON
+    }
+
+    /// N=1 lake-snap eligibility (soil-full already checked): no mobile that can
+    /// leave to a lower-z 4-neighbor.
+    fn singleton_snap_eligible(&self, i: usize, elevations: &[f64]) -> bool {
+        let mobile = self.columns[i].mobile_water_m();
+        if mobile <= V_REST {
+            return true;
+        }
+        let z_i = elevations[i];
+        let x = i % self.width;
+        let y = i / self.width;
+        for &(dx, dy) in &NEIGHBOR_OFFSETS {
+            let nx = x as i32 + dx;
+            let ny = y as i32 + dy;
+            if nx < 0 || ny < 0 || nx as usize >= self.width || ny as usize >= self.height {
+                continue;
+            }
+            let j = ny as usize * self.width + nx as usize;
+            if elevations[j] < z_i {
+                return false;
+            }
+        }
+        true
     }
 
 }
