@@ -2,5 +2,6 @@
 
 Download the `.html` file and open it locally (`file://`).
 
-- `d0.html` — one column, rain vs pore space
-- `d1.html` — 3×3 map; green/yellow soil, blue pond; S02.1 pooling
+- `d0.html` — one column rain vs pores
+- `d1.html` — 3×3 pond runoff
+- `d3.html` — sand / loam / clay, I_max ponding, gravity drain
