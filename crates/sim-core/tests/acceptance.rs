@@ -662,6 +662,9 @@ fn d31_equal_z_mobile_shares() {
         .map(|l| l.theta)
         .collect();
 
+    let soil_b0 = world.column_at(1, 0).soil_water_mass();
+    let soil_a0 = world.column_at(0, 0).soil_water_mass();
+
     // Mobile ≈ 0.16 m; D_max = 0.04 → several ticks to share.
     for _ in 0..32 {
         world.tick();
@@ -670,27 +673,39 @@ fn d31_equal_z_mobile_shares() {
 
     let col_a = world.column_at(0, 0);
     let col_b = world.column_at(1, 0);
+    // A loses soil water overall; individual layers may redistribute via percolate.
+    assert!(
+        col_a.soil_water_mass() < soil_a0 - MASS_EPSILON,
+        "A soil mass should fall: was {soil_a0}, now {}",
+        col_a.soil_water_mass()
+    );
     for (i, layer) in col_a.layers.iter().enumerate() {
-        assert!(
-            layer.theta < theta_a0[i] - MASS_EPSILON,
-            "A layer {i} theta should fall: was {}, now {}",
-            theta_a0[i],
-            layer.theta
-        );
         assert!(
             layer.theta + MASS_EPSILON >= fc,
             "A layer {i} must stay ≥ θ_fc={fc}, got {}",
             layer.theta
         );
-    }
-    for (i, layer) in col_b.layers.iter().enumerate() {
+        // No layer should get wetter than start (A was saturated).
         assert!(
-            layer.theta > theta_b0[i] + MASS_EPSILON,
-            "B layer {i} theta should rise: was {}, now {}",
-            theta_b0[i],
+            layer.theta <= theta_a0[i] + MASS_EPSILON,
+            "A layer {i} should not rise above start: was {}, now {}",
+            theta_a0[i],
             layer.theta
         );
     }
+    // B gains soil mass; profile-first may park water in deeper layers (top can stay at fc).
+    assert!(
+        col_b.soil_water_mass() > soil_b0 + MASS_EPSILON,
+        "B soil mass should rise: was {soil_b0}, now {}",
+        col_b.soil_water_mass()
+    );
+    let b_rose = col_b
+        .layers
+        .iter()
+        .enumerate()
+        .any(|(i, layer)| layer.theta > theta_b0[i] + MASS_EPSILON);
+    assert!(b_rose, "at least one B layer θ should rise (got {:?})", 
+        col_b.layers.iter().map(|l| l.theta).collect::<Vec<_>>());
 
     // No oscillation swap: one extra tick must not invert A↔B soil mass.
     let soil_a = col_a.soil_water_mass();
@@ -790,4 +805,188 @@ fn d31_downslope_beats_equal_z() {
             layer.theta
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 3.2 — profile-first percolation then lateral (ε = MASS_EPSILON = 1e-9)
+// Two-layer columns unless noted. Sand default. Capillary ≤θ_fc does not move.
+// ---------------------------------------------------------------------------
+
+/// D32: 1×2 same z; A top=φ bottom=θ_fc; B at θ_fc; after 1 tick A's bottom rose
+/// and B gained less than that internal fill (profile took water first).
+#[test]
+fn d32_top_percolates_before_lateral() {
+    let tex = Texture::Sand;
+    let phi = tex.porosity();
+    let fc = tex.theta_fc();
+    let z = 10.0;
+    let cols = vec![
+        Column::new(
+            z,
+            0.0,
+            vec![
+                SoilLayer::new(0.3, phi, tex), // A top saturated
+                SoilLayer::new(0.5, fc, tex),  // A bottom at fc
+            ],
+        ),
+        Column::new(
+            z,
+            0.0,
+            vec![
+                SoilLayer::new(0.3, fc, tex), // B at fc
+                SoilLayer::new(0.5, fc, tex),
+            ],
+        ),
+    ];
+    let mut world = World::grid(149, 2, 1, cols);
+    let m0 = world.grid_water_mass();
+    let theta_a_bot0 = world.column_at(0, 0).layers[1].theta;
+    let m_b0 = world.water_mass_at(1, 0);
+
+    world.tick();
+    assert_mass_close(world.grid_water_mass(), m0);
+
+    let theta_a_bot1 = world.column_at(0, 0).layers[1].theta;
+    let internal_fill = (theta_a_bot1 - theta_a_bot0) * world.column_at(0, 0).layers[1].thickness_m;
+    assert!(
+        internal_fill > MASS_EPSILON,
+        "A bottom θ should rise via percolate: was {theta_a_bot0}, now {theta_a_bot1}"
+    );
+    let b_gain = world.water_mass_at(1, 0) - m_b0;
+    assert!(
+        b_gain + MASS_EPSILON < internal_fill,
+        "B gain ({b_gain}) should be less than A's internal fill ({internal_fill}) — profile first"
+    );
+}
+
+/// D32: top at θ_fc, bottom drier; top layer water unchanged by percolate (no capillary move).
+#[test]
+fn d32_no_percolate_below_fc() {
+    let tex = Texture::Sand;
+    let fc = tex.theta_fc();
+    let dry = fc * 0.5;
+    let col = Column::new(
+        10.0,
+        0.0,
+        vec![
+            SoilLayer::new(0.3, fc, tex),  // top at fc — no mobile
+            SoilLayer::new(0.5, dry, tex), // bottom drier
+        ],
+    );
+    let mut world = World::new(151, col);
+    let top_m0 = world.column_at(0, 0).layers[0].water_mass();
+    let top_theta0 = world.column_at(0, 0).layers[0].theta;
+    let m0 = world.water_mass();
+
+    world.tick();
+    assert_mass_close(world.water_mass(), m0);
+
+    assert_mass_close(world.column_at(0, 0).layers[0].water_mass(), top_m0);
+    assert_approx_eq(
+        world.column_at(0, 0).layers[0].theta,
+        top_theta0,
+        "top theta unchanged by percolate when at θ_fc",
+    );
+}
+
+/// D32: 1×2 slope; high mobile, low empty pores; low θ rises; low h_surf did not take whole increment.
+#[test]
+fn d32_downslope_fills_soil_before_pond() {
+    let tex = Texture::Sand;
+    let phi = tex.porosity();
+    let fc = tex.theta_fc();
+    let cols = vec![
+        Column::new(
+            10.0,
+            0.0,
+            vec![
+                SoilLayer::new(0.3, phi, tex),
+                SoilLayer::new(0.5, phi, tex),
+            ],
+        ),
+        Column::new(
+            5.0,
+            0.0,
+            vec![
+                SoilLayer::new(0.3, fc, tex), // empty pores above φ
+                SoilLayer::new(0.5, fc, tex),
+            ],
+        ),
+    ];
+    let mut world = World::grid(157, 2, 1, cols);
+    let m0 = world.grid_water_mass();
+    let m_low0 = world.water_mass_at(1, 0);
+    let theta_low0: Vec<f64> = world
+        .column_at(1, 0)
+        .layers
+        .iter()
+        .map(|l| l.theta)
+        .collect();
+    let h_low0 = world.surface_water_m_at(1, 0);
+
+    world.tick();
+    assert_mass_close(world.grid_water_mass(), m0);
+
+    let m_gain = world.water_mass_at(1, 0) - m_low0;
+    assert!(m_gain > MASS_EPSILON, "low column should gain mass, gain={m_gain}");
+
+    let mut theta_rose = false;
+    for (i, layer) in world.column_at(1, 0).layers.iter().enumerate() {
+        if layer.theta > theta_low0[i] + MASS_EPSILON {
+            theta_rose = true;
+            break;
+        }
+    }
+    assert!(theta_rose, "low θ should rise (soil fill before pond)");
+
+    let h_gain = world.surface_water_m_at(1, 0) - h_low0;
+    assert!(
+        h_gain + MASS_EPSILON < m_gain,
+        "low h_surf gain ({h_gain}) must not take the whole mass increment ({m_gain})"
+    );
+}
+
+/// D32: 1×2 flat; sand at φ next to clay at θ_fc; after 1 tick flux ≤ D_max_clay + ε.
+#[test]
+fn d32_contact_limited_by_slower_soil() {
+    let sand = Texture::Sand;
+    let clay = Texture::Clay;
+    let phi_s = sand.porosity();
+    let fc_c = clay.theta_fc();
+    let d_clay = clay.d_max();
+    let z = 10.0;
+    let cols = vec![
+        Column::new(
+            z,
+            0.0,
+            vec![
+                SoilLayer::new(0.3, phi_s, sand),
+                SoilLayer::new(0.5, phi_s, sand),
+            ],
+        ),
+        Column::new(
+            z,
+            0.0,
+            vec![
+                SoilLayer::new(0.3, fc_c, clay),
+                SoilLayer::new(0.5, fc_c, clay),
+            ],
+        ),
+    ];
+    let mut world = World::grid(163, 2, 1, cols);
+    let m0 = world.grid_water_mass();
+    let m_clay0 = world.water_mass_at(1, 0);
+
+    world.tick();
+    assert_mass_close(world.grid_water_mass(), m0);
+
+    let flux = world.water_mass_at(1, 0) - m_clay0;
+    assert!(
+        flux > MASS_EPSILON,
+        "some flux should reach clay, got {flux}"
+    );
+    assert!(
+        flux <= d_clay + MASS_EPSILON,
+        "contact flux {flux} must be ≤ D_max_clay={d_clay} + ε"
+    );
 }

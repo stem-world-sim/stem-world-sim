@@ -1,9 +1,10 @@
-//! Stem World Sim — Sprint 3.1 lateral interflow on a 4-neighbor grid.
+//! Stem World Sim — Sprint 3.2 profile-first percolation + lateral drain.
 //!
 //! Water mass (A = 1): M = h_surf + sum_i (theta_i * L_i)
 //! Grid mass: sum of column M.
-//! Tick order: rate-limited infiltrate → S02.1 runoff → gravity drain → clock.
-//! Mobile soil water (θ > θ_fc) drains to lower-z surface or equal-z soil; capillary stays.
+//! Tick order: rate-limited infiltrate → S02.1 runoff → percolate → lateral → clock.
+//! Mobile soil water (θ > θ_fc) percolates within-column first, then laterally/downhill
+//! into neighbor soil (overflow → surface). Capillary stays. Contact flux ≤ min(D_i, D_j).
 
 /// Absolute / relative tolerance for water-mass comparisons (f64).
 pub const MASS_EPSILON: f64 = 1e-9;
@@ -227,6 +228,115 @@ impl Column {
             self.surface_water_m += amount;
         }
     }
+
+    /// Intra-column percolation (S03.2): mobile water in layer k fills remaining pore
+    /// in layers k+1…. Snapshot θ, then apply. Do not pull below θ_fc.
+    /// Shared texture → one D_max budget for the column; else each source layer's D_max.
+    /// Returns total depth moved (counts against the column's lateral D_max budget this tick).
+    fn percolate_step(&mut self) -> f64 {
+        let n = self.layers.len();
+        if n < 2 {
+            return 0.0;
+        }
+
+        let thetas: Vec<f64> = self.layers.iter().map(|l| l.theta).collect();
+        let same_texture = self
+            .layers
+            .windows(2)
+            .all(|w| w[0].texture == w[1].texture);
+
+        // Remaining pore from snapshot; shrink as we plan fills.
+        let mut pore_left: Vec<f64> = self
+            .layers
+            .iter()
+            .zip(thetas.iter())
+            .map(|(layer, &th)| (layer.porosity - th).max(0.0) * layer.thickness_m)
+            .collect();
+        let mut delta = vec![0.0f64; n];
+
+        if same_texture {
+            let mut budget = self.d_max();
+            for k in 0..n {
+                if budget <= 0.0 {
+                    break;
+                }
+                let fc = self.layers[k].theta_fc();
+                let l_k = self.layers[k].thickness_m;
+                let mut available = (thetas[k] - fc).max(0.0) * l_k;
+                if available <= 0.0 {
+                    continue;
+                }
+                for dest in (k + 1)..n {
+                    if budget <= 0.0 || available <= 0.0 {
+                        break;
+                    }
+                    let can = pore_left[dest];
+                    if can <= 0.0 {
+                        continue;
+                    }
+                    let take = available.min(can).min(budget);
+                    if take <= 0.0 {
+                        continue;
+                    }
+                    delta[k] -= take;
+                    delta[dest] += take;
+                    available -= take;
+                    budget -= take;
+                    pore_left[dest] -= take;
+                }
+            }
+        } else {
+            for k in 0..n {
+                let mut budget = self.layers[k].texture.d_max();
+                if budget <= 0.0 {
+                    continue;
+                }
+                let fc = self.layers[k].theta_fc();
+                let l_k = self.layers[k].thickness_m;
+                let mut available = (thetas[k] - fc).max(0.0) * l_k;
+                if available <= 0.0 {
+                    continue;
+                }
+                for dest in (k + 1)..n {
+                    if budget <= 0.0 || available <= 0.0 {
+                        break;
+                    }
+                    let can = pore_left[dest];
+                    if can <= 0.0 {
+                        continue;
+                    }
+                    let take = available.min(can).min(budget);
+                    if take <= 0.0 {
+                        continue;
+                    }
+                    delta[k] -= take;
+                    delta[dest] += take;
+                    available -= take;
+                    budget -= take;
+                    pore_left[dest] -= take;
+                }
+            }
+        }
+
+        let mut moved = 0.0f64;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            if delta[i] == 0.0 {
+                continue;
+            }
+            if delta[i] > 0.0 {
+                moved += delta[i];
+            }
+            layer.theta += delta[i] / layer.thickness_m;
+            let fc = layer.theta_fc();
+            if layer.theta < fc {
+                layer.theta = fc;
+            }
+            if layer.theta > layer.porosity {
+                layer.theta = layer.porosity;
+            }
+        }
+        moved
+    }
 }
 
 /// Simulation clock (tick count).
@@ -420,11 +530,12 @@ impl World {
         self.clock.advance();
     }
 
-    /// Full tick: infiltrate → runoff (S02.1) → gravity drain; advances clock once.
+    /// Full tick: infiltrate → runoff (S02.1) → percolate → lateral; advances clock once.
     pub fn tick(&mut self) {
         self.infiltrate_all();
         self.runoff_pass();
-        self.gravity_drain_pass();
+        let percolated = self.percolate_all();
+        self.lateral_drain_pass(&percolated);
         self.clock.advance();
     }
 
@@ -553,14 +664,23 @@ impl World {
         }
     }
 
-    /// Simultaneous gravity drain (S03 + S03.1).
-    /// Snapshot z, θ/m, D_max; then apply.
-    /// - Strictly lower-z candidates: V = min(D_max, m_i) split equally across all at
-    ///   the lowest z; add each share to neighbor **surface**.
-    /// - Else flat equal-z with m_nbr < m_i: half-diff shares into neighbor **soil**
-    ///   (excess over φ → that neighbor's surface). Total leaving ≤ D_max and ≤ m_i.
-    /// Never send to z_nbr > z_i. Capillary (θ ≤ θ_fc) does not move.
-    fn gravity_drain_pass(&mut self) {
+    /// S03.2: percolate every column (profile-first), apply immediately.
+    /// Returns per-column volume percolated (for shared D_max with lateral).
+    fn percolate_all(&mut self) -> Vec<f64> {
+        self.columns
+            .iter_mut()
+            .map(Column::percolate_step)
+            .collect()
+    }
+
+    /// Lateral / downhill drain on leftover mobile m after percolate (S03.2).
+    /// Snapshot z, leftover m, D_max; then apply.
+    /// Candidates: lower-z OR (equal-z && m_nbr < m_i); never z_nbr > z_i.
+    /// Contact flux ≤ min(D_i, D_j); column outflow also ≤ remaining D_max after percolate.
+    /// If any lower-z: targets at min_z; equal split of leftover m, each ≤ contact.
+    /// Else flat: half-diff of leftover m, ≤ contact; total ≤ leftover m and remaining D.
+    /// Receiver: soil top-down (overflow past φ → surface). Capillary does not move.
+    fn lateral_drain_pass(&mut self, percolated: &[f64]) {
         let n = self.columns.len();
         if n == 0 {
             return;
@@ -569,15 +689,13 @@ impl World {
         let elevations: Vec<f64> = self.columns.iter().map(|c| c.elevation_m).collect();
         let mobiles: Vec<f64> = self.columns.iter().map(Column::mobile_water_m).collect();
         let d_maxes: Vec<f64> = self.columns.iter().map(Column::d_max).collect();
-        // Snapshot remaining pore capacity for simultaneous soil fills.
-        let mut pore_left: Vec<f64> = self
-            .columns
-            .iter()
-            .map(Column::remaining_pore_capacity_m)
+        // Remaining drain budget after profile percolation (shared column D_max).
+        let rem_d: Vec<f64> = (0..n)
+            .map(|i| (d_maxes[i] - percolated.get(i).copied().unwrap_or(0.0)).max(0.0))
             .collect();
 
-        // Planned: (from, to, amount, to_soil)
-        let mut transfers: Vec<(usize, usize, f64, bool)> = Vec::new();
+        // Planned: (from, to, amount) — always delivered to soil first.
+        let mut transfers: Vec<(usize, usize, f64)> = Vec::new();
 
         for y in 0..self.height {
             for x in 0..self.width {
@@ -586,8 +704,9 @@ impl World {
                 if m_i <= 0.0 {
                     continue;
                 }
-                let d_max = d_maxes[i];
-                if d_max <= 0.0 {
+                let d_i = d_maxes[i];
+                let d_rem = rem_d[i];
+                if d_i <= 0.0 || d_rem <= 0.0 {
                     continue;
                 }
                 let z_i = elevations[i];
@@ -612,7 +731,6 @@ impl World {
                 }
 
                 if !lower.is_empty() {
-                    // Prefer strictly lower z: T = all at min_z; split V equally → surface.
                     let z_star = lower.iter().map(|&(_, z)| z).fold(f64::INFINITY, f64::min);
                     let targets: Vec<usize> = lower
                         .into_iter()
@@ -623,22 +741,13 @@ impl World {
                     if n_t == 0 {
                         continue;
                     }
-                    let v = m_i.min(d_max);
-                    if v <= 0.0 {
-                        continue;
-                    }
-                    let share = v / n_t as f64;
-                    for j in targets {
-                        transfers.push((i, j, share, false));
-                    }
-                } else if !equal_poorer.is_empty() {
-                    // Flat bench: half-diff into soil; D_max split across poorer neighbors.
-                    let n_p = equal_poorer.len();
-                    let d_share = d_max / n_p as f64;
                     let mut planned: Vec<(usize, f64)> = Vec::new();
                     let mut total = 0.0;
-                    for (j, m_nbr) in equal_poorer {
-                        let v_j = d_share.min(0.5 * (m_i - m_nbr));
+                    let equal_share = m_i / n_t as f64;
+                    for j in targets {
+                        // Contact: min(donor remaining D, neighbor D_max).
+                        let contact = d_rem.min(d_maxes[j]);
+                        let v_j = equal_share.min(contact);
                         if v_j > 0.0 {
                             planned.push((j, v_j));
                             total += v_j;
@@ -647,36 +756,46 @@ impl World {
                     if total <= 0.0 {
                         continue;
                     }
-                    // Cap total leaving at m_i (and D_max — already ≤ via shares).
-                    let cap = m_i.min(d_max);
+                    let cap = m_i.min(d_rem);
                     let scale = if total > cap { cap / total } else { 1.0 };
                     for (j, v_j) in planned {
                         let v = v_j * scale;
                         if v > 0.0 {
-                            transfers.push((i, j, v, true));
+                            transfers.push((i, j, v));
+                        }
+                    }
+                } else if !equal_poorer.is_empty() {
+                    let mut planned: Vec<(usize, f64)> = Vec::new();
+                    let mut total = 0.0;
+                    for (j, m_nbr) in equal_poorer {
+                        let contact = d_rem.min(d_maxes[j]);
+                        let v_j = contact.min(0.5 * (m_i - m_nbr));
+                        if v_j > 0.0 {
+                            planned.push((j, v_j));
+                            total += v_j;
+                        }
+                    }
+                    if total <= 0.0 {
+                        continue;
+                    }
+                    let cap = m_i.min(d_rem);
+                    let scale = if total > cap { cap / total } else { 1.0 };
+                    for (j, v_j) in planned {
+                        let v = v_j * scale;
+                        if v > 0.0 {
+                            transfers.push((i, j, v));
                         }
                     }
                 }
             }
         }
 
-        // Apply: remove mobile from donors, then deliver to surface or soil.
-        // Soil delivery uses snapshot pore capacity; leftover → surface.
         let mut remove_amt = vec![0.0f64; n];
-        let mut surface_delta = vec![0.0f64; n];
         let mut soil_add = vec![0.0f64; n];
 
-        for (from, to, amount, to_soil) in transfers {
+        for (from, to, amount) in transfers {
             remove_amt[from] += amount;
-            if to_soil {
-                let can = pore_left[to].max(0.0);
-                let into_soil = amount.min(can);
-                pore_left[to] -= into_soil;
-                soil_add[to] += into_soil;
-                surface_delta[to] += amount - into_soil;
-            } else {
-                surface_delta[to] += amount;
-            }
+            soil_add[to] += amount;
         }
 
         for i in 0..n {
@@ -686,18 +805,12 @@ impl World {
         }
         for i in 0..n {
             if soil_add[i] > 0.0 {
+                // add_soil_water fills top-down; overflow past φ → surface.
                 self.columns[i].add_soil_water(soil_add[i]);
-            }
-            if surface_delta[i] != 0.0 {
-                self.columns[i].surface_water_m += surface_delta[i];
-                if self.columns[i].surface_water_m < 0.0
-                    && self.columns[i].surface_water_m.abs() <= MASS_EPSILON
-                {
-                    self.columns[i].surface_water_m = 0.0;
-                }
             }
         }
     }
+
 }
 
 #[cfg(test)]
