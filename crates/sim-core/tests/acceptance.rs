@@ -4,7 +4,10 @@
 //! Cell area A = 1. Column water mass M = h_surf + sum(theta_i * L_i).
 //! Grid mass: sum of column M.
 
-use sim_core::{Column, SoilLayer, Texture, World, E_OPEN, E_SOIL, H_REST, MASS_EPSILON, N_ET, R_MAX, V_REST};
+use sim_core::{
+    Column, Occupant, SoilLayer, Texture, World, E_OPEN, E_SOIL, H_REST, MASS_EPSILON, MAX_OCCUPANTS,
+    N_ET, N_LAYERS, P_MAX, R_MAX, T_WILT, V_REST,
+};
 
 fn assert_mass_close(actual: f64, expected: f64) {
     let scale = expected.abs().max(1.0);
@@ -25,9 +28,9 @@ fn assert_approx_eq(a: f64, b: f64, label: &str) {
 }
 
 
-/// Closed-basin inventory: on-grid water + cumulative ET (I3 / S05).
+/// Closed-basin inventory: on-grid water + ET + extract (I3 / S05 / S06).
 fn closed_mass(world: &World) -> f64 {
-    world.grid_water_mass() + world.et_lost()
+    world.grid_water_mass() + world.et_lost() + world.extract_lost()
 }
 
 /// Default Sand column (φ = 0.40). `porosity` arg kept for call-site shape; ignored — Sand φ used.
@@ -113,7 +116,7 @@ fn i2_isolated_column_mass_conserved() {
     let r = 0.2;
     world.add_rain(r);
     world.tick_until_surface_dry_or_saturated();
-    let m_final = world.water_mass() + world.et_lost();
+    let m_final = world.water_mass() + world.et_lost() + world.extract_lost();
     assert_mass_close(m_final, m0 + r);
 }
 
@@ -158,6 +161,11 @@ fn i6_queries_are_kernel_methods() {
     let _grid_rest = world.grid_at_rest();
     // S05 ET sink query.
     let _et = world.et_lost();
+    // S06 occupant / extract queries.
+    let _extract = world.extract_lost();
+    let _plant = world.plant_at(0, 0);
+    let _occ_n = world.occupant_count(0, 0);
+    let _th = world.layer_theta_at(0, 0, 0);
 
     assert!(mass >= 0.0);
     assert!(surf >= 0.0);
@@ -182,8 +190,8 @@ fn d0_rain_fits_in_pores_surface_dries() {
     world.tick_until_surface_dry_or_saturated();
 
     assert_approx_eq(world.surface_water_m(), 0.0, "surface should be dry");
-    assert!(world.water_mass() + world.et_lost() > m0);
-    assert_mass_close(world.water_mass() + world.et_lost(), m0 + r);
+    assert!(world.water_mass() + world.et_lost() + world.extract_lost() > m0);
+    assert_mass_close(world.water_mass() + world.et_lost() + world.extract_lost(), m0 + r);
     // Water entered soil: some theta increased / pore decreased
     assert!(world.remaining_pore_capacity_m() < pore0 - MASS_EPSILON);
 }
@@ -222,7 +230,7 @@ fn d0_novice_all_rain_vanishes_is_false() {
     world.add_rain(r);
     world.tick_until_surface_dry_or_saturated();
 
-    let m_final = world.water_mass() + world.et_lost();
+    let m_final = world.water_mass() + world.et_lost() + world.extract_lost();
     let surface_dry = world.surface_water_m() <= MASS_EPSILON;
     let mass_lost = (m_final - (m0 + r)).abs() > MASS_EPSILON * (m0 + r).abs().max(1.0);
 
@@ -1273,7 +1281,7 @@ fn d331_drowned_lake_no_period2() {
     v_hist.push(w3.surface_water_m_at(1, 0));
     for _ in 0..39 {
         w3.tick();
-        assert_mass_close(w3.grid_water_mass() + w3.et_lost(), m3);
+        assert_mass_close(w3.grid_water_mass() + w3.et_lost() + w3.extract_lost(), m3);
         v_hist.push(w3.surface_water_m_at(1, 0));
     }
     let dh3 = (w3.column_at(0, 0).head() - w3.column_at(1, 0).head()).abs();
@@ -1767,5 +1775,223 @@ fn d5_mass_et_accounts() {
     }
 
     assert!(world.et_lost() > MASS_EPSILON, "rain then ET should lose some water");
-    assert_mass_close(world.grid_water_mass() + world.et_lost(), m_initial + rain);
+    assert_mass_close(world.grid_water_mass() + world.et_lost() + world.extract_lost(), m_initial + rain);
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 6 — occupants + plant stub (ε = MASS_EPSILON = 1e-9)
+// Sink cadence same as ET: after advance when tick % N_ET == 0; ET then occupants.
+// ---------------------------------------------------------------------------
+
+/// D6: one PlantStub, wet top; after one sink-step θ_top fell, bot unchanged.
+#[test]
+fn d6_plant_drinks_top() {
+    let tex = Texture::Sand;
+    // Both layers at θ_fc so no percolate/lateral before the sink-step; plant + ET
+    // pull top (below fc OK); bot stays put with top-only root.
+    let fc = tex.theta_fc();
+    let col = Column::new(
+        0.0,
+        0.0,
+        vec![
+            SoilLayer::new(0.3, fc, tex),
+            SoilLayer::new(0.5, fc, tex),
+        ],
+    );
+    let mut world = World::new(601, col);
+    world.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+    assert!(world.plant_at(0, 0));
+    assert_eq!(world.occupant_count(0, 0), 1);
+
+    let theta_top0 = world.layer_theta_at(0, 0, 0);
+    let theta_bot0 = world.layer_theta_at(0, 0, 1);
+    let m0 = closed_mass(&world);
+
+    tick_through_next_et(&mut world);
+
+    let theta_top1 = world.layer_theta_at(0, 0, 0);
+    let theta_bot1 = world.layer_theta_at(0, 0, 1);
+    assert!(
+        theta_top1 < theta_top0 - MASS_EPSILON,
+        "θ_top should fall: {theta_top0} -> {theta_top1}"
+    );
+    assert_approx_eq(theta_bot1, theta_bot0, "bot unchanged with top-only root");
+    assert!(world.extract_lost() > MASS_EPSILON, "plant should extract");
+    assert_mass_close(closed_mass(&world), m0);
+}
+
+/// D6: root [0,1]; θ_bot falls, θ_top unchanged (pond shields top from ET).
+#[test]
+fn d6_mask_can_be_bot() {
+    let tex = Texture::Sand;
+    // Both layers saturated + pond ⇒ no percolate room; ET takes pond; bot-root drinks bot.
+    let phi = tex.porosity();
+    let col = Column::new(
+        0.0,
+        0.10, // pond
+        vec![
+            SoilLayer::new(0.3, phi, tex),
+            SoilLayer::new(0.5, phi, tex),
+        ],
+    );
+    let mut world = World::new(602, col);
+    world
+        .add_occupant(0, 0, Occupant::plant_stub_with_root([0.0, 1.0]))
+        .unwrap();
+
+    let theta_top0 = world.layer_theta_at(0, 0, 0);
+    let theta_bot0 = world.layer_theta_at(0, 0, 1);
+    let m0 = closed_mass(&world);
+
+    tick_through_next_et(&mut world);
+
+    let theta_top1 = world.layer_theta_at(0, 0, 0);
+    let theta_bot1 = world.layer_theta_at(0, 0, 1);
+    assert_approx_eq(theta_top1, theta_top0, "θ_top unchanged with bot root + pond ET");
+    assert!(
+        theta_bot1 < theta_bot0 - MASS_EPSILON,
+        "θ_bot should fall: {theta_bot0} -> {theta_bot1}"
+    );
+    assert_approx_eq(world.extract_lost(), P_MAX, "one bot-root plant takes P_MAX");
+    assert_mass_close(closed_mass(&world), m0);
+    let _ = N_LAYERS; // used by Occupant root type
+}
+
+/// D6: two PlantStubs; extract ≈ 2*P_MAX (capped by water).
+#[test]
+fn d6_two_occupants_sum() {
+    let tex = Texture::Sand;
+    // Plenty of top water; pond so ET does not compete for soil mass budget.
+    let col = Column::new(
+        0.0,
+        0.10,
+        vec![
+            SoilLayer::new(0.3, tex.porosity(), tex),
+            SoilLayer::new(0.5, tex.porosity(), tex),
+        ],
+    );
+    let mut world = World::new(603, col);
+    world.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+    world.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+    assert_eq!(world.occupant_count(0, 0), 2);
+    let m0 = closed_mass(&world);
+
+    tick_through_next_et(&mut world);
+
+    assert_approx_eq(world.extract_lost(), 2.0 * P_MAX, "two plants extract ~2*P_MAX");
+    assert_mass_close(closed_mass(&world), m0);
+}
+
+/// D6: dry top; after 3 sink-steps alive=false; further steps θ unchanged.
+#[test]
+fn d6_wilt_stops_uptake() {
+    let tex = Texture::Sand;
+    // Dry top (θ≈0) so plant takes nothing each sink-step; tiny bot water that
+    // plant does not reach (root top-only). No pond ⇒ ET soil take also ~0.
+    let col = Column::new(
+        0.0,
+        0.0,
+        vec![
+            SoilLayer::new(0.3, 0.0, tex),
+            SoilLayer::new(0.5, 0.25, tex),
+        ],
+    );
+    let mut world = World::new(604, col);
+    world.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+    assert!(world.plant_at(0, 0));
+
+    // Three sink-steps → wilt.
+    for step in 1..=3 {
+        tick_through_next_et(&mut world);
+        if step < 3 {
+            assert!(
+                world.plant_at(0, 0),
+                "should still be alive after {step} dry sink-steps (T_WILT={T_WILT})"
+            );
+        }
+    }
+    assert!(
+        !world.plant_at(0, 0),
+        "plant should wilt after {T_WILT} dry sink-steps"
+    );
+    assert_approx_eq(world.extract_lost(), 0.0, "no water to extract while drying");
+
+    let theta_top = world.layer_theta_at(0, 0, 0);
+    let theta_bot = world.layer_theta_at(0, 0, 1);
+    let extract0 = world.extract_lost();
+
+    // Further sink-steps: θ unchanged, extract unchanged.
+    for _ in 0..3 {
+        tick_through_next_et(&mut world);
+        assert_approx_eq(world.layer_theta_at(0, 0, 0), theta_top, "top frozen after wilt");
+        assert_approx_eq(world.layer_theta_at(0, 0, 1), theta_bot, "bot frozen after wilt");
+        assert_approx_eq(world.extract_lost(), extract0, "no further extract after wilt");
+        assert!(!world.plant_at(0, 0));
+    }
+}
+
+/// D6: M + et_lost + extract_lost conserved with occupants present.
+#[test]
+fn d6_extract_in_ledger() {
+    let tex = Texture::Sand;
+    let col = Column::new(
+        0.0,
+        0.20,
+        vec![
+            SoilLayer::new(0.3, tex.porosity(), tex),
+            SoilLayer::new(0.5, 0.25, tex),
+        ],
+    );
+    let mut world = World::new(605, col);
+    world.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+    let rain = 0.15;
+    world.add_rain(rain);
+    let m0 = closed_mass(&world);
+
+    for _ in 0..40 {
+        world.tick();
+        assert_mass_close(closed_mass(&world), m0);
+    }
+    assert!(world.et_lost() > MASS_EPSILON || world.extract_lost() > MASS_EPSILON);
+    assert!(world.extract_lost() > MASS_EPSILON, "plant should have extracted");
+    assert_mass_close(
+        world.grid_water_mass() + world.et_lost() + world.extract_lost(),
+        m0,
+    );
+}
+
+/// D6: no occupants ⇒ extract_lost == 0.
+#[test]
+fn d6_bare_cell_no_extract() {
+    let mut world = World::new(606, saturated_column(0.0, 0.25));
+    assert_eq!(world.occupant_count(0, 0), 0);
+    assert!(!world.plant_at(0, 0));
+    let m0 = closed_mass(&world);
+
+    for _ in 0..30 {
+        world.tick();
+        assert_approx_eq(world.extract_lost(), 0.0, "bare cell extract_lost");
+        assert_mass_close(closed_mass(&world), m0);
+    }
+    assert!(world.et_lost() > MASS_EPSILON, "ET still runs on bare cells");
+}
+
+/// D6: 9th add_occupant fails.
+#[test]
+fn d6_cap_eight() {
+    let mut world = World::new(607, default_column(0.2, 0.4));
+    for i in 0..MAX_OCCUPANTS {
+        world
+            .add_occupant(0, 0, Occupant::plant_stub())
+            .unwrap_or_else(|_| panic!("add {i} should succeed"));
+    }
+    assert_eq!(world.occupant_count(0, 0), MAX_OCCUPANTS);
+    let err = world.add_occupant(0, 0, Occupant::plant_stub());
+    assert!(err.is_err(), "9th occupant must fail");
+    assert_eq!(world.occupant_count(0, 0), MAX_OCCUPANTS);
+
+    world.clear_occupants(0, 0);
+    assert_eq!(world.occupant_count(0, 0), 0);
+    world.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+    assert_eq!(world.occupant_count(0, 0), 1);
 }

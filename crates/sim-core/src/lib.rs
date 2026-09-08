@@ -1,9 +1,9 @@
-//! Stem World Sim — Sprint 5 batched evaporation (closed basin).
+//! Stem World Sim — Sprint 6 occupants + plant stub (closed basin).
 //!
 //! Water mass (A = 1): M = h_surf + sum_i (theta_i * L_i)
-//! Grid mass: sum of column M. Closed basin: M + et_lost() == mass ever added.
+//! Grid mass: sum of column M. Closed basin: M + et_lost() + extract_lost() == mass ever added.
 //! Tick order: infiltrate → pond → soil → lake_snap → at_rest; advance clock;
-//! if clock.tick % N_ET == 0: ET → lake_snap → rest again.
+//! if clock.tick % N_ET == 0: ET → occupants → lake_snap → rest again.
 //! Pond: every lower-H 4-neighbor with ΔH > H_REST, weights ∝ ΔH, each edge ≤ R_MAX
 //! and ≤ 0.5 ΔH; donor-scale then receiver-cap; drop V ≤ V_REST. Mass conserved.
 //! Soil percolate/lateral: V = min(old cap, unused pore room on receiver); unused=0 ⇒ V=0;
@@ -11,6 +11,8 @@
 //! Lake snap: 4-connected components with h > V_REST and intra |ΔH| ≤ H_REST snap to
 //! mean H* with Σh conserved; mark snapped cells at_rest. S04 sleep kept.
 //! ET: pond first (E_OPEN) else top-layer soil (E_SOIL, may go below θ_fc); skip ≤ V_REST.
+//! E_eff = E * (1 - clamp(sum_shade, 0, 1)); shade=0 ⇒ identical to S05.
+//! Occupants: per-cell list ≤ MAX_OCCUPANTS; PlantStub uptake by root mask; wilt at T_WILT.
 //! Unique-min-H chute revoked. Capillary stays.
 
 /// Absolute / relative tolerance for water-mass comparisons (f64).
@@ -33,6 +35,18 @@ pub const E_SOIL: f64 = 0.005;
 
 /// ET-step cadence: run evaporation when clock.tick % N_ET == 0 after advance. S05.
 pub const N_ET: u64 = 10;
+
+/// Max occupants per cell. S06.
+pub const MAX_OCCUPANTS: usize = 8;
+
+/// Root-mask length (matches default two-layer columns). S06.
+pub const N_LAYERS: usize = 2;
+
+/// PlantStub max uptake per sink-step (metres water, A = 1). S06.
+pub const P_MAX: f64 = 0.01;
+
+/// Dry sink-steps before PlantStub wilts (alive = false). S06.
+pub const T_WILT: u32 = 3;
 
 /// Soil texture: porosity, field capacity, infiltrate and drain rate limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +89,53 @@ impl Texture {
         }
     }
 }
+
+/// Occupant kind. S06 PlantStub; later Animal, Machine, Drip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OccupantKind {
+    PlantStub,
+}
+
+/// Cell occupant with root mask and uptake demand. S06.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Occupant {
+    pub kind: OccupantKind,
+    pub alive: bool,
+    pub uptake_max: f64,
+    pub root: [f64; N_LAYERS],
+    pub shade: f64,
+    pub dry_steps: u32,
+}
+
+impl Occupant {
+    /// Default PlantStub: root top-only, shade 0, uptake P_MAX, alive.
+    pub fn plant_stub() -> Self {
+        Self {
+            kind: OccupantKind::PlantStub,
+            alive: true,
+            uptake_max: P_MAX,
+            root: [1.0, 0.0],
+            shade: 0.0,
+            dry_steps: 0,
+        }
+    }
+
+    /// PlantStub with an explicit root mask (weights should sum to 1).
+    pub fn plant_stub_with_root(root: [f64; N_LAYERS]) -> Self {
+        Self {
+            kind: OccupantKind::PlantStub,
+            alive: true,
+            uptake_max: P_MAX,
+            root,
+            shade: 0.0,
+            dry_steps: 0,
+        }
+    }
+}
+
+/// Error when [`World::add_occupant`] would exceed [`MAX_OCCUPANTS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OccupantsFull;
 
 /// One soil layer: thickness L, volumetric moisture theta, texture (φ from table).
 #[derive(Clone, Debug, PartialEq)]
@@ -127,6 +188,8 @@ pub struct Column {
     pub elevation_m: f64,
     pub surface_water_m: f64,
     pub layers: Vec<SoilLayer>,
+    /// Per-cell occupants, capped at [`MAX_OCCUPANTS`]. S06.
+    pub occupants: Vec<Occupant>,
 }
 
 impl Column {
@@ -135,6 +198,7 @@ impl Column {
             elevation_m,
             surface_water_m,
             layers,
+            occupants: Vec::new(),
         }
     }
 
@@ -452,6 +516,8 @@ pub struct World {
     at_rest: Vec<bool>,
     /// Cumulative water depth evaporated (A = 1); closed-basin sink. S05.
     et_lost: f64,
+    /// Cumulative water depth extracted by occupants (A = 1). S06.
+    extract_lost: f64,
 }
 
 impl World {
@@ -465,6 +531,7 @@ impl World {
             columns: vec![column],
             at_rest: vec![false],
             et_lost: 0.0,
+            extract_lost: 0.0,
         }
     }
 
@@ -485,6 +552,7 @@ impl World {
             columns,
             at_rest: vec![false; n],
             et_lost: 0.0,
+            extract_lost: 0.0,
         }
     }
 
@@ -628,9 +696,53 @@ impl World {
     }
 
     /// Cumulative ET sink (metres water, A = 1). I3: grid_water_mass() + et_lost()
-    /// equals mass ever added (initial + rain/additions).
+    /// + extract_lost() equals mass ever added (initial + rain/additions).
     pub fn et_lost(&self) -> f64 {
         self.et_lost
+    }
+
+    /// Cumulative occupant extract sink (metres water, A = 1). S06.
+    pub fn extract_lost(&self) -> f64 {
+        self.extract_lost
+    }
+
+    /// True if any alive [`OccupantKind::PlantStub`] is present at (x,y). S06.
+    pub fn plant_at(&self, x: usize, y: usize) -> bool {
+        self.column_at(x, y).occupants.iter().any(|o| {
+            o.alive && matches!(o.kind, OccupantKind::PlantStub)
+        })
+    }
+
+    /// Number of occupants at (x,y) (alive or wilted). S06.
+    pub fn occupant_count(&self, x: usize, y: usize) -> usize {
+        self.column_at(x, y).occupants.len()
+    }
+
+    /// Layer theta at (x,y), layer index i. S06 kernel query.
+    pub fn layer_theta_at(&self, x: usize, y: usize, i: usize) -> f64 {
+        self.column_at(x, y).layers[i].theta
+    }
+
+    /// Add an occupant at (x,y). Err if the cell already has [`MAX_OCCUPANTS`].
+    pub fn add_occupant(&mut self, x: usize, y: usize, occ: Occupant) -> Result<(), OccupantsFull> {
+        let col = self.column_at_mut(x, y);
+        if col.occupants.len() >= MAX_OCCUPANTS {
+            return Err(OccupantsFull);
+        }
+        col.occupants.push(occ);
+        Ok(())
+    }
+
+    /// Clear all occupants at (x,y).
+    pub fn clear_occupants(&mut self, x: usize, y: usize) {
+        self.column_at_mut(x, y).occupants.clear();
+    }
+
+    /// Clear occupants on every cell.
+    pub fn clear_all_occupants(&mut self) {
+        for col in &mut self.columns {
+            col.occupants.clear();
+        }
     }
 
     /// Infiltrate every column (rate-limited); no runoff/drain; advances clock.
@@ -640,10 +752,10 @@ impl World {
     }
 
     /// Full tick: infiltrate → pond → soil → lake_snap → at_rest; advance clock;
-    /// if clock.tick % N_ET == 0: ET → lake_snap → rest again (S05).
+    /// if clock.tick % N_ET == 0: ET → occupants → lake_snap → rest again (S05/S06).
     /// S04: sleeping cells (at_rest and all 4-nbrs at_rest) skip hydro as donors.
     /// S04.1: soil flux capped by unused pore room; lake snap after soil.
-    /// S05: ET cadence is after advance; ticks 10,20,… run one ET-step (E*1, not E*N_ET).
+    /// S05/S06: sink cadence after advance; ticks 10,20,… run one ET+occupant step.
     pub fn tick(&mut self) {
         let n = self.columns.len();
         let active = self.compute_active();
@@ -662,13 +774,14 @@ impl World {
         }
         self.clock.advance();
 
-        // S05 batched ET: after advance, when tick is a multiple of N_ET.
+        // S05/S06 sink batch: after advance, when tick is a multiple of N_ET.
         if self.clock.tick % N_ET == 0 {
-            let mut et_busy = vec![false; n];
-            self.et_pass(&mut et_busy);
+            let mut sink_busy = vec![false; n];
+            self.et_pass(&mut sink_busy);
+            self.occupant_pass(&mut sink_busy);
             self.lake_snap();
             for i in 0..n {
-                self.at_rest[i] = !et_busy[i];
+                self.at_rest[i] = !sink_busy[i];
             }
         }
     }
@@ -1094,19 +1207,24 @@ impl World {
         }
     }
 
-    /// S05 batched evaporation: one ET-step (E*1). Pond first if h>0, else top soil.
+    /// S05/S06 batched evaporation: one ET-step (E*1). Pond first if h>0, else top soil.
+    /// E_eff = E * (1 - clamp(sum_shade, 0, 1)); shade=0 ⇒ identical to S05.
     /// Skip take ≤ V_REST. Wakes cells that lose > V_REST via `busy`.
     fn et_pass(&mut self, busy: &mut [bool]) {
         let n = self.columns.len();
         for i in 0..n {
-            let take = {
+            let (take, from_pond) = {
                 let col = &self.columns[i];
+                let sum_shade: f64 = col.occupants.iter().map(|o| o.shade).sum();
+                let shade_factor = 1.0 - sum_shade.clamp(0.0, 1.0);
                 if col.surface_water_m > 0.0 {
-                    col.surface_water_m.min(E_OPEN)
+                    let e_eff = E_OPEN * shade_factor;
+                    (col.surface_water_m.min(e_eff), true)
                 } else if let Some(top) = col.layers.first() {
-                    (top.theta * top.thickness_m).min(E_SOIL)
+                    let e_eff = E_SOIL * shade_factor;
+                    ((top.theta * top.thickness_m).min(e_eff), false)
                 } else {
-                    0.0
+                    (0.0, false)
                 }
             };
             if take <= V_REST {
@@ -1114,7 +1232,7 @@ impl World {
             }
             busy[i] = true;
             let col = &mut self.columns[i];
-            if col.surface_water_m > 0.0 {
+            if from_pond {
                 col.surface_water_m = (col.surface_water_m - take).max(0.0);
             } else if let Some(top) = col.layers.first_mut() {
                 let mass = (top.theta * top.thickness_m - take).max(0.0);
@@ -1125,6 +1243,65 @@ impl World {
                 };
             }
             self.et_lost += take;
+        }
+    }
+
+    /// S06 occupant extract after ET on the same sink cadence. Alive occupants in
+    /// insert order: demand u = uptake_max; take min(u*root[k], θ_k*L) per layer
+    /// (below θ_fc OK). No pond drink. Wilt after T_WILT consecutive dry steps.
+    fn occupant_pass(&mut self, busy: &mut [bool]) {
+        let n = self.columns.len();
+        for i in 0..n {
+            // Collect per-occupant totals then mutate layers / dry_steps.
+            let occ_len = self.columns[i].occupants.len();
+            if occ_len == 0 {
+                continue;
+            }
+            let mut cell_taken = 0.0f64;
+            for oi in 0..occ_len {
+                if !self.columns[i].occupants[oi].alive {
+                    continue;
+                }
+                let u = self.columns[i].occupants[oi].uptake_max;
+                let root = self.columns[i].occupants[oi].root;
+                let mut taken = 0.0f64;
+                for k in 0..N_LAYERS {
+                    if k >= self.columns[i].layers.len() {
+                        break;
+                    }
+                    let demand = u * root[k];
+                    if demand <= 0.0 {
+                        continue;
+                    }
+                    let layer = &mut self.columns[i].layers[k];
+                    let avail = (layer.theta * layer.thickness_m).max(0.0);
+                    let take = demand.min(avail);
+                    if take <= 0.0 {
+                        continue;
+                    }
+                    let mass = (avail - take).max(0.0);
+                    layer.theta = if layer.thickness_m > 0.0 {
+                        mass / layer.thickness_m
+                    } else {
+                        0.0
+                    };
+                    taken += take;
+                }
+                if taken == 0.0 {
+                    self.columns[i].occupants[oi].dry_steps =
+                        self.columns[i].occupants[oi].dry_steps.saturating_add(1);
+                } else {
+                    self.columns[i].occupants[oi].dry_steps = 0;
+                }
+                if self.columns[i].occupants[oi].dry_steps >= T_WILT {
+                    self.columns[i].occupants[oi].alive = false;
+                }
+                cell_taken += taken;
+            }
+            if cell_taken > V_REST {
+                busy[i] = true;
+            }
+            self.extract_lost += cell_taken;
         }
     }
 
