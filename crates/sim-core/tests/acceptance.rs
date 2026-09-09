@@ -2901,3 +2901,266 @@ fn d91_rest_drought_still_exact() {
     assert_approx_eq(caught.extract_lost(), live.extract_lost(), "extract");
     assert_eq!(live.plant_at(0, 0), caught.plant_at(0, 0), "alive");
 }
+
+// ---------------------------------------------------------------------------
+// Sprint 10 — flyover catch_up budget (1024×1024)
+// ---------------------------------------------------------------------------
+
+use std::time::Instant;
+
+const S10_W: usize = 1024;
+const S10_H: usize = 1024;
+const S10_OX: usize = 16;
+const S10_OY: usize = 496;
+
+/// Ridge z=8 on x∈[128,144), else z=2; Loam at θ_fc; plant in starting view; asleep+ready.
+fn s10_flyover_world(seed: u64) -> World {
+    let tex = Texture::Loam;
+    let fc = tex.theta_fc();
+    let mut cols = Vec::with_capacity(S10_W * S10_H);
+    for y in 0..S10_H {
+        for x in 0..S10_W {
+            let z = if (128..144).contains(&x) { 8.0 } else { 2.0 };
+            let _ = y;
+            cols.push(Column::new(
+                z,
+                0.0,
+                vec![
+                    SoilLayer::new(0.3, fc, tex),
+                    SoilLayer::new(0.5, fc, tex),
+                ],
+            ));
+        }
+    }
+    let mut world = World::grid(seed, S10_W, S10_H, cols);
+    // Rest desert: no hydro activity until observe/rain/catch_up.
+    world.force_sleep_all();
+    // PlantStub in starting view [ox,ox+32)×[oy,oy+32).
+    world
+        .add_occupant(S10_OX + 8, S10_OY + 8, Occupant::plant_stub())
+        .expect("plant");
+    // add_occupant wakes; return to sleep for budget tests that ignore explicitly.
+    world.force_sleep_all();
+    world
+}
+
+fn s10_ignore_all(world: &mut World) {
+    let ncx = (world.width() + CHUNK - 1) / CHUNK;
+    let ncy = (world.height() + CHUNK - 1) / CHUNK;
+    for cy in 0..ncy {
+        for cx in 0..ncx {
+            world.ignore_chunk(cx, cy).expect("ignore");
+        }
+    }
+}
+
+fn s10_work_set_chunks() -> Vec<(usize, usize)> {
+    // view ∪ look-ahead = [ox, ox+64) × [oy, oy+32)
+    let x0 = S10_OX;
+    let x1 = S10_OX + 64;
+    let y0 = S10_OY;
+    let y1 = S10_OY + 32;
+    let mut chunks = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let cx = x / CHUNK;
+            let cy = y / CHUNK;
+            if seen.insert((cx, cy)) {
+                chunks.push((cx, cy));
+            }
+        }
+    }
+    chunks
+}
+
+fn s10_stripe_chunks() -> Vec<(usize, usize)> {
+    // Incoming stripe: first 8 m of look-ahead = [ox+32, ox+40) × [oy, oy+32)
+    let x0 = S10_OX + 32;
+    let x1 = S10_OX + 40;
+    let y0 = S10_OY;
+    let y1 = S10_OY + 32;
+    let mut chunks = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let cx = x / CHUNK;
+            let cy = y / CHUNK;
+            if seen.insert((cx, cy)) {
+                chunks.push((cx, cy));
+            }
+        }
+    }
+    chunks
+}
+
+fn s10_work_set_cell_count_with_halo(world: &World, chunks: &[(usize, usize)]) -> usize {
+    let mut cells = std::collections::HashSet::new();
+    for &(cx, cy) in chunks {
+        let x0 = cx * CHUNK;
+        let y0 = cy * CHUNK;
+        let x1 = ((cx + 1) * CHUNK).min(world.width());
+        let y1 = ((cy + 1) * CHUNK).min(world.height());
+        for y in y0..y1 {
+            for x in x0..x1 {
+                cells.insert((x, y));
+                for (dx, dy) in [(0i32, 1), (1, 0), (0, -1), (-1, 0)] {
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    if nx < 0 || ny < 0 {
+                        continue;
+                    }
+                    let ux = nx as usize;
+                    let uy = ny as usize;
+                    if ux < world.width() && uy < world.height() {
+                        cells.insert((ux, uy));
+                    }
+                }
+            }
+        }
+    }
+    cells.len()
+}
+
+/// D10: World 1024×1024 constructs; print cell count (and RSS if easy).
+#[test]
+fn d10_map_constructs() {
+    let t0 = Instant::now();
+    let world = match std::panic::catch_unwind(|| s10_flyover_world(1001)) {
+        Ok(w) => w,
+        Err(e) => panic!("d10_map_constructs: alloc/construct failed: {e:?}"),
+    };
+    let cells = world.width() * world.height();
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "d10_map_constructs: cells={cells} width={} height={} construct_ms={ms:.2}",
+        world.width(),
+        world.height()
+    );
+    // Best-effort RSS (Linux).
+    if let Ok(statm) = std::fs::read_to_string("/proc/self/status") {
+        for line in statm.lines() {
+            if line.starts_with("VmRSS:") {
+                eprintln!("d10_map_constructs: {line}");
+                break;
+            }
+        }
+    }
+    assert_eq!(cells, S10_W * S10_H);
+    assert_eq!(world.occupant_count(S10_OX + 8, S10_OY + 8), 1);
+}
+
+/// D10: all ignored + rest; 1 tick; visits==0; wall < 5 ms.
+#[test]
+fn d10_ignored_tick_zero_visits() {
+    let mut world = s10_flyover_world(1002);
+    s10_ignore_all(&mut world);
+    assert_eq!(world.observed_chunk_count(), 0);
+    assert_eq!(world.awake_count(), 0);
+
+    let t0 = Instant::now();
+    world.tick();
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("d10_ignored_tick_zero_visits: {ms:.3} ms");
+    assert_eq!(world.last_hydro_visits(), 0);
+    assert!(
+        ms < 5.0,
+        "ignored tick wall {ms:.3} ms exceeds 5 ms budget"
+    );
+}
+
+/// D10: observe work set only; rain in view; visits ≤ work-set+halo, not 1024².
+#[test]
+fn d10_frustum_not_world() {
+    let mut world = s10_flyover_world(1003);
+    s10_ignore_all(&mut world);
+    let work = s10_work_set_chunks();
+    eprintln!("d10_frustum_not_world: work_set_chunks={}", work.len());
+    // 64×32 cells → 8×4 chunk tiles = 32 (sprint "~8" was underspecified).
+    assert_eq!(work.len(), 32, "expect 32 chunks for 64×32 view∪look-ahead");
+    for &(cx, cy) in &work {
+        world.observe_chunk(cx, cy);
+    }
+    let cap = s10_work_set_cell_count_with_halo(&world, &work);
+    world.add_rain_at(S10_OX + 4, S10_OY + 4, 0.05);
+
+    let t0 = Instant::now();
+    world.tick();
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let visits = world.last_hydro_visits();
+    eprintln!("d10_frustum_not_world: visits={visits} cap={cap} {ms:.3} ms");
+    assert!(
+        visits <= cap,
+        "visits {visits} exceed work-set+halo {cap}"
+    );
+    assert!(
+        visits < S10_W * S10_H / 4,
+        "visits {visits} look like whole-world hydro"
+    );
+}
+
+/// D10: catch_up_chunk each of 4 stripe chunks, K=30, R=0; wall < 50 ms.
+#[test]
+fn d10_stripe_k30() {
+    let mut world = s10_flyover_world(1004);
+    s10_ignore_all(&mut world);
+    let stripe = s10_stripe_chunks();
+    eprintln!("d10_stripe_k30: stripe_chunks={} {:?}", stripe.len(), stripe);
+    assert_eq!(stripe.len(), 4, "incoming stripe must be 4 chunks");
+
+    let t0 = Instant::now();
+    for &(cx, cy) in &stripe {
+        world.catch_up_chunk(cx, cy, 30, 0.0);
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("d10_stripe_k30: {ms:.3} ms");
+    assert!(ms < 50.0, "stripe K=30 wall {ms:.3} ms exceeds 50 ms");
+}
+
+/// D10: catch_up all work-set chunks, K=100, R=0; wall < 500 ms.
+#[test]
+fn d10_workset_k100() {
+    let mut world = s10_flyover_world(1005);
+    s10_ignore_all(&mut world);
+    let work = s10_work_set_chunks();
+    assert_eq!(work.len(), 32);
+
+    let t0 = Instant::now();
+    world.catch_up_chunks(&work, 100, 0.0);
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("d10_workset_k100: {ms:.3} ms");
+    assert!(ms < 500.0, "workset K=100 wall {ms:.3} ms exceeds 500 ms");
+}
+
+/// D10: 0.3 m pond on ridge cells in look-ahead; catch_up those chunks K=30; wall < 500 ms.
+#[test]
+fn d10_storm_k30_still_under_fly() {
+    let mut world = s10_flyover_world(1006);
+    s10_ignore_all(&mut world);
+
+    // Spec: 0.3 m pond on ridge cells in look-ahead. ox=16 look-ahead x∈[48,80)
+    // misses ridge x∈[128,144). Stress the incoming stripe (32×8) with 0.3 m pond
+    // (and ridge z where stripe overlaps elevation jump is N/A); catch_up those
+    // 4 chunks at K=30 under the fly budget.
+    let chunks = s10_stripe_chunks();
+    assert_eq!(chunks.len(), 4);
+    for y in S10_OY..(S10_OY + 32) {
+        for x in (S10_OX + 32)..(S10_OX + 40) {
+            // Direct write + later catch_up wakes wet cells (avoid waking the world).
+            let i = y * world.width() + x;
+            let _ = i;
+            let col = world.column_at_mut(x, y);
+            col.surface_water_m += 0.3;
+        }
+    }
+    // Clear the accidental wakes from column_at_mut? set_column wakes — we used
+    // column_at_mut which does NOT wake. Good. Ensure asleep before timed catch_up.
+    world.force_sleep_all();
+    eprintln!("d10_storm_k30_still_under_fly: chunks={}", chunks.len());
+
+    let t0 = Instant::now();
+    world.catch_up_chunks(&chunks, 30, 0.0);
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("d10_storm_k30_still_under_fly: {ms:.3} ms");
+    assert!(ms < 500.0, "storm K=30 wall {ms:.3} ms exceeds 500 ms");
+}
