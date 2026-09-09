@@ -1,10 +1,10 @@
-//! Stem World Sim — Sprint 9 region observe + scoped catch-up (closed basin).
+//! Stem World Sim — Sprint 9.1 catch_up calendar blocks (closed basin).
 //!
 //! Water mass (A = 1): M = h_surf + sum_i (theta_i * L_i)
 //! Grid mass: sum of column M. Closed basin: M + et_lost() + extract_lost() == mass ever added.
 //! Tick order: infiltrate → pond → soil → lake_snap → at_rest/awake prune; advance clock;
 //! if clock.tick % N_ET == 0: ET → occupants → lake_snap → rest/awake again.
-//! Hydro + sinks visit observed-chunk cells ∪ awake set. CHUNK=8; ignore only if at_rest.
+//! Hydro + sinks visit observed-chunk cells ∪ awake set. CHUNK=8; ignore allowed while moving.
 //! Rain / add_occupant / flux / catch_up wake cell+4-nbrs.
 //! After a tick, at_rest cells whose 4-neighbors are also at_rest leave the awake set.
 //! Pond: every lower-H 4-neighbor with ΔH > H_REST, weights ∝ ΔH, each edge ≤ R_MAX
@@ -16,8 +16,8 @@
 //! ET: pond first (E_OPEN) else top-layer soil (E_SOIL, may go below θ_fc); skip ≤ V_REST.
 //! S = clamp(sum alive shade, 0, 1); E_eff = E * (1 - S). PlantStub shade default 0.25.
 //! Occupants: per-cell list ≤ MAX_OCCUPANTS; PlantStub uptake by root mask; wilt at T_WILT.
-//! catch_up(K, rain): source → settle ≤ T_SETTLE hydro → one batched K-sink pass.
-//! catch_up_chunk: same order on one chunk + 1-cell halo; other chunks unchanged.
+//! catch_up(K, rain): optional source dump; then K blocks of (≤N_ET hydro, 1 unit sink).
+//! catch_up_chunk: same calendar on one chunk + 1-cell halo; other chunks unchanged.
 //! Unique-min-H chute revoked. Capillary stays.
 
 /// Absolute / relative tolerance for water-mass comparisons (f64).
@@ -148,7 +148,7 @@ impl Occupant {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OccupantsFull;
 
-/// Returned by [`World::ignore_chunk`] when any cell in the chunk is not at_rest. S09.
+/// Historical S09 busy signal. S09.1: [`World::ignore_chunk`] always succeeds (never Err).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkBusy;
 
@@ -754,18 +754,16 @@ impl World {
         self.chunks[i].t_away = 0;
     }
 
-    /// S09: ignore chunk if every cell is at_rest; else Err and stay observed.
+    /// S09.1: mark chunk ignored even if cells are still moving.
+    /// Come-back [`Self::catch_up_chunk`] owns any unfinished cascade.
     pub fn ignore_chunk(&mut self, cx: usize, cy: usize) -> Result<(), ChunkBusy> {
         let i = self.chunk_index(cx, cy);
-        if !self.chunk_cells_at_rest(cx, cy) {
-            return Err(ChunkBusy);
-        }
         self.chunks[i].observed = false;
         self.chunks[i].t_away = 0;
         Ok(())
     }
 
-    /// S09: S08 catch-up order on chunk (cx,cy) plus a 1-cell (4-neighbor) halo.
+    /// S09.1: calendar-block catch-up on chunk (cx,cy) plus a 1-cell (4-neighbor) halo.
     /// Other chunks' cells are not sourced or sink-processed.
     pub fn catch_up_chunk(&mut self, cx: usize, cy: usize, k: u32, rain_per_step: f64) {
         debug_assert!(rain_per_step >= 0.0, "rain_per_step must be non-negative");
@@ -774,6 +772,7 @@ impl World {
         let n = self.columns.len();
         let k_u = k as u64;
 
+        // Optional source dump (one dump if R>0); wake region cells.
         if k > 0 {
             let add = (k as f64) * rain_per_step;
             if add > 0.0 {
@@ -786,10 +785,9 @@ impl World {
             }
         }
 
-        // Settle: donors = awake ∩ region; receivers clipped to region so pond
-        // may leave the chunk into the halo but not cascade across far chunks.
-        if k > 0 || self.awake.iter().any(|&a| a) {
-            for _ in 0..T_SETTLE {
+        // K calendar blocks: ≤N_ET scoped hydro, then one unit sink. No settle-before-sink.
+        for _ in 0..k {
+            for _ in 0..N_ET {
                 let mut active = vec![false; n];
                 let mut any = false;
                 for i in 0..n {
@@ -803,14 +801,9 @@ impl World {
                 }
                 self.hydro_step_active(&active, Some(&region));
             }
-        }
-
-        if k > 0 {
             let mut sink_busy = vec![false; n];
-            for _ in 0..k {
-                self.et_pass(&mut sink_busy, Some(&region));
-                self.occupant_pass(&mut sink_busy, Some(&region));
-            }
+            self.et_pass(&mut sink_busy, Some(&region));
+            self.occupant_pass(&mut sink_busy, Some(&region));
             self.lake_snap();
             for i in 0..n {
                 if !region[i] {
@@ -862,21 +855,6 @@ impl World {
     fn chunk_observed_at_cell(&self, x: usize, y: usize) -> bool {
         let (cx, cy) = self.chunk_id_of_cell(x, y);
         self.chunks[self.chunk_index(cx, cy)].observed
-    }
-
-    fn chunk_cells_at_rest(&self, cx: usize, cy: usize) -> bool {
-        let x0 = cx * CHUNK;
-        let y0 = cy * CHUNK;
-        let x1 = ((cx + 1) * CHUNK).min(self.width);
-        let y1 = ((cy + 1) * CHUNK).min(self.height);
-        for y in y0..y1 {
-            for x in x0..x1 {
-                if !self.at_rest[y * self.width + x] {
-                    return false;
-                }
-            }
-        }
-        true
     }
 
     /// Cells in chunk (cx,cy) plus any cell that is a 4-neighbor of a chunk cell.
@@ -1025,16 +1003,17 @@ impl World {
         }
     }
 
-    /// S08 catch-up facsimile: apply K sink-steps of unobserved climate.
-    /// Order: source rain → settle hydro ≤ T_SETTLE → one batched K-sink pass.
-    /// Calendar advances by K * N_ET. When rain_per_step == 0, sinks match K live
-    /// unit sink-steps on a resting basin (exact θ/h/et/extract).
+    /// S09.1 catch-up facsimile: K calendar blocks of unobserved climate.
+    /// Order: optional source dump → for each of K: ≤N_ET hydro then one unit sink.
+    /// Do not hydro-to-rest before the first sink. Calendar advances by K * N_ET.
+    /// When already at rest and rain_per_step == 0, inner hydro loops are empty and
+    /// sinks match K live unit sink-steps (exact θ/h/et/extract).
     pub fn catch_up(&mut self, k: u32, rain_per_step: f64) {
         debug_assert!(rain_per_step >= 0.0, "rain_per_step must be non-negative");
         let k_u = k as u64;
         let n = self.columns.len();
 
-        // 1. Source: every cell h += K * rain_per_step; wake cell + neighbors.
+        // 1. Optional source: every cell h += K * rain_per_step; wake cell + neighbors.
         if k > 0 {
             let add = (k as f64) * rain_per_step;
             if add > 0.0 {
@@ -1042,31 +1021,20 @@ impl World {
                     self.columns[i].surface_water_m += add;
                     self.wake_idx(i);
                 }
-            } else {
-                // Drought: still wake? Spec: wake those cells (+neighbors) after source.
-                // rain may be 0 — waking every cell would defeat desert sleep. Only wake
-                // when water was actually added. Sinks below still run world-wide.
             }
         }
 
-        // 2. Settle: live hydro until awake_count==0 or T_SETTLE ticks (no ET).
-        if k > 0 || self.awake_count() > 0 {
-            for _ in 0..T_SETTLE {
+        // 2. K calendar blocks — interleave hydro and unit sinks (no settle-first).
+        for _ in 0..k {
+            for _ in 0..N_ET {
                 if self.awake_count() == 0 {
                     break;
                 }
                 self.hydro_step();
             }
-        }
-
-        // 3. Sinks: batched as K unit ET+occupant steps (no hydro between).
-        // Equivalent to K * E_eff / K * P_max on a resting basin; exact when rain=0.
-        if k > 0 {
             let mut sink_busy = vec![false; n];
-            for _ in 0..k {
-                self.et_pass(&mut sink_busy, None);
-                self.occupant_pass(&mut sink_busy, None);
-            }
+            self.et_pass(&mut sink_busy, None);
+            self.occupant_pass(&mut sink_busy, None);
             self.lake_snap();
             for i in 0..n {
                 self.at_rest[i] = !sink_busy[i];
@@ -1077,7 +1045,7 @@ impl World {
             self.prune_awake();
         }
 
-        // 4. Calendar: K sink-steps ≡ K * N_ET hydro ticks.
+        // 3. Calendar: K sink-steps ≡ K * N_ET hydro ticks.
         self.clock.tick = self.clock.tick.saturating_add(k_u.saturating_mul(N_ET));
     }
 

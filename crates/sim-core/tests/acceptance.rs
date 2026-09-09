@@ -2533,7 +2533,8 @@ fn d9_observe_one_chunk_only() {
     assert!(!world.cell_at_rest(rx, CHUNK), "south halo awake");
 }
 
-/// D9: pond still flowing; ignore_chunk fails or stays observed.
+/// D9/S09.1: pond still flowing; ignore_chunk succeeds (chunk not observed).
+/// Come-back catch_up owns the unfinished cascade.
 #[test]
 fn d9_cannot_ignore_moving() {
     let tex = Texture::Sand;
@@ -2559,14 +2560,15 @@ fn d9_cannot_ignore_moving() {
         "precondition: pond still moving"
     );
     let before = world.observed_chunk_count();
+    assert!(before >= 1);
     let res = world.ignore_chunk(0, 0);
-    assert!(
-        res.is_err() || world.observed_chunk_count() == before,
-        "ignore while moving must fail or leave chunk observed"
+    assert!(res.is_ok(), "S09.1: ignore while moving must succeed");
+    assert_eq!(
+        world.observed_chunk_count(),
+        before - 1,
+        "ignored chunk must leave the observed set"
     );
-    assert!(matches!(res, Err(ChunkBusy)) || world.observed_chunk_count() == before);
-    // Chunk must remain observed either way under our Result API.
-    assert_eq!(world.observed_chunk_count(), before);
+    let _ = ChunkBusy; // type retained in public API
 }
 
 /// D9: two chunks; catch_up_chunk A; B mass unchanged.
@@ -2715,4 +2717,187 @@ fn d9_halo_can_export_pond() {
         valley1 > valley0 + MASS_EPSILON,
         "valley chunk should gain water via halo export: {valley0} -> {valley1}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 9.1 — catch_up calendar blocks
+// ---------------------------------------------------------------------------
+
+/// D91: plant + pond on highs; catch_up(K=10,R=0); plant alive; top not forced to 0 while bot full.
+#[test]
+fn d91_storm_then_catchup_plant_lives() {
+    let tex = Texture::Sand;
+    let phi = tex.porosity();
+    // Equal-elevation "highs" with pond so water stays local (no valley steal).
+    // Top starts moist, bot has room — percolation fills bot while calendar sinks
+    // let the plant sip the top (settle-first would drain the top before any drink).
+    let cols = vec![
+        Column::new(
+            2.0,
+            0.30,
+            vec![
+                SoilLayer::new(0.3, phi, tex),
+                SoilLayer::new(0.5, 0.05, tex),
+            ],
+        ),
+        Column::new(
+            2.0,
+            0.30,
+            vec![
+                SoilLayer::new(0.3, phi, tex),
+                SoilLayer::new(0.5, 0.05, tex),
+            ],
+        ),
+    ];
+    let mut world = World::grid(910, 2, 1, cols);
+    world.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+    assert!(world.plant_at(0, 0));
+
+    let m0 = closed_mass(&world);
+    world.catch_up(10, 0.0);
+
+    assert!(
+        world.plant_at(0, 0),
+        "plant should survive calendar catch_up while water is still moving"
+    );
+    let theta_top = world.layer_theta_at(0, 0, 0);
+    let theta_bot = world.layer_theta_at(0, 0, 1);
+    // Bot fills from percolation; top must not be forced dry while bot is full.
+    assert!(
+        (theta_bot - phi).abs() <= 1e-3,
+        "precondition of assertion: bot should be (near) full, θ_bot={theta_bot}"
+    );
+    assert!(
+        theta_top > 1e-6,
+        "top must not be forced to 0 while bot full (θ_top={theta_top}, θ_bot={theta_bot})"
+    );
+    assert_mass_close(closed_mass(&world), m0);
+}
+
+/// D91: same seed — 100 live ticks vs catch_up(K=10,R=0); θ,h,alive within 1e-6; extract within 20%.
+#[test]
+fn d91_matches_live_100() {
+    let tex = Texture::Sand;
+    let phi = tex.porosity();
+    let mk = || {
+        let cols = vec![
+            Column::new(
+                2.0,
+                0.25,
+                vec![
+                    SoilLayer::new(0.3, 0.08, tex),
+                    SoilLayer::new(0.5, 0.20, tex),
+                ],
+            ),
+            Column::new(
+                0.0,
+                0.0,
+                vec![
+                    SoilLayer::new(0.3, phi * 0.5, tex),
+                    SoilLayer::new(0.5, phi * 0.5, tex),
+                ],
+            ),
+        ];
+        let mut w = World::grid(911, 2, 1, cols);
+        w.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+        w
+    };
+
+    let mut live = mk();
+    let mut caught = mk();
+    assert_eq!(live.tick_count(), caught.tick_count());
+
+    for _ in 0..100 {
+        live.tick();
+    }
+    caught.catch_up(10, 0.0);
+
+    assert_eq!(live.tick_count(), caught.tick_count(), "calendar advances K*N_ET");
+    let tol = 1e-6;
+    assert!(
+        (live.surface_water_m_at(0, 0) - caught.surface_water_m_at(0, 0)).abs() <= tol,
+        "h high: live={} caught={}",
+        live.surface_water_m_at(0, 0),
+        caught.surface_water_m_at(0, 0)
+    );
+    assert!(
+        (live.surface_water_m_at(1, 0) - caught.surface_water_m_at(1, 0)).abs() <= tol,
+        "h valley: live={} caught={}",
+        live.surface_water_m_at(1, 0),
+        caught.surface_water_m_at(1, 0)
+    );
+    for layer in 0..2 {
+        for x in 0..2 {
+            let a = live.layer_theta_at(x, 0, layer);
+            let b = caught.layer_theta_at(x, 0, layer);
+            assert!(
+                (a - b).abs() <= tol,
+                "θ({x},0,{layer}): live={a} caught={b}"
+            );
+        }
+    }
+    assert_eq!(
+        live.plant_at(0, 0),
+        caught.plant_at(0, 0),
+        "alive mismatch live={} caught={}",
+        live.plant_at(0, 0),
+        caught.plant_at(0, 0)
+    );
+    let le = live.extract_lost();
+    let ce = caught.extract_lost();
+    let scale = le.abs().max(ce.abs()).max(1e-9);
+    assert!(
+        (le - ce).abs() <= 0.20 * scale,
+        "extract within 20%: live={le} caught={ce}"
+    );
+}
+
+/// D91: at rest, R=0; catch_up(K) vs K live sinks; exact (inner hydro loop is 0).
+#[test]
+fn d91_rest_drought_still_exact() {
+    let tex = Texture::Sand;
+    let mk = || {
+        let col = Column::new(
+            0.0,
+            0.06,
+            vec![
+                SoilLayer::new(0.3, tex.porosity(), tex),
+                SoilLayer::new(0.5, tex.theta_fc(), tex),
+            ],
+        );
+        let mut w = World::new(912, col);
+        w.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+        // Drive to rest without burning many ET sinks.
+        for _ in 0..5 {
+            w.tick();
+        }
+        assert!(w.grid_at_rest(), "precondition: at rest");
+        w
+    };
+
+    let k = 4u32;
+    let mut live = mk();
+    let mut caught = mk();
+    assert_eq!(live.tick_count(), caught.tick_count());
+    assert_approx_eq(live.grid_water_mass(), caught.grid_water_mass(), "pre mass");
+
+    for _ in 0..k {
+        tick_through_next_et(&mut live);
+    }
+    caught.catch_up(k, 0.0);
+
+    assert_approx_eq(caught.surface_water_m(), live.surface_water_m(), "h");
+    assert_approx_eq(
+        caught.layer_theta_at(0, 0, 0),
+        live.layer_theta_at(0, 0, 0),
+        "θ_top",
+    );
+    assert_approx_eq(
+        caught.layer_theta_at(0, 0, 1),
+        live.layer_theta_at(0, 0, 1),
+        "θ_bot",
+    );
+    assert_approx_eq(caught.et_lost(), live.et_lost(), "et");
+    assert_approx_eq(caught.extract_lost(), live.extract_lost(), "extract");
+    assert_eq!(live.plant_at(0, 0), caught.plant_at(0, 0), "alive");
 }
