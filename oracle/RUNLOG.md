@@ -1,13 +1,13 @@
 # Oracle RUNLOG
 
 ```
-sprint: S09
+sprint: S09.1
 result: green
-branch: feat/s09-regions
+branch: feat/s09.1-catchup-calendar
 date: 2026-09-08 (PT)
 epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15; H_REST=0.02 m; V_REST=1e-4 m
 constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25; T_SETTLE=64; CHUNK=8
-invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9
+invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9 + D91
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -82,5 +82,8 @@ tests:
   - d9_catchup_other_chunk_untouched
   - d9_drought_chunk_wilts
   - d9_halo_can_export_pond
-notes: S09 chunk observe/ignore + scoped catch-up. CHUNK=8; chunk_id(x,y)=(x/CHUNK,y/CHUNK); each chunk observed+t_away. Default observed=true (W*H<=12 and larger; 16×16 tests ignore explicitly). API observe_chunk / ignore_chunk->Result<ChunkBusy> (only if every cell at_rest) / catch_up_chunk(cx,cy,K,rain) = S08 order on chunk+1-cell 4-nbr halo with receivers clipped to region. Live hydro+sinks visit observed∪awake; last_hydro_visits() + observed_chunk_count(). Ignoring rest chunk yields zero hydro visits next tick. Halo export can wet adjacent valley chunk; far cells beyond halo unchanged. Older D0–D8 names green.
+  - d91_storm_then_catchup_plant_lives
+  - d91_matches_live_100
+  - d91_rest_drought_still_exact
+notes: S09.1 catch_up calendar blocks. Replace settle-then-K-sink with optional source dump then K blocks of (≤N_ET hydro on awake, early-break if awake_count==0, then one unit ET+occupant sink). Same structure for catch_up_chunk (scoped region+halo). Do not hydro-to-rest before first sink. ignore_chunk allowed while moving (ChunkBusy never returned); d9_cannot_ignore_moving now asserts ignore succeeds / chunk leaves observed set. d8_drought_matches_live_sinks still exact at rest. Older D0–D9 names green.
 ```
