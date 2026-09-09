@@ -1,3 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/sim-core"]
+
+# S10 flyover budgets are wall-clock; keep `cargo test` optimized enough to be meaningful.
+[profile.test]
+opt-level = 3

@@ -1,4 +1,4 @@
-//! Stem World Sim — Sprint 9.1 catch_up calendar blocks (closed basin).
+//! Stem World Sim — Sprint 10 flyover catch_up budget (closed basin).
 //!
 //! Water mass (A = 1): M = h_surf + sum_i (theta_i * L_i)
 //! Grid mass: sum of column M. Closed basin: M + et_lost() + extract_lost() == mass ever added.
@@ -21,6 +21,9 @@
 //! Unique-min-H chute revoked. Capillary stays.
 
 /// Absolute / relative tolerance for water-mass comparisons (f64).
+use smallvec::SmallVec;
+use std::collections::{HashMap, HashSet};
+
 pub const MASS_EPSILON: f64 = 1e-9;
 
 /// Max pond flux per edge per tick (metres water, A = 1). S03.3.
@@ -208,18 +211,23 @@ impl SoilLayer {
 pub struct Column {
     pub elevation_m: f64,
     pub surface_water_m: f64,
-    pub layers: Vec<SoilLayer>,
-    /// Per-cell occupants, capped at [`MAX_OCCUPANTS`]. S06.
-    pub occupants: Vec<Occupant>,
+    /// Soil stack; inline for N_LAYERS to keep 1024² worlds allocatable. S10.
+    pub layers: SmallVec<[SoilLayer; N_LAYERS]>,
+    /// Per-cell occupants, capped at [`MAX_OCCUPANTS`]. S06. Inline one plant.
+    pub occupants: SmallVec<[Occupant; 1]>,
 }
 
 impl Column {
-    pub fn new(elevation_m: f64, surface_water_m: f64, layers: Vec<SoilLayer>) -> Self {
+    pub fn new(
+        elevation_m: f64,
+        surface_water_m: f64,
+        layers: impl Into<SmallVec<[SoilLayer; N_LAYERS]>>,
+    ) -> Self {
         Self {
             elevation_m,
             surface_water_m,
-            layers,
-            occupants: Vec::new(),
+            layers: layers.into(),
+            occupants: SmallVec::new(),
         }
     }
 
@@ -538,10 +546,16 @@ pub struct World {
     at_rest: Vec<bool>,
     /// Explicit awake set. S08.
     awake: Vec<bool>,
+    /// Cached count of `awake[i]==true`. S10.
+    n_awake: usize,
+    /// Sparse awake indices (no duplicates). S10.
+    awake_list: Vec<usize>,
     /// Chunk grid (CHUNK×CHUNK cells); visit = observed ∪ awake. S09.
     n_chunk_x: usize,
     n_chunk_y: usize,
     chunks: Vec<ChunkState>,
+    /// Cached count of observed chunks. S10.
+    n_observed: usize,
     /// Cells in the visit set of the last [`Self::hydro_step`]. S09.
     last_hydro_visits: usize,
     /// Cumulative water depth evaporated (A = 1); closed-basin sink. S05.
@@ -554,6 +568,7 @@ impl World {
     /// S01 constructor: 1×1 grid with the given column.
     pub fn new(seed: u64, column: Column) -> Self {
         let (n_chunk_x, n_chunk_y, chunks) = Self::make_chunks(1, 1);
+        let n_observed = chunks.len();
         Self {
             seed,
             clock: Clock::new(),
@@ -562,9 +577,12 @@ impl World {
             columns: vec![column],
             at_rest: vec![false],
             awake: vec![true],
+            n_awake: 1,
+            awake_list: vec![0],
             n_chunk_x,
             n_chunk_y,
             chunks,
+            n_observed,
             last_hydro_visits: 0,
             et_lost: 0.0,
             extract_lost: 0.0,
@@ -581,6 +599,7 @@ impl World {
         );
         let n = columns.len();
         let (n_chunk_x, n_chunk_y, chunks) = Self::make_chunks(width, height);
+        let n_observed = chunks.len();
         Self {
             seed,
             clock: Clock::new(),
@@ -589,9 +608,12 @@ impl World {
             columns,
             at_rest: vec![false; n],
             awake: vec![true; n],
+            n_awake: n,
+            awake_list: (0..n).collect(),
             n_chunk_x,
             n_chunk_y,
             chunks,
+            n_observed,
             last_hydro_visits: 0,
             et_lost: 0.0,
             extract_lost: 0.0,
@@ -734,12 +756,12 @@ impl World {
 
     /// S08: number of cells currently in the awake set.
     pub fn awake_count(&self) -> usize {
-        self.awake.iter().filter(|&&a| a).count()
+        self.n_awake
     }
 
     /// S09: number of chunks currently marked observed.
     pub fn observed_chunk_count(&self) -> usize {
-        self.chunks.iter().filter(|c| c.observed).count()
+        self.n_observed
     }
 
     /// S09: cells visited by the most recent hydro step (observed ∪ awake).
@@ -750,7 +772,10 @@ impl World {
     /// S09: mark chunk (cx, cy) observed and reset t_away.
     pub fn observe_chunk(&mut self, cx: usize, cy: usize) {
         let i = self.chunk_index(cx, cy);
-        self.chunks[i].observed = true;
+        if !self.chunks[i].observed {
+            self.chunks[i].observed = true;
+            self.n_observed += 1;
+        }
         self.chunks[i].t_away = 0;
     }
 
@@ -758,9 +783,28 @@ impl World {
     /// Come-back [`Self::catch_up_chunk`] owns any unfinished cascade.
     pub fn ignore_chunk(&mut self, cx: usize, cy: usize) -> Result<(), ChunkBusy> {
         let i = self.chunk_index(cx, cy);
-        self.chunks[i].observed = false;
+        if self.chunks[i].observed {
+            self.chunks[i].observed = false;
+            self.n_observed = self.n_observed.saturating_sub(1);
+        }
         self.chunks[i].t_away = 0;
         Ok(())
+    }
+
+    /// S10: mark every cell at_rest and clear the awake set (large-map init).
+    /// Does not change column water; caller must ensure hydro-rest state.
+    pub fn force_sleep_all(&mut self) {
+        self.at_rest.fill(true);
+        self.awake.fill(false);
+        self.n_awake = 0;
+        self.awake_list.clear();
+    }
+
+    /// S10: catch_up each listed chunk with the same (K, rain) calendar.
+    pub fn catch_up_chunks(&mut self, chunks: &[(usize, usize)], k: u32, rain_per_step: f64) {
+        for &(cx, cy) in chunks {
+            self.catch_up_chunk(cx, cy, k, rain_per_step);
+        }
     }
 
     /// S09.1: calendar-block catch-up on chunk (cx,cy) plus a 1-cell (4-neighbor) halo.
@@ -768,50 +812,51 @@ impl World {
     pub fn catch_up_chunk(&mut self, cx: usize, cy: usize, k: u32, rain_per_step: f64) {
         debug_assert!(rain_per_step >= 0.0, "rain_per_step must be non-negative");
         let _ = self.chunk_index(cx, cy); // bounds check
-        let region = self.chunk_halo_mask(cx, cy);
-        let n = self.columns.len();
+        let region_ids = self.chunk_halo_ids(cx, cy);
+        let region_set: HashSet<usize> = region_ids.iter().copied().collect();
         let k_u = k as u64;
 
         // Optional source dump (one dump if R>0); wake region cells.
         if k > 0 {
             let add = (k as f64) * rain_per_step;
             if add > 0.0 {
-                for i in 0..n {
-                    if region[i] {
-                        self.columns[i].surface_water_m += add;
-                        self.wake_idx(i);
-                    }
+                for &i in &region_ids {
+                    self.columns[i].surface_water_m += add;
+                    self.wake_idx(i);
                 }
+            }
+        }
+        // R=0 come-back: still drain any pond/mobile left in the region. S10.
+        for &i in &region_ids {
+            let col = &self.columns[i];
+            if col.surface_water_m > V_REST || col.mobile_water_m() > V_REST {
+                self.wake_one(i);
             }
         }
 
         // K calendar blocks: ≤N_ET scoped hydro, then one unit sink. No settle-before-sink.
         for _ in 0..k {
             for _ in 0..N_ET {
-                let mut active = vec![false; n];
-                let mut any = false;
-                for i in 0..n {
-                    if region[i] && self.awake[i] {
-                        active[i] = true;
-                        any = true;
+                let mut step_ids: Vec<usize> = Vec::new();
+                for &i in &region_ids {
+                    if self.awake[i] {
+                        step_ids.push(i);
                     }
                 }
-                if !any {
+                if step_ids.is_empty() {
                     break;
                 }
-                self.hydro_step_active(&active, Some(&region));
+                self.hydro_step_active_ids(&step_ids, Some(&region_set));
             }
-            let mut sink_busy = vec![false; n];
-            self.et_pass(&mut sink_busy, Some(&region));
-            self.occupant_pass(&mut sink_busy, Some(&region));
-            self.lake_snap();
-            for i in 0..n {
-                if !region[i] {
-                    continue;
-                }
-                self.at_rest[i] = !sink_busy[i];
-                if sink_busy[i] {
-                    self.awake[i] = true;
+            let mut sink_busy: HashSet<usize> = HashSet::new();
+            self.et_pass_ids(&mut sink_busy, &region_ids);
+            self.occupant_pass_ids(&mut sink_busy, &region_ids);
+            self.lake_snap_ids(&region_ids);
+            for &i in &region_ids {
+                let is_busy = sink_busy.contains(&i);
+                self.at_rest[i] = !is_busy;
+                if is_busy {
+                    self.wake_one(i);
                 }
             }
             self.prune_awake();
@@ -860,45 +905,117 @@ impl World {
     /// Cells in chunk (cx,cy) plus any cell that is a 4-neighbor of a chunk cell.
     fn chunk_halo_mask(&self, cx: usize, cy: usize) -> Vec<bool> {
         let n = self.columns.len();
-        let mut in_chunk = vec![false; n];
+        let mut region = vec![false; n];
+        for i in self.chunk_halo_ids(cx, cy) {
+            region[i] = true;
+        }
+        region
+    }
+
+    /// Sparse chunk+halo cell indices. S10.
+    fn chunk_halo_ids(&self, cx: usize, cy: usize) -> Vec<usize> {
         let x0 = cx * CHUNK;
         let y0 = cy * CHUNK;
         let x1 = ((cx + 1) * CHUNK).min(self.width);
         let y1 = ((cy + 1) * CHUNK).min(self.height);
+        let mut ids = Vec::with_capacity(CHUNK * CHUNK + 4 * CHUNK);
+        let mut seen = HashSet::new();
         for y in y0..y1 {
             for x in x0..x1 {
-                in_chunk[y * self.width + x] = true;
-            }
-        }
-        let mut region = in_chunk.clone();
-        for y in y0..y1 {
-            for x in x0..x1 {
+                let i = y * self.width + x;
+                if seen.insert(i) {
+                    ids.push(i);
+                }
                 for &(dx, dy) in &NEIGHBOR_OFFSETS {
                     let nx = x as i32 + dx;
                     let ny = y as i32 + dy;
                     if nx < 0 || ny < 0 || nx as usize >= self.width || ny as usize >= self.height {
                         continue;
                     }
-                    region[ny as usize * self.width + nx as usize] = true;
+                    let j = ny as usize * self.width + nx as usize;
+                    if seen.insert(j) {
+                        ids.push(j);
+                    }
                 }
             }
         }
-        region
+        ids
     }
 
     /// Visit mask for live ticks: observed-chunk cells ∪ awake set.
     fn visit_mask(&self) -> Vec<bool> {
         let n = self.columns.len();
         let mut v = vec![false; n];
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let i = y * self.width + x;
-                if self.awake[i] || self.chunk_observed_at_cell(x, y) {
+        if self.n_observed == 0 && self.n_awake == 0 {
+            return v;
+        }
+        // Mark observed chunk cells without scanning the whole desert. S10.
+        if self.n_observed > 0 {
+            for cy in 0..self.n_chunk_y {
+                for cx in 0..self.n_chunk_x {
+                    let ci = cy * self.n_chunk_x + cx;
+                    if !self.chunks[ci].observed {
+                        continue;
+                    }
+                    let x0 = cx * CHUNK;
+                    let y0 = cy * CHUNK;
+                    let x1 = ((cx + 1) * CHUNK).min(self.width);
+                    let y1 = ((cy + 1) * CHUNK).min(self.height);
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            v[y * self.width + x] = true;
+                        }
+                    }
+                }
+            }
+        }
+        if self.n_awake > 0 {
+            for &i in &self.awake_list {
+                if self.awake[i] {
                     v[i] = true;
                 }
             }
         }
         v
+    }
+
+    /// Sparse visit indices (observed ∪ awake) without building a full bool mask when empty.
+    fn visit_indices(&self) -> Vec<usize> {
+        if self.n_observed == 0 && self.n_awake == 0 {
+            return Vec::new();
+        }
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut ids = Vec::new();
+        if self.n_observed > 0 {
+            for cy in 0..self.n_chunk_y {
+                for cx in 0..self.n_chunk_x {
+                    let ci = cy * self.n_chunk_x + cx;
+                    if !self.chunks[ci].observed {
+                        continue;
+                    }
+                    let x0 = cx * CHUNK;
+                    let y0 = cy * CHUNK;
+                    let x1 = ((cx + 1) * CHUNK).min(self.width);
+                    let y1 = ((cy + 1) * CHUNK).min(self.height);
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            let i = y * self.width + x;
+                            if seen.insert(i) {
+                                ids.push(i);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if self.n_awake > 0 {
+            for &i in &self.awake_list {
+                if self.awake[i] && seen.insert(i) {
+                    ids.push(i);
+                }
+            }
+        }
+        ids
     }
 
     /// Grid water mass = sum of column M (I3).
@@ -971,6 +1088,16 @@ impl World {
     /// S04.1: soil flux capped by unused pore room; lake snap after soil.
     /// S05/S06: sink cadence after advance; ticks 10,20,… run one ET+occupant step.
     pub fn tick(&mut self) {
+        // S10: fully ignored + asleep worlds must stay wall-clock cheap (no O(n) scans).
+        if self.n_observed == 0 && self.n_awake == 0 {
+            self.last_hydro_visits = 0;
+            self.clock.advance();
+            for ch in &mut self.chunks {
+                ch.t_away = ch.t_away.saturating_add(1);
+            }
+            return;
+        }
+
         self.hydro_step();
         self.clock.advance();
 
@@ -984,19 +1111,19 @@ impl World {
         // S05/S06 sink batch: after advance, when tick is a multiple of N_ET.
         // S09: sinks only on observed ∪ awake (same visit set as hydro).
         if self.clock.tick % N_ET == 0 {
-            let n = self.columns.len();
-            let active = self.visit_mask();
-            let mut sink_busy = vec![false; n];
-            self.et_pass(&mut sink_busy, Some(&active));
-            self.occupant_pass(&mut sink_busy, Some(&active));
-            self.lake_snap();
-            for i in 0..n {
-                if !active[i] {
-                    continue;
-                }
-                self.at_rest[i] = !sink_busy[i];
-                if sink_busy[i] {
-                    self.awake[i] = true;
+            let ids = self.visit_indices();
+            if ids.is_empty() {
+                return;
+            }
+            let mut sink_busy: HashSet<usize> = HashSet::new();
+            self.et_pass_ids(&mut sink_busy, &ids);
+            self.occupant_pass_ids(&mut sink_busy, &ids);
+            self.lake_snap_ids(&ids);
+            for &i in &ids {
+                let is_busy = sink_busy.contains(&i);
+                self.at_rest[i] = !is_busy;
+                if is_busy {
+                    self.wake_one(i);
                 }
             }
             self.prune_awake();
@@ -1039,7 +1166,7 @@ impl World {
             for i in 0..n {
                 self.at_rest[i] = !sink_busy[i];
                 if sink_busy[i] {
-                    self.awake[i] = true;
+                    self.wake_one(i);
                 }
             }
             self.prune_awake();
@@ -1051,38 +1178,61 @@ impl World {
 
     /// Hydro-only step (no clock, no ET): visit = observed ∪ awake. S09.
     fn hydro_step(&mut self) {
-        let active = self.visit_mask();
-        self.hydro_step_active(&active, None);
+        if self.n_observed == 0 && self.n_awake == 0 {
+            self.last_hydro_visits = 0;
+            return;
+        }
+        let ids = self.visit_indices();
+        self.hydro_step_active_ids(&ids, None);
     }
 
     /// Hydro-only step over an explicit active mask.
     /// If `receiver_bound` is set, pond/soil edges may only deliver inside that mask
     /// (used by [`Self::catch_up_chunk`] to keep flux inside chunk+halo).
-    fn hydro_step_active(&mut self, active: &[bool], receiver_bound: Option<&[bool]>) {
-        let n = self.columns.len();
-        self.last_hydro_visits = active.iter().filter(|&&a| a).count();
-        let mut busy = vec![false; n];
-        let mut flux_recv = vec![false; n];
+    fn hydro_step_active(&mut self, active: &[bool], receiver_bound: Option<&HashSet<usize>>) {
+        let active_ids: Vec<usize> = active
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &a)| if a { Some(i) } else { None })
+            .collect();
+        self.hydro_step_active_ids(&active_ids, receiver_bound);
+    }
 
-        self.infiltrate_active(active, &mut busy);
-        self.pond_pass(active, &mut busy, &mut flux_recv, receiver_bound);
-        let percolated = self.percolate_active(active, &mut busy);
-        self.lateral_drain_pass(&percolated, active, &mut busy, &mut flux_recv, receiver_bound);
-        self.lake_snap();
-
-        for i in 0..n {
-            if flux_recv[i] {
-                self.wake_idx(i);
-            }
+    fn hydro_step_active_ids(
+        &mut self,
+        active_ids: &[usize],
+        receiver_bound: Option<&HashSet<usize>>,
+    ) {
+        self.last_hydro_visits = active_ids.len();
+        if active_ids.is_empty() {
+            return;
         }
-        for i in 0..n {
+        let mut busy: HashSet<usize> = HashSet::new();
+        let mut flux_ids: Vec<usize> = Vec::new();
+        let mut flux_seen: HashSet<usize> = HashSet::new();
+
+        self.infiltrate_active_ids(active_ids, &mut busy);
+        self.pond_pass_ids(active_ids, &mut busy, &mut flux_seen, &mut flux_ids, receiver_bound);
+        let percolated = self.percolate_active_ids(active_ids, &mut busy);
+        self.lateral_drain_pass_ids(
+            &percolated,
+            active_ids,
+            &mut busy,
+            &mut flux_seen,
+            &mut flux_ids,
+            receiver_bound,
+        );
+        self.lake_snap_ids(active_ids);
+
+        for &i in &flux_ids {
+            self.wake_idx(i);
+        }
+        for &i in active_ids {
             // Only update rest flags for cells we visited; ignored sleepers stay put.
-            if !active[i] {
-                continue;
-            }
-            self.at_rest[i] = !busy[i];
-            if busy[i] {
-                self.awake[i] = true;
+            let is_busy = busy.contains(&i);
+            self.at_rest[i] = !is_busy;
+            if is_busy {
+                self.wake_one(i);
             }
         }
         self.prune_awake();
@@ -1090,8 +1240,7 @@ impl World {
 
     /// Wake cell i and its 4-neighbors (clear at_rest, enter awake set). S08.
     fn wake_idx(&mut self, i: usize) {
-        self.awake[i] = true;
-        self.at_rest[i] = false;
+        self.wake_one(i);
         let x = i % self.width;
         let y = i / self.width;
         for &(dx, dy) in &NEIGHBOR_OFFSETS {
@@ -1101,47 +1250,62 @@ impl World {
                 continue;
             }
             let j = ny as usize * self.width + nx as usize;
-            self.awake[j] = true;
-            self.at_rest[j] = false;
+            self.wake_one(j);
         }
+    }
+
+    #[inline]
+    fn wake_one(&mut self, i: usize) {
+        if !self.awake[i] {
+            self.awake[i] = true;
+            self.n_awake += 1;
+            self.awake_list.push(i);
+        }
+        self.at_rest[i] = false;
     }
 
     /// Drop awake cells that are at_rest with all 4-neighbors at_rest. S08.
     fn prune_awake(&mut self) {
-        let n = self.columns.len();
-        let mut leave = vec![false; n];
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let i = y * self.width + x;
-                if !self.awake[i] {
+        if self.n_awake == 0 {
+            return;
+        }
+        let awake_ids = self.awake_list.clone();
+        let mut leave: Vec<usize> = Vec::new();
+        for &i in &awake_ids {
+            if !self.awake[i] {
+                continue;
+            }
+            if !self.at_rest[i] {
+                continue;
+            }
+            let x = i % self.width;
+            let y = i / self.width;
+            let mut all_nbrs_rest = true;
+            for &(dx, dy) in &NEIGHBOR_OFFSETS {
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                if nx < 0 || ny < 0 || nx as usize >= self.width || ny as usize >= self.height {
                     continue;
                 }
-                if !self.at_rest[i] {
-                    continue;
-                }
-                let mut all_nbrs_rest = true;
-                for &(dx, dy) in &NEIGHBOR_OFFSETS {
-                    let nx = x as i32 + dx;
-                    let ny = y as i32 + dy;
-                    if nx < 0 || ny < 0 || nx as usize >= self.width || ny as usize >= self.height {
-                        continue;
-                    }
-                    let j = ny as usize * self.width + nx as usize;
-                    if !self.at_rest[j] {
-                        all_nbrs_rest = false;
-                        break;
-                    }
-                }
-                if all_nbrs_rest {
-                    leave[i] = true;
+                let j = ny as usize * self.width + nx as usize;
+                if !self.at_rest[j] {
+                    all_nbrs_rest = false;
+                    break;
                 }
             }
+            if all_nbrs_rest {
+                leave.push(i);
+            }
         }
-        for i in 0..n {
-            if leave[i] {
+        for i in leave {
+            if self.awake[i] {
                 self.awake[i] = false;
+                self.n_awake = self.n_awake.saturating_sub(1);
             }
         }
+        // Compact sparse list.
+        self.awake_list.retain(|&i| self.awake[i]);
+        debug_assert_eq!(self.awake_list.len(), self.n_awake);
     }
 
     /// Tick until every column is quiescent (surface dry or saturated).
@@ -1185,6 +1349,305 @@ impl World {
         }
     }
 
+
+    fn infiltrate_active_ids(&mut self, active_ids: &[usize], busy: &mut HashSet<usize>) {
+        for &i in active_ids {
+            let moved = self.columns[i].infiltrate_step();
+            if moved > V_REST {
+                busy.insert(i);
+            }
+        }
+    }
+
+    fn percolate_active_ids(
+        &mut self,
+        active_ids: &[usize],
+        busy: &mut HashSet<usize>,
+    ) -> HashMap<usize, f64> {
+        let mut out = HashMap::new();
+        for &i in active_ids {
+            let moved = self.columns[i].percolate_step();
+            if moved != 0.0 {
+                out.insert(i, moved);
+            }
+            if moved > V_REST {
+                busy.insert(i);
+            }
+        }
+        out
+    }
+
+    fn et_pass_ids(&mut self, busy: &mut HashSet<usize>, ids: &[usize]) {
+        for &i in ids {
+            let (take, from_pond) = {
+                let col = &self.columns[i];
+                let sum_shade: f64 = col
+                    .occupants
+                    .iter()
+                    .filter(|o| o.alive)
+                    .map(|o| o.shade)
+                    .sum();
+                let shade_factor = 1.0 - sum_shade.clamp(0.0, 1.0);
+                if col.surface_water_m > 0.0 {
+                    let e_eff = E_OPEN * shade_factor;
+                    (col.surface_water_m.min(e_eff), true)
+                } else if let Some(top) = col.layers.first() {
+                    let e_eff = E_SOIL * shade_factor;
+                    ((top.theta * top.thickness_m).min(e_eff), false)
+                } else {
+                    (0.0, false)
+                }
+            };
+            if take <= V_REST {
+                continue;
+            }
+            busy.insert(i);
+            let col = &mut self.columns[i];
+            if from_pond {
+                col.surface_water_m = (col.surface_water_m - take).max(0.0);
+            } else if let Some(top) = col.layers.first_mut() {
+                let mass = (top.theta * top.thickness_m - take).max(0.0);
+                top.theta = if top.thickness_m > 0.0 {
+                    mass / top.thickness_m
+                } else {
+                    0.0
+                };
+            }
+            self.et_lost += take;
+        }
+    }
+
+    fn occupant_pass_ids(&mut self, busy: &mut HashSet<usize>, ids: &[usize]) {
+        for &i in ids {
+            let occ_len = self.columns[i].occupants.len();
+            if occ_len == 0 {
+                continue;
+            }
+            let mut cell_taken = 0.0f64;
+            for oi in 0..occ_len {
+                if !self.columns[i].occupants[oi].alive {
+                    continue;
+                }
+                let u = self.columns[i].occupants[oi].uptake_max;
+                let root = self.columns[i].occupants[oi].root;
+                let mut taken = 0.0f64;
+                for k in 0..N_LAYERS {
+                    if k >= self.columns[i].layers.len() {
+                        break;
+                    }
+                    let demand = u * root[k];
+                    if demand <= 0.0 {
+                        continue;
+                    }
+                    let layer = &mut self.columns[i].layers[k];
+                    let avail = (layer.theta * layer.thickness_m).max(0.0);
+                    let take = demand.min(avail);
+                    if take <= 0.0 {
+                        continue;
+                    }
+                    let mass = (avail - take).max(0.0);
+                    layer.theta = if layer.thickness_m > 0.0 {
+                        mass / layer.thickness_m
+                    } else {
+                        0.0
+                    };
+                    taken += take;
+                }
+                if taken == 0.0 {
+                    self.columns[i].occupants[oi].dry_steps =
+                        self.columns[i].occupants[oi].dry_steps.saturating_add(1);
+                } else {
+                    self.columns[i].occupants[oi].dry_steps = 0;
+                }
+                if self.columns[i].occupants[oi].dry_steps >= T_WILT {
+                    self.columns[i].occupants[oi].alive = false;
+                }
+                cell_taken += taken;
+            }
+            if cell_taken > V_REST {
+                busy.insert(i);
+            }
+            self.extract_lost += cell_taken;
+        }
+    }
+
+    /// Sparse lake snap over candidate seed ids (plus any wet cells among them).
+    fn lake_snap_ids(&mut self, seed_ids: &[usize]) {
+        if seed_ids.is_empty() {
+            return;
+        }
+        // Candidates: seed cells with pond above the rest floor.
+        let mut cand_ids: Vec<usize> = Vec::new();
+        let mut is_cand = vec![false; self.columns.len()];
+        for &i in seed_ids {
+            if self.columns[i].surface_water_m > V_REST && !is_cand[i] {
+                is_cand[i] = true;
+                cand_ids.push(i);
+            }
+        }
+        if cand_ids.is_empty() {
+            return;
+        }
+        // Grow to full connected wet components that touch the seeds (global physics).
+        // For scoped catch-up the seed set is the region; components stay inside if
+        // exterior cells are dry. Scan neighbors of candidates iteratively.
+        let mut stack = cand_ids.clone();
+        while let Some(i) = stack.pop() {
+            let x = i % self.width;
+            let y = i / self.width;
+            let h_i = self.columns[i].head();
+            for &(dx, dy) in &NEIGHBOR_OFFSETS {
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                if nx < 0 || ny < 0 || nx as usize >= self.width || ny as usize >= self.height {
+                    continue;
+                }
+                let j = ny as usize * self.width + nx as usize;
+                if is_cand[j] {
+                    continue;
+                }
+                if self.columns[j].surface_water_m <= V_REST {
+                    continue;
+                }
+                if (h_i - self.columns[j].head()).abs() <= H_REST {
+                    is_cand[j] = true;
+                    cand_ids.push(j);
+                    stack.push(j);
+                }
+            }
+        }
+
+        let m = cand_ids.len();
+        let mut parent: Vec<usize> = (0..m).collect();
+        let mut rank: Vec<u8> = vec![0; m];
+        let mut index_of = vec![usize::MAX; self.columns.len()];
+        for (k, &i) in cand_ids.iter().enumerate() {
+            index_of[i] = k;
+        }
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+        fn unite(parent: &mut [usize], rank: &mut [u8], a: usize, b: usize) {
+            let mut ra = find(parent, a);
+            let mut rb = find(parent, b);
+            if ra == rb {
+                return;
+            }
+            if rank[ra] < rank[rb] {
+                std::mem::swap(&mut ra, &mut rb);
+            }
+            parent[rb] = ra;
+            if rank[ra] == rank[rb] {
+                rank[ra] = rank[ra].saturating_add(1);
+            }
+        }
+
+        for &i in &cand_ids {
+            let x = i % self.width;
+            let y = i / self.width;
+            let ki = index_of[i];
+            let h_i = self.columns[i].head();
+            for &(dx, dy) in &[(1i32, 0i32), (0i32, 1i32)] {
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                if nx < 0 || ny < 0 || nx as usize >= self.width || ny as usize >= self.height {
+                    continue;
+                }
+                let j = ny as usize * self.width + nx as usize;
+                let kj = index_of[j];
+                if kj == usize::MAX {
+                    continue;
+                }
+                if (h_i - self.columns[j].head()).abs() <= H_REST {
+                    unite(&mut parent, &mut rank, ki, kj);
+                }
+            }
+        }
+
+        let mut comps: Vec<Vec<usize>> = vec![Vec::new(); m];
+        for (k, &i) in cand_ids.iter().enumerate() {
+            let r = find(&mut parent, k);
+            comps[r].push(i);
+        }
+
+        for members in comps.into_iter() {
+            let n_c = members.len();
+            if n_c == 0 {
+                continue;
+            }
+            if !members.iter().all(|&i| self.column_soil_full(i)) {
+                continue;
+            }
+            let elevations_tmp: Vec<f64> =
+                members.iter().map(|&i| self.columns[i].elevation_m).collect();
+            // singleton check needs neighbor elevations — use full column elev
+            let eligible = if n_c >= 2 {
+                true
+            } else {
+                self.singleton_snap_eligible_live(members[0])
+            };
+            if !eligible {
+                continue;
+            }
+            let _ = elevations_tmp;
+            let sum_h: f64 = members.iter().map(|&i| self.columns[i].surface_water_m).sum();
+            let sum_z: f64 = members.iter().map(|&i| self.columns[i].elevation_m).sum();
+            let h_star = (sum_h + sum_z) / n_c as f64;
+
+            let mut assigned: Vec<(usize, f64)> = Vec::with_capacity(n_c);
+            let mut sum_new = 0.0;
+            for &i in &members {
+                let h_i = (h_star - self.columns[i].elevation_m).max(0.0);
+                assigned.push((i, h_i));
+                sum_new += h_i;
+            }
+            if sum_new > 0.0 && (sum_new - sum_h).abs() > 0.0 {
+                let scale = sum_h / sum_new;
+                for (_, h) in assigned.iter_mut() {
+                    *h *= scale;
+                }
+                let s2: f64 = assigned.iter().map(|(_, h)| *h).sum();
+                let residual = sum_h - s2;
+                if residual.abs() > 0.0 {
+                    if let Some((_, h)) = assigned.first_mut() {
+                        *h = (*h + residual).max(0.0);
+                    }
+                }
+            } else if sum_new == 0.0 && sum_h > 0.0 {
+                continue;
+            }
+            for (i, h) in assigned {
+                self.columns[i].surface_water_m = h;
+            }
+        }
+    }
+
+    fn singleton_snap_eligible_live(&self, i: usize) -> bool {
+        let mobile = self.columns[i].mobile_water_m();
+        if mobile <= V_REST {
+            return true;
+        }
+        let z_i = self.columns[i].elevation_m;
+        let x = i % self.width;
+        let y = i / self.width;
+        for &(dx, dy) in &NEIGHBOR_OFFSETS {
+            let nx = x as i32 + dx;
+            let ny = y as i32 + dy;
+            if nx < 0 || ny < 0 || nx as usize >= self.width || ny as usize >= self.height {
+                continue;
+            }
+            let j = ny as usize * self.width + nx as usize;
+            if self.columns[j].elevation_m < z_i {
+                return false;
+            }
+        }
+        true
+    }
+
     fn infiltrate_all(&mut self) {
         for col in &mut self.columns {
             let _ = col.infiltrate_step();
@@ -1199,6 +1662,301 @@ impl World {
             let moved = col.infiltrate_step();
             if moved > V_REST {
                 busy[i] = true;
+            }
+        }
+    }
+
+    /// Sparse pond pass over active donor ids. S10.
+    fn pond_pass_ids(
+        &mut self,
+        active_ids: &[usize],
+        busy: &mut HashSet<usize>,
+        flux_seen: &mut HashSet<usize>,
+        flux_ids: &mut Vec<usize>,
+        receiver_bound: Option<&HashSet<usize>>,
+    ) {
+        if active_ids.is_empty() {
+            return;
+        }
+
+        // Edges after donor scale: (from, to, volume).
+        let mut edges: Vec<(usize, usize, f64)> = Vec::new();
+
+        for &i in active_ids {
+            let x = i % self.width;
+            let y = i / self.width;
+            let h_i = self.columns[i].surface_water_m;
+            if h_i <= 0.0 {
+                continue;
+            }
+            let h_head = self.columns[i].head();
+
+            let mut lower: Vec<(usize, f64)> = Vec::new();
+            for &(dx, dy) in &NEIGHBOR_OFFSETS {
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                if nx < 0 || ny < 0 || nx as usize >= self.width || ny as usize >= self.height {
+                    continue;
+                }
+                let j = ny as usize * self.width + nx as usize;
+                if let Some(bound) = receiver_bound {
+                    if !bound.contains(&j) {
+                        continue;
+                    }
+                }
+                let h_nbr = self.columns[j].head();
+                if h_nbr < h_head {
+                    let d_h = h_head - h_nbr;
+                    if d_h > H_REST {
+                        lower.push((j, d_h));
+                    }
+                }
+            }
+            if lower.is_empty() {
+                continue;
+            }
+
+            let sum_delta: f64 = lower.iter().map(|&(_, d)| d).sum();
+            if sum_delta <= 0.0 {
+                continue;
+            }
+
+            let mut sends: Vec<(usize, f64)> = Vec::with_capacity(lower.len());
+            let mut sum_v = 0.0;
+            for &(j, d_h) in &lower {
+                let w = d_h / sum_delta;
+                let v_j = (h_i * w).min(0.5 * d_h).min(R_MAX);
+                if v_j > 0.0 {
+                    sends.push((j, v_j));
+                    sum_v += v_j;
+                }
+            }
+            if sum_v <= 0.0 {
+                continue;
+            }
+
+            let scale = if sum_v > h_i { h_i / sum_v } else { 1.0 };
+            for &(j, v_j) in &sends {
+                let v = v_j * scale;
+                if v > 0.0 {
+                    edges.push((i, j, v));
+                }
+            }
+        }
+
+        // Snapshot heads for receiver-cap (pre-apply).
+        // Receiver cap: sparse HashMap instead of Vec<Vec> sized to n. S10.
+        let mut incoming: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (eidx, &(_i, j, _v)) in edges.iter().enumerate() {
+            incoming.entry(j).or_default().push(eidx);
+        }
+        for (&j, idxs) in incoming.iter() {
+            if idxs.is_empty() {
+                continue;
+            }
+            let in_sum: f64 = idxs.iter().map(|&e| edges[e].2).sum();
+            if in_sum <= 0.0 {
+                continue;
+            }
+            let min_donor_h = idxs
+                .iter()
+                .map(|&e| self.columns[edges[e].0].head())
+                .fold(f64::INFINITY, f64::min);
+            let room = (min_donor_h - self.columns[j].head()).max(0.0);
+            if in_sum > room {
+                let scale = room / in_sum;
+                for &e in idxs {
+                    edges[e].2 *= scale;
+                }
+            }
+        }
+
+        let mut delta: HashMap<usize, f64> = HashMap::new();
+        for (i, j, v) in edges {
+            if v <= V_REST {
+                continue;
+            }
+            *delta.entry(i).or_insert(0.0) -= v;
+            *delta.entry(j).or_insert(0.0) += v;
+            busy.insert(i);
+            busy.insert(j);
+            if flux_seen.insert(j) {
+                flux_ids.push(j);
+            }
+        }
+
+        for (i, d) in delta {
+            if d == 0.0 {
+                continue;
+            }
+            let col = &mut self.columns[i];
+            col.surface_water_m += d;
+            if col.surface_water_m < 0.0 && col.surface_water_m.abs() <= MASS_EPSILON {
+                col.surface_water_m = 0.0;
+            }
+        }
+    }
+
+    /// Sparse lateral drain over active donor ids. S10.
+    fn lateral_drain_pass_ids(
+        &mut self,
+        percolated: &HashMap<usize, f64>,
+        active_ids: &[usize],
+        busy: &mut HashSet<usize>,
+        flux_seen: &mut HashSet<usize>,
+        flux_ids: &mut Vec<usize>,
+        receiver_bound: Option<&HashSet<usize>>,
+    ) {
+        if active_ids.is_empty() {
+            return;
+        }
+
+        let mut transfers: Vec<(usize, usize, f64)> = Vec::new();
+
+        for &i in active_ids {
+            let x = i % self.width;
+            let y = i / self.width;
+            let m_i = self.columns[i].mobile_water_m();
+            if m_i <= V_REST {
+                continue;
+            }
+            let d_i = self.columns[i].d_max();
+            let d_rem = (d_i - percolated.get(&i).copied().unwrap_or(0.0)).max(0.0);
+            if d_i <= 0.0 || d_rem <= 0.0 {
+                continue;
+            }
+            let z_i = self.columns[i].elevation_m;
+
+            let mut lower: Vec<(usize, f64)> = Vec::new();
+            let mut equal_poorer: Vec<(usize, f64)> = Vec::new();
+
+            for &(dx, dy) in &NEIGHBOR_OFFSETS {
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                if nx < 0 || ny < 0 || nx as usize >= self.width || ny as usize >= self.height {
+                    continue;
+                }
+                let j = ny as usize * self.width + nx as usize;
+                if let Some(bound) = receiver_bound {
+                    if !bound.contains(&j) {
+                        continue;
+                    }
+                }
+                let z_nbr = self.columns[j].elevation_m;
+                if z_nbr < z_i {
+                    lower.push((j, z_nbr));
+                } else if z_nbr == z_i {
+                    let m_nbr = self.columns[j].mobile_water_m();
+                    if m_nbr < m_i {
+                        equal_poorer.push((j, m_nbr));
+                    }
+                }
+            }
+
+            if !lower.is_empty() {
+                let z_star = lower.iter().map(|&(_, z)| z).fold(f64::INFINITY, f64::min);
+                let targets: Vec<usize> = lower
+                    .into_iter()
+                    .filter(|&(_, z)| z == z_star)
+                    .map(|(j, _)| j)
+                    .collect();
+                let n_t = targets.len();
+                if n_t == 0 {
+                    continue;
+                }
+                let mut planned: Vec<(usize, f64)> = Vec::new();
+                let mut total = 0.0;
+                let equal_share = m_i / n_t as f64;
+                for j in targets {
+                    let contact = d_rem.min(self.columns[j].d_max());
+                    let v_j = equal_share.min(contact);
+                    if v_j > V_REST {
+                        planned.push((j, v_j));
+                        total += v_j;
+                    }
+                }
+                if total <= 0.0 {
+                    continue;
+                }
+                let cap = m_i.min(d_rem);
+                let scale = if total > cap { cap / total } else { 1.0 };
+                for (j, v_j) in planned {
+                    let v = v_j * scale;
+                    if v > V_REST {
+                        transfers.push((i, j, v));
+                    }
+                }
+            } else if !equal_poorer.is_empty() {
+                let mut planned: Vec<(usize, f64)> = Vec::new();
+                let mut total = 0.0;
+                for (j, m_nbr) in equal_poorer {
+                    let contact = d_rem.min(self.columns[j].d_max());
+                    let v_j = contact.min(0.5 * (m_i - m_nbr));
+                    if v_j > V_REST {
+                        planned.push((j, v_j));
+                        total += v_j;
+                    }
+                }
+                if total <= 0.0 {
+                    continue;
+                }
+                let cap = m_i.min(d_rem);
+                let scale = if total > cap { cap / total } else { 1.0 };
+                for (j, v_j) in planned {
+                    let v = v_j * scale;
+                    if v > V_REST {
+                        transfers.push((i, j, v));
+                    }
+                }
+            }
+        }
+
+        // Cap by unused pore room (snapshot at receivers).
+        let mut incoming: HashMap<usize, f64> = HashMap::new();
+        for &(_from, to, amount) in &transfers {
+            if amount > V_REST {
+                *incoming.entry(to).or_insert(0.0) += amount;
+            }
+        }
+        let mut recv_scale: HashMap<usize, f64> = HashMap::new();
+        for (&j, &inc) in incoming.iter() {
+            if inc <= 0.0 {
+                continue;
+            }
+            let room = self.columns[j].remaining_pore_capacity_m().max(0.0);
+            if room <= 0.0 {
+                recv_scale.insert(j, 0.0);
+            } else if inc > room {
+                recv_scale.insert(j, room / inc);
+            }
+        }
+
+        let mut remove_amt: HashMap<usize, f64> = HashMap::new();
+        let mut soil_add: HashMap<usize, f64> = HashMap::new();
+
+        for (from, to, amount) in transfers {
+            let scale = recv_scale.get(&to).copied().unwrap_or(1.0);
+            let v = amount * scale;
+            if v <= V_REST {
+                continue;
+            }
+            *remove_amt.entry(from).or_insert(0.0) += v;
+            *soil_add.entry(to).or_insert(0.0) += v;
+            busy.insert(from);
+            busy.insert(to);
+            if flux_seen.insert(to) {
+                flux_ids.push(to);
+            }
+        }
+
+        for (i, amt) in remove_amt {
+            if amt > V_REST {
+                self.columns[i].remove_mobile_water(amt);
+            }
+        }
+        for (i, amt) in soil_add {
+            if amt > V_REST {
+                let _ = self.columns[i].fill_soil_only(amt);
             }
         }
     }
@@ -1679,6 +2437,21 @@ impl World {
     fn lake_snap(&mut self) {
         let n = self.columns.len();
         if n == 0 {
+            return;
+        }
+        // S10: sparse path — only touch wet cells (avoids O(n) UF on deserts).
+        let wet: Vec<usize> = self
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| if c.surface_water_m > V_REST { Some(i) } else { None })
+            .collect();
+        if wet.is_empty() {
+            return;
+        }
+        // For modest wet sets use the sparse snap; fall through only if huge.
+        if wet.len() * 8 < n || n <= 4096 {
+            self.lake_snap_ids(&wet);
             return;
         }
 

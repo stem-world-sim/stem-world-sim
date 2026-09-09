@@ -8,3 +8,4 @@ name = "sim_core"
 path = "src/lib.rs"
 
 [dependencies]
+smallvec = "1.13.2"
