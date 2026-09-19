@@ -1,0 +1,2 @@
+REJECT_ROOT oryza sativa root=6.0
+N demo=10 plus gold rows in full local catalog; GitHub file includes demo ten for S11 tests.
