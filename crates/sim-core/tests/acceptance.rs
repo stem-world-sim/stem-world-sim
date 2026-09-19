@@ -5,8 +5,9 @@
 //! Grid mass: sum of column M.
 
 use sim_core::{
-    ChunkBusy, Column, Occupant, SoilLayer, Texture, World, CHUNK, E_OPEN, E_SOIL, H_REST,
-    MASS_EPSILON, MAX_OCCUPANTS, N_ET, N_LAYERS, P_MAX, R_MAX, T_SETTLE, T_WILT, V_REST,
+    Catalog, ChunkBusy, Column, Occupant, OccupantParams, SoilLayer, Texture, World, CHUNK,
+    E_OPEN, E_SOIL, H_REST, MASS_EPSILON, MAX_OCCUPANTS, N_ET, N_LAYERS, P_MAX, R_MAX, T_SETTLE,
+    T_WILT, V_REST,
 };
 
 fn assert_mass_close(actual: f64, expected: f64) {
@@ -3163,4 +3164,117 @@ fn d10_storm_k30_still_under_fly() {
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     eprintln!("d10_storm_k30_still_under_fly: {ms:.3} ms");
     assert!(ms < 500.0, "storm K=30 wall {ms:.3} ms exceeds 500 ms");
+}
+
+
+// --- Sprint 11 — kernel catalog -------------------------------------------------
+
+/// D11: embedded CSV loads; at least ten demo=1 taxa (fixture has exactly 10).
+#[test]
+fn d11_catalog_loads_demo_ten() {
+    let cat = Catalog::load_embedded().expect("embedded catalog");
+    assert!(
+        cat.demo_count() >= 10,
+        "expected ≥10 demo taxa, got {}",
+        cat.demo_count()
+    );
+    assert_eq!(
+        cat.demo_count(),
+        10,
+        "demo fixture should be exactly 10 rows"
+    );
+    assert_eq!(cat.len(), 10);
+}
+
+/// D11: unknown taxon_id is Err.
+#[test]
+fn d11_unknown_taxon_is_err() {
+    let cat = Catalog::load_embedded().expect("embedded catalog");
+    assert!(cat.get("not_a_taxon").is_err());
+}
+
+/// D11: rice (oryza_sativa) empty root_depth → herb form default → [1,0].
+#[test]
+fn d11_rice_root_null_uses_herb_mask() {
+    let cat = Catalog::load_embedded().expect("embedded catalog");
+    let rice = cat.get("oryza_sativa").expect("oryza_sativa");
+    assert!(rice.root_depth_m.is_none());
+    assert_eq!(rice.root_mask, [1.0, 0.0]);
+    // Helper builds PlantStub with catalog mask; uptake stays P_MAX.
+    let stub = rice.to_plant_stub();
+    assert_eq!(stub.root, [1.0, 0.0]);
+    assert!((stub.uptake_max - P_MAX).abs() < MASS_EPSILON);
+}
+
+/// D11: oak (quercus_alba) deeper root → [1,1], deeper than rice default.
+#[test]
+fn d11_oak_deeper_than_rice_default_mask() {
+    let cat = Catalog::load_embedded().expect("embedded catalog");
+    let oak = cat.get("quercus_alba").expect("quercus_alba");
+    let rice = cat.get("oryza_sativa").expect("oryza_sativa");
+    assert!(oak.root_depth_m.is_some());
+    assert!(oak.root_depth_m.unwrap() > 0.20);
+    assert_eq!(oak.root_mask, [1.0, 1.0]);
+    assert_eq!(rice.root_mask, [1.0, 0.0]);
+    // Oak reaches bot layer; rice default does not.
+    assert!(oak.root_mask[1] > rice.root_mask[1]);
+}
+
+/// D11: kernel resolves taxa by taxon_id only — no species-name string branching.
+#[test]
+fn d11_no_species_name_match_in_sim_core() {
+    let cat = Catalog::load_embedded().expect("embedded catalog");
+    // API-only: oak and rice resolve via id, not display name.
+    let oak = cat.get("quercus_alba").expect("id quercus_alba");
+    let rice = cat.get("oryza_sativa").expect("id oryza_sativa");
+    assert_ne!(oak.taxon_id, rice.taxon_id);
+    assert_eq!(oak.name_norm, "quercus alba");
+    assert_eq!(rice.name_norm, "oryza sativa");
+    // Lookup by common English name must fail (no name matching in kernel).
+    assert!(cat.get("oak").is_err());
+    assert!(cat.get("rice").is_err());
+    assert!(cat.get("quercus alba").is_err());
+
+    // Source scan: production sim-core must not branch physics on species name strings.
+    let lib = include_str!("../src/lib.rs");
+    let catalog = include_str!("../src/catalog.rs");
+    for (label, src) in [("lib.rs", lib), ("catalog.rs", catalog)] {
+        for pat in [
+            r#"name == "oak""#,
+            r#"name == "rice""#,
+            r#"== "oak""#,
+            r#"== "Rice""#,
+            "if name ==",
+            "match name",
+        ] {
+            assert!(
+                !src.contains(pat),
+                "{label} contains forbidden species-name pattern: {pat}"
+            );
+        }
+    }
+    let _params: &OccupantParams = oak;
+}
+
+/// D11: two taxa expose queryable rain_min/max envelopes (no filter applied).
+#[test]
+fn d11_same_rain_two_taxa_queryable() {
+    let cat = Catalog::load_embedded().expect("embedded catalog");
+    let a = cat.get("oryza_sativa").expect("rice");
+    let b = cat.get("quercus_alba").expect("oak");
+    let a_min = a.rain_min_mm.expect("rice rain_min");
+    let a_max = a.rain_max_mm.expect("rice rain_max");
+    let b_min = b.rain_min_mm.expect("oak rain_min");
+    let b_max = b.rain_max_mm.expect("oak rain_max");
+    assert!(a_min < a_max);
+    assert!(b_min < b_max);
+    // Overlapping mid-range queryable on both (e.g. 900 mm).
+    let q = 900.0;
+    assert!(a_min <= q && q <= a_max, "rice envelope should cover {q}");
+    assert!(b_min <= q && q <= b_max, "oak envelope should cover {q}");
+    // Envelopes differ (not a single hardcoded rain table).
+    assert!(
+        (a_min, a_max) != (b_min, b_max),
+        "two taxa should carry distinct rain envelopes"
+    );
 }

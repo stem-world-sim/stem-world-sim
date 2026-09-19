@@ -1,4 +1,4 @@
-//! Stem World Sim — Sprint 10 flyover catch_up budget (closed basin).
+//! Stem World Sim — Sprint 11 kernel catalog ingest (closed basin).
 //!
 //! Water mass (A = 1): M = h_surf + sum_i (theta_i * L_i)
 //! Grid mass: sum of column M. Closed basin: M + et_lost() + extract_lost() == mass ever added.
@@ -16,6 +16,7 @@
 //! ET: pond first (E_OPEN) else top-layer soil (E_SOIL, may go below θ_fc); skip ≤ V_REST.
 //! S = clamp(sum alive shade, 0, 1); E_eff = E * (1 - S). PlantStub shade default 0.25.
 //! Occupants: per-cell list ≤ MAX_OCCUPANTS; PlantStub uptake by root mask; wilt at T_WILT.
+//! Catalog: typed OccupantParams from embedded kernel_catalog.csv; root_mask by depth/form.
 //! catch_up(K, rain): optional source dump; then K blocks of (≤N_ET hydro, 1 unit sink).
 //! catch_up_chunk: same calendar on one chunk + 1-cell halo; other chunks unchanged.
 //! Unique-min-H chute revoked. Capillary stays.
@@ -23,6 +24,11 @@
 /// Absolute / relative tolerance for water-mass comparisons (f64).
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
+
+pub mod catalog;
+pub use catalog::{
+    root_mask_from_depth, Catalog, CatalogError, Form, OccupantParams,
+};
 
 pub const MASS_EPSILON: f64 = 1e-9;
 
