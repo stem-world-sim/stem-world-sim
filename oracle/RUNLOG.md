@@ -1,13 +1,13 @@
 # Oracle RUNLOG
 
 ```
-sprint: S10
+sprint: S11
 result: green
-branch: feat/s10-flyover-budget
-date: 2026-09-08 (PT)
+branch: feat/s11-kernel-catalog
+date: 2026-09-19 (PT)
 epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15; H_REST=0.02 m; V_REST=1e-4 m
 constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25; T_SETTLE=64; CHUNK=8
-invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9 + D91 + D10
+invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9 + D91 + D10 + D11
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -91,5 +91,11 @@ tests:
   - d10_stripe_k30
   - d10_workset_k100
   - d10_storm_k30_still_under_fly
-notes: S10 1024x1024 flyover catch_up budgets. Column layers/occupants densified via SmallVec; sparse hydro/catch_up (awake_list, visit_indices, HashSet region bounds, lake_snap_ids); force_sleep_all + catch_up_chunks; profile.test opt-level=3 for wall-clock. Topology: ridge z=8 on x in [128,144) else z=2; Loam theta_fc; plant in view; ox,oy=(16,496). Work set view+look-ahead 64x32 = 32 chunks (sprint "~8" underspecified). Incoming stripe 32x8 = 4 chunks. Storm: ox look-ahead misses ridge — stress 0.3 m pond on incoming stripe + K=30 catch_up. Measured (cargo test, opt-level=3): d10_map_constructs construct~123 ms cells=1048576 VmRSS~990 MB; d10_ignored_tick_zero_visits~0.006 ms; d10_frustum_not_world visits=2048 cap=2240 ~0.31 ms; d10_stripe_k30~4.7 ms; d10_workset_k100~84 ms; d10_storm_k30_still_under_fly~104 ms. Older D0-D91 names green. No silent shrink on alloc.
+  - d11_catalog_loads_demo_ten
+  - d11_unknown_taxon_is_err
+  - d11_rice_root_null_uses_herb_mask
+  - d11_oak_deeper_than_rice_default_mask
+  - d11_no_species_name_match_in_sim_core
+  - d11_same_rain_two_taxa_queryable
+notes: S11 kernel catalog ingest. Catalog::load_embedded include_str docs/data/kernel_catalog.csv; from_csv_str hand-parse (no new crate dep). OccupantParams by taxon_id; empty cells None; climate parsed not filtered. root_mask: None→herb[1,0]/shrub|tree[1,1]; depth≤0.20→[1,0]; else[1,1]. Rice null root→herb[1,0]; oak 1.5→[1,1]. to_plant_stub uses P_MAX + shade 0.25. No species-name physics branching. cargo test --workspace: 88 acceptance + 4 unit green. Cargo.lock left untracked (no new dep). docs/ untouched.
 ```
