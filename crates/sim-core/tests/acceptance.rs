@@ -5,9 +5,9 @@
 //! Grid mass: sum of column M.
 
 use sim_core::{
-    Catalog, ChunkBusy, Column, Occupant, OccupantParams, SoilLayer, Texture, World, CHUNK,
-    E_OPEN, E_SOIL, H_REST, MASS_EPSILON, MAX_OCCUPANTS, N_ET, N_LAYERS, P_MAX, R_MAX, T_SETTLE,
-    T_WILT, V_REST,
+    Catalog, ChunkBusy, ClimateReject, Column, Occupant, OccupantParams, PlantTaxonError,
+    SoilLayer, Texture, World, CHUNK, E_OPEN, E_SOIL, H_REST, MASS_EPSILON, MAX_OCCUPANTS, N_ET,
+    N_LAYERS, P_MAX, R_MAX, T_SETTLE, T_WILT, V_REST,
 };
 
 fn assert_mass_close(actual: f64, expected: f64) {
@@ -3277,4 +3277,174 @@ fn d11_same_rain_two_taxa_queryable() {
         (a_min, a_max) != (b_min, b_max),
         "two taxa should carry distinct rain envelopes"
     );
+}
+
+
+// --- Sprint 12 — climate envelope -------------------------------------------------
+
+fn climate_sand_column() -> Column {
+    let tex = Texture::Sand;
+    let fc = tex.theta_fc();
+    Column::new(
+        0.0,
+        0.0,
+        vec![
+            SoilLayer::new(0.3, fc, tex),
+            SoilLayer::new(0.5, fc, tex),
+        ],
+    )
+}
+
+/// D12: rice dies / fails to plant when T_air < catalog t_min (16°C).
+#[test]
+fn d12_rice_dies_below_tmin() {
+    let mut world = World::new(1201, climate_sand_column());
+    world.set_climate(10.0, 1000.0); // below rice t_min=16; rain OK
+    let err = world.plant_taxon(0, 0, "oryza_sativa");
+    assert!(
+        matches!(err, Err(PlantTaxonError::Climate(ClimateReject::TMin))),
+        "expected TMin reject, got {err:?}"
+    );
+    assert!(!world.plant_at(0, 0));
+    assert_eq!(world.climate_reject(0, 0), ClimateReject::TMin);
+    // Tick path: plant under good climate then chill.
+    world.set_climate(25.0, 1000.0);
+    world.plant_taxon(0, 0, "oryza_sativa").unwrap();
+    assert!(world.plant_at(0, 0));
+    world.set_climate(10.0, 1000.0);
+    world.tick();
+    assert!(!world.plant_at(0, 0));
+    assert_eq!(world.climate_reject(0, 0), ClimateReject::TMin);
+}
+
+/// D12: wheat lives at the same cold T that kills rice.
+#[test]
+fn d12_wheat_lives_at_same_t() {
+    let mut world = World::new(1202, climate_sand_column());
+    world.set_climate(10.0, 1000.0); // rice dies; wheat t_min=5
+    world.plant_taxon(0, 0, "triticum_aestivum").unwrap();
+    assert!(world.plant_at(0, 0));
+    world.tick();
+    assert!(world.plant_at(0, 0));
+    assert_eq!(world.climate_reject(0, 0), ClimateReject::None);
+}
+
+/// D12: rice lives inside its T/rain envelope.
+#[test]
+fn d12_rice_lives_in_envelope() {
+    let mut world = World::new(1203, climate_sand_column());
+    world.set_climate(25.0, 1200.0); // inside 16–38 / 800–4000
+    world.plant_taxon(0, 0, "oryza_sativa").unwrap();
+    assert!(world.plant_at(0, 0));
+    world.tick();
+    assert!(world.plant_at(0, 0));
+    assert_eq!(world.climate_reject(0, 0), ClimateReject::None);
+}
+
+/// D12: wheat dies when T_air > catalog t_max (27°C).
+#[test]
+fn d12_wheat_dies_above_tmax() {
+    let mut world = World::new(1204, climate_sand_column());
+    world.set_climate(30.0, 1000.0); // above wheat t_max=27; rain OK
+    let err = world.plant_taxon(0, 0, "triticum_aestivum");
+    assert!(
+        matches!(err, Err(PlantTaxonError::Climate(ClimateReject::TMax))),
+        "expected TMax reject, got {err:?}"
+    );
+    assert!(!world.plant_at(0, 0));
+    assert_eq!(world.climate_reject(0, 0), ClimateReject::TMax);
+}
+
+/// D12: rice dies when rain_year_mm < catalog rain_min (800).
+#[test]
+fn d12_rice_dies_dry_year() {
+    let mut world = World::new(1205, climate_sand_column());
+    world.set_climate(25.0, 500.0); // dry year
+    let err = world.plant_taxon(0, 0, "oryza_sativa");
+    assert!(
+        matches!(err, Err(PlantTaxonError::Climate(ClimateReject::RMin))),
+        "expected RMin reject, got {err:?}"
+    );
+    assert!(!world.plant_at(0, 0));
+    assert_eq!(world.climate_reject(0, 0), ClimateReject::RMin);
+}
+
+/// D12: add_rain (metres into the column) is not rain_year_mm; set_climate owns the envelope axis.
+#[test]
+fn d12_bucket_is_not_climate() {
+    let mut world = World::new(1206, climate_sand_column());
+    world.set_climate(25.0, 500.0); // dry year — rice r_min=800
+    assert!((world.rain_year_mm() - 500.0).abs() < 1e-12);
+    // Irrigation bucket: metres of water into the column.
+    world.add_rain(2.0);
+    assert!((world.rain_year_mm() - 500.0).abs() < 1e-12, "add_rain must not flip rain_year_mm");
+    let err = world.plant_taxon(0, 0, "oryza_sativa");
+    assert!(
+        matches!(err, Err(PlantTaxonError::Climate(ClimateReject::RMin))),
+        "bucket alone must not satisfy rain envelope; got {err:?}"
+    );
+    assert!(!world.plant_at(0, 0));
+    // set_climate still controls the rain envelope axis.
+    world.set_climate(25.0, 1200.0);
+    assert!((world.rain_year_mm() - 1200.0).abs() < 1e-12);
+    world.plant_taxon(0, 0, "oryza_sativa").unwrap();
+    assert!(world.plant_at(0, 0));
+    assert_eq!(world.climate_reject(0, 0), ClimateReject::None);
+}
+
+/// D12: empty envelope / PlantStub without taxon — no climate veto at extreme set_climate.
+#[test]
+fn d12_empty_envelope_no_veto() {
+    let mut world = World::new(1207, climate_sand_column());
+    world.set_climate(-40.0, 0.0);
+    world.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+    assert!(world.plant_at(0, 0));
+    world.tick();
+    assert!(world.plant_at(0, 0), "taxon-less PlantStub must survive extreme climate");
+    assert_eq!(world.climate_reject(0, 0), ClimateReject::None);
+}
+
+/// D12: filter uses catalog ids/fields — no species-name branching in the kernel.
+#[test]
+fn d12_no_species_name_match() {
+    let cat = Catalog::load_embedded().expect("embedded catalog");
+    let rice = cat.get("oryza_sativa").expect("oryza_sativa");
+    let wheat = cat.get("triticum_aestivum").expect("triticum_aestivum");
+    assert_ne!(rice.taxon_id, wheat.taxon_id);
+    // Common English names are not taxon keys.
+    assert!(cat.get("rice").is_err());
+    assert!(cat.get("wheat").is_err());
+
+    // API: envelopes differ via catalog fields, not hardcoded name tables.
+    assert_eq!(rice.t_min_c, Some(16.0));
+    assert_eq!(wheat.t_min_c, Some(5.0));
+    assert_ne!(rice.t_max_c, wheat.t_max_c);
+
+    let mut world = World::new(1208, climate_sand_column());
+    world.set_climate(10.0, 1000.0);
+    assert!(matches!(
+        world.plant_taxon(0, 0, "oryza_sativa"),
+        Err(PlantTaxonError::Climate(ClimateReject::TMin))
+    ));
+    world.plant_taxon(0, 0, "triticum_aestivum").unwrap();
+    assert!(world.plant_at(0, 0));
+
+    let lib = include_str!("../src/lib.rs");
+    let catalog = include_str!("../src/catalog.rs");
+    for (label, src) in [("lib.rs", lib), ("catalog.rs", catalog)] {
+        for pat in [
+            r#"== "rice""#,
+            r#"== "wheat""#,
+            r#"name == "rice""#,
+            r#"name == "wheat""#,
+            "if name ==",
+            "match name",
+        ] {
+            assert!(
+                !src.contains(pat),
+                "{label} contains forbidden species-name pattern: {pat}"
+            );
+        }
+    }
+    let _params: &OccupantParams = rice;
 }

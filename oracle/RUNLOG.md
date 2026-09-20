@@ -1,13 +1,13 @@
 # Oracle RUNLOG
 
 ```
-sprint: S11
+sprint: S12
 result: green
-branch: feat/s11-kernel-catalog
+branch: feat/s12-climate-envelope
 date: 2026-09-19 (PT)
 epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15; H_REST=0.02 m; V_REST=1e-4 m
 constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25; T_SETTLE=64; CHUNK=8
-invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9 + D91 + D10 + D11
+invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9 + D91 + D10 + D11 + D12
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -97,5 +97,13 @@ tests:
   - d11_oak_deeper_than_rice_default_mask
   - d11_no_species_name_match_in_sim_core
   - d11_same_rain_two_taxa_queryable
-notes: S11 kernel catalog ingest. Catalog::load_embedded include_str docs/data/kernel_catalog.csv; from_csv_str hand-parse (no new crate dep). OccupantParams by taxon_id; empty cells None; climate parsed not filtered. root_mask: None→herb[1,0]/shrub|tree[1,1]; depth≤0.20→[1,0]; else[1,1]. Rice null root→herb[1,0]; oak 1.5→[1,1]. to_plant_stub uses P_MAX + shade 0.25. No species-name physics branching. cargo test --workspace: 88 acceptance + 4 unit green. Cargo.lock left untracked (no new dep). docs/ untouched.
+  - d12_rice_dies_below_tmin
+  - d12_wheat_lives_at_same_t
+  - d12_rice_lives_in_envelope
+  - d12_wheat_dies_above_tmax
+  - d12_rice_dies_dry_year
+  - d12_bucket_is_not_climate
+  - d12_empty_envelope_no_veto
+  - d12_no_species_name_match
+notes: S12 climate envelope filter. World holds t_air_c + rain_year_mm (defaults 20°C / 1000 mm) and embedded Catalog; set_climate / t_air_c / rain_year_mm; add_rain does not flip rain_year_mm. Occupant.taxon_id: Option<String> (None for plant_stub helpers); OccupantParams::to_plant_stub sets Some(taxon_id). plant_taxon + add_occupant + post-tick/catch_up filter: TMin→TMax→RMin→RMax first hit; None fields skip; reject removes occupant (not a mass sink). climate_reject(x,y) → ClimateReject. Demo envelopes via Catalog::get (oryza_sativa / triticum_aestivum) — no species-name physics. cargo test --workspace: 96 acceptance + 4 unit green. Cargo.lock left untracked. docs/ untouched.
 ```

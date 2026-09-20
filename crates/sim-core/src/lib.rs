@@ -17,6 +17,7 @@
 //! S = clamp(sum alive shade, 0, 1); E_eff = E * (1 - S). PlantStub shade default 0.25.
 //! Occupants: per-cell list ≤ MAX_OCCUPANTS; PlantStub uptake by root mask; wilt at T_WILT.
 //! Catalog: typed OccupantParams from embedded kernel_catalog.csv; root_mask by depth/form.
+//! S12: world climate (T_air_c, rain_year_mm); catalog envelope veto on plant/tick.
 //! catch_up(K, rain): optional source dump; then K blocks of (≤N_ET hydro, 1 unit sink).
 //! catch_up_chunk: same calendar on one chunk + 1-cell halo; other chunks unchanged.
 //! Unique-min-H chute revoked. Capillary stays.
@@ -125,6 +126,8 @@ pub struct Occupant {
     pub root: [f64; N_LAYERS],
     pub shade: f64,
     pub dry_steps: u32,
+    /// Catalog taxon key for S12 climate envelope; None = no climate veto.
+    pub taxon_id: Option<String>,
 }
 
 impl Occupant {
@@ -137,6 +140,7 @@ impl Occupant {
             root: [1.0, 0.0],
             shade: 0.25,
             dry_steps: 0,
+            taxon_id: None,
         }
     }
 
@@ -149,6 +153,7 @@ impl Occupant {
             root,
             shade: 0.25,
             dry_steps: 0,
+            taxon_id: None,
         }
     }
 }
@@ -156,6 +161,50 @@ impl Occupant {
 /// Error when [`World::add_occupant`] would exceed [`MAX_OCCUPANTS`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OccupantsFull;
+
+/// S12 climate envelope reject reason (cell last-reject query).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ClimateReject {
+    #[default]
+    None,
+    TMin,
+    TMax,
+    RMin,
+    RMax,
+}
+
+/// Error from [`World::plant_taxon`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlantTaxonError {
+    OccupantsFull,
+    UnknownTaxon,
+    Climate(ClimateReject),
+}
+
+/// First matching EcoCrop clause wins; `None` fields do not fire. S12.
+fn climate_envelope_reject(params: &OccupantParams, t_air_c: f64, rain_year_mm: f64) -> ClimateReject {
+    if let Some(t_min) = params.t_min_c {
+        if t_air_c < t_min {
+            return ClimateReject::TMin;
+        }
+    }
+    if let Some(t_max) = params.t_max_c {
+        if t_air_c > t_max {
+            return ClimateReject::TMax;
+        }
+    }
+    if let Some(r_min) = params.rain_min_mm {
+        if rain_year_mm < r_min {
+            return ClimateReject::RMin;
+        }
+    }
+    if let Some(r_max) = params.rain_max_mm {
+        if rain_year_mm > r_max {
+            return ClimateReject::RMax;
+        }
+    }
+    ClimateReject::None
+}
 
 /// Historical S09 busy signal. S09.1: [`World::ignore_chunk`] always succeeds (never Err).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -568,6 +617,14 @@ pub struct World {
     et_lost: f64,
     /// Cumulative water depth extracted by occupants (A = 1). S06.
     extract_lost: f64,
+    /// World-wide air temperature (°C). S12.
+    t_air_c: f64,
+    /// Annual / period rain depth (mm) — not column irrigation. S12.
+    rain_year_mm: f64,
+    /// Embedded kernel catalog for envelope lookups. S12.
+    catalog: Catalog,
+    /// Last climate reject reason per cell. S12.
+    climate_reject: Vec<ClimateReject>,
 }
 
 impl World {
@@ -592,6 +649,10 @@ impl World {
             last_hydro_visits: 0,
             et_lost: 0.0,
             extract_lost: 0.0,
+            t_air_c: 20.0,
+            rain_year_mm: 1000.0,
+            catalog: Catalog::load_embedded().expect("embedded kernel catalog"),
+            climate_reject: vec![ClimateReject::None],
         }
     }
 
@@ -623,6 +684,10 @@ impl World {
             last_hydro_visits: 0,
             et_lost: 0.0,
             extract_lost: 0.0,
+            t_air_c: 20.0,
+            rain_year_mm: 1000.0,
+            catalog: Catalog::load_embedded().expect("embedded kernel catalog"),
+            climate_reject: vec![ClimateReject::None; n],
         }
     }
 
@@ -857,6 +922,7 @@ impl World {
             let mut sink_busy: HashSet<usize> = HashSet::new();
             self.et_pass_ids(&mut sink_busy, &region_ids);
             self.occupant_pass_ids(&mut sink_busy, &region_ids);
+            self.apply_climate_filter_ids(&region_ids);
             self.lake_snap_ids(&region_ids);
             for &i in &region_ids {
                 let is_busy = sink_busy.contains(&i);
@@ -1059,13 +1125,20 @@ impl World {
 
     /// Add an occupant at (x,y). Err if the cell already has [`MAX_OCCUPANTS`].
     /// Wakes the cell and its 4-neighbors. S08.
+    /// S12: if `occ.taxon_id` has a catalog envelope that rejects current climate,
+    /// the occupant is not inserted and [`Self::climate_reject`] records the reason.
     pub fn add_occupant(&mut self, x: usize, y: usize, occ: Occupant) -> Result<(), OccupantsFull> {
         let i = self.idx(x, y);
+        if let Some(reason) = self.climate_veto_for(&occ) {
+            self.climate_reject[i] = reason;
+            return Ok(());
+        }
         let col = &mut self.columns[i];
         if col.occupants.len() >= MAX_OCCUPANTS {
             return Err(OccupantsFull);
         }
         col.occupants.push(occ);
+        self.climate_reject[i] = ClimateReject::None;
         self.wake_idx(i);
         Ok(())
     }
@@ -1079,6 +1152,132 @@ impl World {
     pub fn clear_all_occupants(&mut self) {
         for col in &mut self.columns {
             col.occupants.clear();
+        }
+    }
+
+    /// Set world-wide climate coordinates. Does not change column water. S12.
+    pub fn set_climate(&mut self, t_air_c: f64, rain_year_mm: f64) {
+        self.t_air_c = t_air_c;
+        self.rain_year_mm = rain_year_mm;
+    }
+
+    pub fn set_t_air_c(&mut self, t_air_c: f64) {
+        self.t_air_c = t_air_c;
+    }
+
+    pub fn set_rain_year_mm(&mut self, rain_year_mm: f64) {
+        self.rain_year_mm = rain_year_mm;
+    }
+
+    pub fn t_air_c(&self) -> f64 {
+        self.t_air_c
+    }
+
+    pub fn rain_year_mm(&self) -> f64 {
+        self.rain_year_mm
+    }
+
+    /// Last climate reject reason for cell (x,y). S12.
+    pub fn climate_reject(&self, x: usize, y: usize) -> ClimateReject {
+        self.climate_reject[self.idx(x, y)]
+    }
+
+    /// Replace the world's catalog (tests / custom packs). S12.
+    pub fn set_catalog(&mut self, catalog: Catalog) {
+        self.catalog = catalog;
+    }
+
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
+    /// Plant a catalog taxon at (x,y) after climate check. S12.
+    pub fn plant_taxon(
+        &mut self,
+        x: usize,
+        y: usize,
+        taxon_id: &str,
+    ) -> Result<(), PlantTaxonError> {
+        let params = match self.catalog.get(taxon_id) {
+            Ok(p) => p.clone(),
+            Err(_) => return Err(PlantTaxonError::UnknownTaxon),
+        };
+        let occ = params.to_plant_stub();
+        if let Some(reason) = self.climate_veto_for(&occ) {
+            let i = self.idx(x, y);
+            self.climate_reject[i] = reason;
+            return Err(PlantTaxonError::Climate(reason));
+        }
+        self.add_occupant(x, y, occ)
+            .map_err(|_| PlantTaxonError::OccupantsFull)
+    }
+
+    /// Evaluate catalog envelope for an occupant against current climate.
+    /// Returns Some(reason) if vetoed; None if no taxon / empty fields / in range.
+    fn climate_veto_for(&self, occ: &Occupant) -> Option<ClimateReject> {
+        let Some(ref tid) = occ.taxon_id else {
+            return None;
+        };
+        let Ok(params) = self.catalog.get(tid) else {
+            return None;
+        };
+        let reason = climate_envelope_reject(params, self.t_air_c, self.rain_year_mm);
+        if reason == ClimateReject::None {
+            None
+        } else {
+            Some(reason)
+        }
+    }
+
+    /// Apply climate envelope to all alive occupants in `ids`; remove rejects. S12.
+    fn apply_climate_filter_ids(&mut self, ids: &[usize]) {
+        for &i in ids {
+            self.apply_climate_filter_at(i);
+        }
+    }
+
+    fn apply_climate_filter_at(&mut self, i: usize) {
+        let t_air = self.t_air_c;
+        let rain_year = self.rain_year_mm;
+        // Collect reject decisions without holding &mut columns + catalog together.
+        let decisions: Vec<(usize, ClimateReject)> = {
+            let col = &self.columns[i];
+            let mut out = Vec::new();
+            for (oi, occ) in col.occupants.iter().enumerate() {
+                if !occ.alive {
+                    continue;
+                }
+                let Some(ref tid) = occ.taxon_id else {
+                    continue;
+                };
+                let Ok(params) = self.catalog.get(tid) else {
+                    continue;
+                };
+                let reason = climate_envelope_reject(params, t_air, rain_year);
+                if reason != ClimateReject::None {
+                    out.push((oi, reason));
+                }
+            }
+            out
+        };
+        if decisions.is_empty() {
+            // If any taxon occupant was evaluated and all passed, clear reject.
+            let had_taxon = self.columns[i]
+                .occupants
+                .iter()
+                .any(|o| o.alive && o.taxon_id.is_some());
+            if had_taxon {
+                self.climate_reject[i] = ClimateReject::None;
+            }
+            return;
+        }
+        // First hit wins for cell reason; remove all rejecting indices (high→low).
+        self.climate_reject[i] = decisions[0].1;
+        let mut remove: Vec<usize> = decisions.into_iter().map(|(oi, _)| oi).collect();
+        remove.sort_unstable();
+        remove.dedup();
+        for oi in remove.into_iter().rev() {
+            self.columns[i].occupants.remove(oi);
         }
     }
 
@@ -1118,21 +1317,25 @@ impl World {
         // S09: sinks only on observed ∪ awake (same visit set as hydro).
         if self.clock.tick % N_ET == 0 {
             let ids = self.visit_indices();
-            if ids.is_empty() {
-                return;
-            }
-            let mut sink_busy: HashSet<usize> = HashSet::new();
-            self.et_pass_ids(&mut sink_busy, &ids);
-            self.occupant_pass_ids(&mut sink_busy, &ids);
-            self.lake_snap_ids(&ids);
-            for &i in &ids {
-                let is_busy = sink_busy.contains(&i);
-                self.at_rest[i] = !is_busy;
-                if is_busy {
-                    self.wake_one(i);
+            if !ids.is_empty() {
+                let mut sink_busy: HashSet<usize> = HashSet::new();
+                self.et_pass_ids(&mut sink_busy, &ids);
+                self.occupant_pass_ids(&mut sink_busy, &ids);
+                self.lake_snap_ids(&ids);
+                for &i in &ids {
+                    let is_busy = sink_busy.contains(&i);
+                    self.at_rest[i] = !is_busy;
+                    if is_busy {
+                        self.wake_one(i);
+                    }
                 }
+                self.prune_awake();
             }
-            self.prune_awake();
+        }
+        // S12: climate envelope after every live tick (visit set).
+        let climate_ids = self.visit_indices();
+        if !climate_ids.is_empty() {
+            self.apply_climate_filter_ids(&climate_ids);
         }
     }
 
@@ -1168,6 +1371,9 @@ impl World {
             let mut sink_busy = vec![false; n];
             self.et_pass(&mut sink_busy, None);
             self.occupant_pass(&mut sink_busy, None);
+            // S12: climate envelope after sink extract.
+            let all_ids: Vec<usize> = (0..self.columns.len()).collect();
+            self.apply_climate_filter_ids(&all_ids);
             self.lake_snap();
             for i in 0..n {
                 self.at_rest[i] = !sink_busy[i];
