@@ -2,6 +2,7 @@
 //!
 //! Occupant scalars come from a row keyed by `taxon_id`. Missing numeric/
 //! string fields are `None`; `root_mask` uses form defaults when depth is null.
+//! S12: climate Option fields drive World envelope vetoes.
 
 use crate::{Occupant, N_LAYERS};
 use std::collections::HashMap;
@@ -33,7 +34,7 @@ impl Form {
     }
 }
 
-/// Typed row for one taxon. Climate fields are parsed but not filtered (S12).
+/// Typed row for one taxon. Climate fields feed the S12 envelope filter.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OccupantParams {
     pub taxon_id: String,
@@ -60,7 +61,9 @@ pub struct OccupantParams {
 impl OccupantParams {
     /// Build a PlantStub occupant: uptake [`P_MAX`], shade 0.25 (PlantStub default).
     pub fn to_plant_stub(&self) -> Occupant {
-        Occupant::plant_stub_with_root(self.root_mask)
+        let mut occ = Occupant::plant_stub_with_root(self.root_mask);
+        occ.taxon_id = Some(self.taxon_id.clone());
+        occ
     }
 }
 
@@ -96,7 +99,7 @@ impl std::fmt::Display for CatalogError {
 impl std::error::Error for CatalogError {}
 
 /// In-memory catalog keyed by `taxon_id`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Catalog {
     by_id: HashMap<String, OccupantParams>,
 }
