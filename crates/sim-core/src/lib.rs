@@ -14,12 +14,12 @@
 //! Lake snap: 4-connected components with h > V_REST and intra |ΔH| ≤ H_REST snap to
 //! mean H* with Σh conserved; mark snapped cells at_rest. S04 sleep kept.
 //! ET: pond first (E_OPEN) else top-layer soil (E_SOIL, may go below θ_fc); skip ≤ V_REST.
-//! S = clamp(sum alive alphas, 0, 1); E_eff = E * (1 - S). PlantStub shade field 0.25; ET uses alpha_for.
+//! ET shade: C = min(C_MAX, 1-Π(1-α)) over living alphas; E_eff = E*(1-C). PlantStub alpha 0.25; ET uses alpha_for.
 //! Occupants: per-cell list ≤ MAX_OCCUPANTS; PlantStub uptake by root mask; wilt at T_WILT.
 //! Catalog: typed OccupantParams from embedded kernel_catalog.csv; root_mask by depth/form.
 //! S12/S12.1: world climate (T_air_c, rain_year_mm); live plant/tick use T only;
 //! catch_up may still apply rain_year vs EcoCrop. Hydro: waterlog/submerge from drain_ok+height.
-//! S13/S13.1: height-band light L0=1, H_BAND=0.05; alpha from SLA/form; dark kill T_DARK; ET uses same alpha.
+//! S13/S13.1/S13.2: height-band light L0=1, H_BAND=0.05; overlap cover T=max(T_MIN,1-min(C_MAX,1-Π(1-α))); dark kill T_DARK; ET same C.
 //! catch_up(K, rain): optional source dump; then K blocks of (≤N_ET hydro, 1 unit sink).
 //! catch_up_chunk: same calendar on one chunk + 1-cell halo; other chunks unchanged.
 //! Unique-min-H chute revoked. Capillary stays.
@@ -91,6 +91,12 @@ pub const L0: f64 = 1.0;
 
 /// Same-tile height band (metres): occupants with |Δh| ≤ H_BAND share incoming L. S13.1.
 pub const H_BAND: f64 = 0.05;
+
+/// Floor on band light transmission (never black). S13.2.
+pub const T_MIN: f64 = 0.05;
+
+/// Cap on overlap cover fraction C. S13.2.
+pub const C_MAX: f64 = 0.85;
 
 /// Soil texture: porosity, field capacity, infiltrate and drain rate limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -346,6 +352,23 @@ pub fn alpha_for_occupant(catalog: &Catalog, occ: &Occupant) -> f64 {
         },
         None => 0.25,
     }
+}
+
+/// Overlap cover from alphas: C_raw = 1 − Π(1−α_i); C = min(C_MAX, C_raw). S13.2.
+pub fn overlap_cover_from_alphas<I>(alphas: I) -> f64
+where
+    I: IntoIterator<Item = f64>,
+{
+    let mut prod = 1.0;
+    for a in alphas {
+        prod *= 1.0 - a;
+    }
+    (1.0 - prod).min(C_MAX)
+}
+
+/// Band transmission from cover: T = max(T_MIN, 1 − C). S13.2.
+pub fn cover_transmission(c: f64) -> f64 {
+    (1.0 - c).max(T_MIN)
 }
 
 fn light_traits_for_occupant(catalog: &Catalog, occ: &Occupant) -> (f64, f64, f64) {
@@ -1587,11 +1610,11 @@ impl World {
                 end += 1;
             }
 
-            // All members of the band receive the same incoming L.
+            // All members of the band receive the same incoming L (S13.1 H_BAND).
             let received = l;
-            let mut sum_alpha = 0.0;
+            let mut band_alphas: Vec<f64> = Vec::with_capacity(end - idx + 1);
             for &(oi, _h, alpha, l_min) in &rows[idx..=end] {
-                sum_alpha += alpha;
+                band_alphas.push(alpha);
                 self.columns[i].occupants[oi].last_light = Some(received);
                 if received < l_min {
                     self.columns[i].occupants[oi].dark_steps =
@@ -1603,8 +1626,10 @@ impl World {
                     kills.push(oi);
                 }
             }
-            // Band transmits L * (1 - min(1, sum alpha)); dead already excluded.
-            l *= 1.0 - sum_alpha.min(1.0);
+            // Overlap cover transmission: C=min(C_MAX,1-Π(1-α)); T=max(T_MIN,1-C).
+            let c = overlap_cover_from_alphas(band_alphas);
+            let t = cover_transmission(c);
+            l *= t;
             idx = end + 1;
         }
 
@@ -1942,12 +1967,12 @@ impl World {
         for &i in ids {
             let (take, from_pond) = {
                 let col = &self.columns[i];
-                let sum_alpha: f64 = col
-                    .occupants
-                    .iter()
-                    .map(|o| alpha_for_occupant(&self.catalog, o))
-                    .sum();
-                let shade_factor = 1.0 - sum_alpha.clamp(0.0, 1.0);
+                let c = overlap_cover_from_alphas(
+                    col.occupants
+                        .iter()
+                        .map(|o| alpha_for_occupant(&self.catalog, o)),
+                );
+                let shade_factor = 1.0 - c;
                 if col.surface_water_m > 0.0 {
                     let e_eff = E_OPEN * shade_factor;
                     (col.surface_water_m.min(e_eff), true)
@@ -2877,8 +2902,8 @@ impl World {
         }
     }
 
-    /// S05/S07/S13 batched evaporation: one ET-step (E*1). Pond first if h>0, else top soil.
-    /// S = clamp(sum alive alphas, 0, 1); E_eff = E * (1 - S). Dead/wilted alpha = 0.
+    /// S05/S07/S13.2 batched evaporation: one ET-step (E*1). Pond first if h>0, else top soil.
+    /// C = min(C_MAX, 1-Π(1-α)) over living alphas; E_eff = E * (1 - C). Dead/wilted alpha = 0.
     /// Skip take ≤ V_REST. Wakes cells that lose > V_REST via `busy`.
     fn et_pass(&mut self, busy: &mut [bool], active: Option<&[bool]>) {
         let n = self.columns.len();
@@ -2890,12 +2915,12 @@ impl World {
             }
             let (take, from_pond) = {
                 let col = &self.columns[i];
-                let sum_alpha: f64 = col
-                    .occupants
-                    .iter()
-                    .map(|o| alpha_for_occupant(&self.catalog, o))
-                    .sum();
-                let shade_factor = 1.0 - sum_alpha.clamp(0.0, 1.0);
+                let c = overlap_cover_from_alphas(
+                    col.occupants
+                        .iter()
+                        .map(|o| alpha_for_occupant(&self.catalog, o)),
+                );
+                let shade_factor = 1.0 - c;
                 if col.surface_water_m > 0.0 {
                     let e_eff = E_OPEN * shade_factor;
                     (col.surface_water_m.min(e_eff), true)
