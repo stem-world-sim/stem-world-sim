@@ -7,8 +7,8 @@
 use sim_core::{
     alpha_for_occupant, alpha_from_params, Catalog, ChunkBusy, ClimateReject, Column,
     HydroReject, LightReject, Occupant, OccupantParams, PlantTaxonError, SoilLayer, Texture,
-    World, CHUNK, E_OPEN, E_SOIL, H_POND, H_REST, L0, MASS_EPSILON, MAX_OCCUPANTS, N_ET,
-    N_LAYERS, P_MAX, R_MAX, T_DARK, T_SETTLE, T_SUB, T_WILT, T_WL, V_REST,
+    World, CHUNK, E_OPEN, E_SOIL, H_BAND, H_POND, H_REST, L0, MASS_EPSILON, MAX_OCCUPANTS,
+    N_ET, N_LAYERS, P_MAX, R_MAX, T_DARK, T_SETTLE, T_SUB, T_WILT, T_WL, V_REST,
 };
 
 fn assert_mass_close(actual: f64, expected: f64) {
@@ -3723,29 +3723,53 @@ fn d13_oak_over_grass_shades() {
     assert_eq!(world.light_reject(0, 0), LightReject::None);
 }
 
-/// D13: deep oak shade (two oaks) drives grass below herb L_min → Dark remove.
+/// D13: deep oak shade (two oaks, same band) drives grass below herb L_min → Dark remove.
 #[test]
 fn d13_grass_dies_in_oak_shade() {
     let mut world = World::new(1303, light_sand_column());
     world.set_climate(20.0, 1000.0);
     world.plant_taxon(0, 0, "lolium_perenne").unwrap();
-    // Two oak canopies: L_grass = (1-a)^2 < herb L_min=0.25 with catalog SLA alphas.
+    // Two oaks same band: both see L0; grass gets L0*(1-min(1,2*alpha)).
     world.plant_taxon(0, 0, "quercus_alba").unwrap();
     world.plant_taxon(0, 0, "quercus_alba").unwrap();
 
     let oak = world.catalog().get("quercus_alba").unwrap();
     let a = alpha_from_params(oak);
-    let l_grass = L0 * (1.0 - a) * (1.0 - a);
+    let l_grass = L0 * (1.0 - (2.0 * a).min(1.0));
     assert!(
         l_grass < 0.25,
-        "precondition: two-oak shade {l_grass} must be < herb L_min"
+        "precondition: two-oak band shade {l_grass} must be < herb L_min"
+    );
+
+    world.tick();
+    let col = world.column_at(0, 0);
+    let mut oak_lights = Vec::new();
+    let mut grass_l = None;
+    for o in &col.occupants {
+        match o.taxon_id.as_deref() {
+            Some("quercus_alba") => oak_lights.push(o.last_light.expect("oak light")),
+            Some("lolium_perenne") => grass_l = o.last_light,
+            _ => {}
+        }
+    }
+    assert_eq!(oak_lights.len(), 2);
+    for ol in &oak_lights {
+        assert!((ol - L0).abs() < 1e-12, "same-band oaks both see L0, got {ol}");
+    }
+    let grass_l = grass_l.expect("grass light");
+    assert!(
+        (grass_l - l_grass).abs() < 1e-9,
+        "grass last_light={grass_l} expect band transmit {l_grass}"
     );
 
     for t in 1..=T_DARK {
-        world.tick();
+        if t > 1 {
+            world.tick();
+        }
         if t < T_DARK {
             assert!(
-                world.column_at(0, 0)
+                world
+                    .column_at(0, 0)
                     .occupants
                     .iter()
                     .any(|o| o.taxon_id.as_deref() == Some("lolium_perenne")),
@@ -3763,13 +3787,15 @@ fn d13_grass_dies_in_oak_shade() {
         "grass must be removed after T_DARK under deep oak shade"
     );
     assert_eq!(world.light_reject(0, 0), LightReject::Dark);
-    // Oaks remain (tree L_min is low).
+    // Oaks remain (tree L_min is low); both still same band at L0.
     assert!(
         world
             .column_at(0, 0)
             .occupants
             .iter()
-            .any(|o| o.taxon_id.as_deref() == Some("quercus_alba")),
+            .filter(|o| o.taxon_id.as_deref() == Some("quercus_alba"))
+            .count()
+            >= 1,
         "oaks should survive their own canopy light"
     );
 }
@@ -3812,21 +3838,27 @@ fn d13_remove_oak_grass_lives() {
     assert!((light - L0).abs() < 1e-12);
 }
 
-/// D13: two herbs — neither falls below L_min under mutual shade.
+/// D13: two ryegrass same band — both receive L0; neither shades the other before receive.
 #[test]
 fn d13_two_herbs_neither_dark() {
     let mut world = World::new(1305, light_sand_column());
     world.set_climate(20.0, 1000.0);
-    // agrostis taller (0.3) than lolium (0.272); second still above herb L_min.
     world.plant_taxon(0, 0, "lolium_perenne").unwrap();
-    world.plant_taxon(0, 0, "agrostis_stolonifera").unwrap();
+    world.plant_taxon(0, 0, "lolium_perenne").unwrap();
 
-    let agro = world.catalog().get("agrostis_stolonifera").unwrap();
-    let a = alpha_from_params(agro);
-    let l_second = L0 * (1.0 - a);
-    assert!(l_second >= 0.25, "precondition second light {l_second}");
+    world.tick();
+    assert_eq!(world.occupant_count(0, 0), 2);
+    for o in &world.column_at(0, 0).occupants {
+        assert_eq!(o.taxon_id.as_deref(), Some("lolium_perenne"));
+        let light = o.last_light.expect("last_light");
+        assert!(
+            (light - L0).abs() < 1e-12,
+            "same-band ryegrass must both see L0, got {light}"
+        );
+        assert_eq!(o.dark_steps, 0);
+    }
 
-    for _ in 0..(T_DARK + 3) {
+    for _ in 0..(T_DARK + 2) {
         world.tick();
     }
     assert_eq!(world.occupant_count(0, 0), 2);
@@ -3896,4 +3928,182 @@ fn d13_no_species_name_match() {
     }
     let _a = alpha_from_params(grass);
     let _b = alpha_from_params(oak);
+}
+
+/// D131: two oaks same height band both receive L0.
+#[test]
+fn d131_two_oaks_same_light() {
+    let mut world = World::new(1311, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "quercus_alba").unwrap();
+    world.plant_taxon(0, 0, "quercus_alba").unwrap();
+    assert!((H_BAND - 0.05).abs() < 1e-15);
+
+    world.tick();
+    let lights: Vec<f64> = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .map(|o| o.last_light.expect("light"))
+        .collect();
+    assert_eq!(lights.len(), 2);
+    for l in &lights {
+        assert!((l - L0).abs() < 1e-12, "same-band oaks both L0, got {l}");
+    }
+    assert!((lights[0] - lights[1]).abs() < 1e-15);
+}
+
+/// D131: two oaks shade grass darker than one oak (band sum alpha).
+#[test]
+fn d131_two_oaks_darker_grass_than_one() {
+    let oak = Catalog::load_embedded()
+        .unwrap()
+        .get("quercus_alba")
+        .unwrap()
+        .clone();
+    let a = alpha_from_params(&oak);
+    let one = L0 * (1.0 - a.min(1.0));
+    let two = L0 * (1.0 - (2.0 * a).min(1.0));
+    assert!(two < one - 1e-9, "precondition two-oak band darker than one");
+
+    let mut one_oak = World::new(1312, light_sand_column());
+    one_oak.set_climate(20.0, 1000.0);
+    one_oak.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    one_oak.plant_taxon(0, 0, "quercus_alba").unwrap();
+    one_oak.tick();
+    let grass_one = one_oak
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .find(|o| o.taxon_id.as_deref() == Some("lolium_perenne"))
+        .unwrap()
+        .last_light
+        .unwrap();
+    assert!((grass_one - one).abs() < 1e-9, "one-oak grass {grass_one} vs {one}");
+
+    let mut two_oaks = World::new(1313, light_sand_column());
+    two_oaks.set_climate(20.0, 1000.0);
+    two_oaks.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    two_oaks.plant_taxon(0, 0, "quercus_alba").unwrap();
+    two_oaks.plant_taxon(0, 0, "quercus_alba").unwrap();
+    two_oaks.tick();
+    let grass_two = two_oaks
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .find(|o| o.taxon_id.as_deref() == Some("lolium_perenne"))
+        .unwrap()
+        .last_light
+        .unwrap();
+    assert!((grass_two - two).abs() < 1e-9, "two-oak grass {grass_two} vs {two}");
+    assert!(
+        grass_two < grass_one - 1e-9,
+        "two oaks must darken grass more than one ({grass_two} vs {grass_one})"
+    );
+}
+
+/// D131: shade / received L independent of plant id / insertion order within a band.
+#[test]
+fn d131_no_id_order_shade() {
+    let mut a = World::new(1314, light_sand_column());
+    a.set_climate(20.0, 1000.0);
+    a.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    a.plant_taxon(0, 0, "quercus_alba").unwrap();
+    a.tick();
+
+    let mut b = World::new(1315, light_sand_column());
+    b.set_climate(20.0, 1000.0);
+    b.plant_taxon(0, 0, "quercus_alba").unwrap();
+    b.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    b.tick();
+
+    fn lights(w: &World) -> (f64, f64) {
+        let mut grass = None;
+        let mut oak = None;
+        for o in &w.column_at(0, 0).occupants {
+            match o.taxon_id.as_deref() {
+                Some("lolium_perenne") => grass = o.last_light,
+                Some("quercus_alba") => oak = o.last_light,
+                _ => {}
+            }
+        }
+        (grass.expect("grass"), oak.expect("oak"))
+    }
+    let (g_a, o_a) = lights(&a);
+    let (g_b, o_b) = lights(&b);
+    assert!((o_a - L0).abs() < 1e-12);
+    assert!((o_b - L0).abs() < 1e-12);
+    assert!((g_a - g_b).abs() < 1e-12, "order must not change grass light");
+    assert!((o_a - o_b).abs() < 1e-12, "order must not change oak light");
+
+    // Two same-band oaks: order of planting must not change either oak's L0.
+    let mut c = World::new(1316, light_sand_column());
+    c.set_climate(20.0, 1000.0);
+    c.plant_taxon(0, 0, "quercus_alba").unwrap();
+    c.plant_taxon(0, 0, "quercus_alba").unwrap();
+    c.tick();
+    let mut d = World::new(1317, light_sand_column());
+    d.set_climate(20.0, 1000.0);
+    // plant grass first then oaks in reverse relative slotting
+    d.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    d.plant_taxon(0, 0, "quercus_alba").unwrap();
+    d.plant_taxon(0, 0, "quercus_alba").unwrap();
+    d.tick();
+    for o in &c.column_at(0, 0).occupants {
+        assert!((o.last_light.unwrap() - L0).abs() < 1e-12);
+    }
+    let oak_a = alpha_from_params(c.catalog().get("quercus_alba").unwrap());
+    let expect_g = L0 * (1.0 - (2.0 * oak_a).min(1.0));
+    let g = d
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .find(|o| o.taxon_id.as_deref() == Some("lolium_perenne"))
+        .unwrap()
+        .last_light
+        .unwrap();
+    assert!((g - expect_g).abs() < 1e-9);
+    for o in &d.column_at(0, 0).occupants {
+        if o.taxon_id.as_deref() == Some("quercus_alba") {
+            assert!((o.last_light.unwrap() - L0).abs() < 1e-12);
+        }
+    }
+}
+
+/// D131: light bands use height/alpha ids — no species-name branching.
+#[test]
+fn d131_no_species_name_match() {
+    let cat = Catalog::load_embedded().expect("embedded catalog");
+    let grass = cat.get("lolium_perenne").expect("lolium_perenne");
+    let oak = cat.get("quercus_alba").expect("quercus_alba");
+    assert_eq!(grass.form, sim_core::Form::Herb);
+    assert_eq!(oak.form, sim_core::Form::Tree);
+    let hg = grass.height_m_mature.unwrap();
+    let ho = oak.height_m_mature.unwrap();
+    assert!(
+        (ho - hg).abs() > H_BAND,
+        "oak and grass must be in different bands for shade tests"
+    );
+    assert!(cat.get("grass").is_err());
+    assert!(cat.get("oak").is_err());
+
+    let lib = include_str!("../src/lib.rs");
+    let catalog = include_str!("../src/catalog.rs");
+    for (label, src) in [("lib.rs", lib), ("catalog.rs", catalog)] {
+        for pat in [
+            r#"== "grass""#,
+            r#"== "oak""#,
+            r#"== "lolium""#,
+            r#"name == "oak""#,
+            "if name ==",
+            "match name",
+        ] {
+            assert!(
+                !src.contains(pat),
+                "{label} contains forbidden species-name pattern: {pat}"
+            );
+        }
+    }
+    assert!(lib.contains("H_BAND"));
+    let _ = (alpha_from_params(grass), alpha_from_params(oak));
 }

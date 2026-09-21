@@ -1,13 +1,13 @@
 # Oracle RUNLOG
 
 ```
-sprint: S13
+sprint: S13.1
 result: green
-branch: feat/s13-height-light
+branch: feat/s13.1-light-bands
 date: 2026-09-20 (PT)
 epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15; H_REST=0.02 m; V_REST=1e-4 m
-constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25; T_SETTLE=64; CHUNK=8; H_POND=0.02; T_WL=7; T_WL_D=3; T_SUB=7; T_DARK=7; L0=1
-invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9 + D91 + D10 + D11 + D12 + D121 + D13
+constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25; T_SETTLE=64; CHUNK=8; H_POND=0.02; T_WL=7; T_WL_D=3; T_SUB=7; T_DARK=7; L0=1; H_BAND=0.05
+invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9 + D91 + D10 + D11 + D12 + D121 + D13 + D131
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -120,6 +120,10 @@ tests:
   - d13_two_herbs_neither_dark
   - d13_et_uses_alpha
   - d13_no_species_name_match
-notes: S13 height-layered light. L0=1; alive occupants tallest-first by effective_height_m; each receives L then casts alpha and transmits L*(1-alpha). Alpha from SLA clamp(0.15,0.85,0.55-0.01*(S-20)) else form herb/shrub/tree 0.25/0.45/0.60. L_min herb/shrub/tree 0.25/0.15/0.08; T_DARK=7 → LightReject::Dark remove. PlantStub without taxon_id → herb alpha 0.25. ET S=clamp(sum alive alphas,0,1). Dead do not cast. Occupant dark_steps+last_light; light_reject query. Deep oak shade for dark-kill uses two quercus_alba so understory L<(1-a)^2 < herb L_min with catalog SLA alphas. No growth/density/seeds/usda_shade/seasonal L0. No species-name match. cargo test --workspace: 111 acceptance + 4 unit green. Cargo.lock left untracked. docs/ untouched.
+  - d131_two_oaks_same_light
+  - d131_two_oaks_darker_grass_than_one
+  - d131_no_id_order_shade
+  - d131_no_species_name_match
+notes: S13.1 same-tile height light bands. H_BAND=0.05; alive occupants clustered by height (tallest-first bands where |Δh| from band top ≤ H_BAND); within band all receive same incoming L then band transmits L*(1-min(1,sum alpha)). Amended d13_two_herbs_neither_dark (two lolium_perenne both L~1); amended d13_grass_dies_in_oak_shade (two oaks same band both L~1, grass 1-min(1,2*alpha)). New d131_*. ET still sums individual alphas. Dead do not cast. No neighbor radius. No growth/density/seeds/usda_shade/seasonal L0. No species-name match. cargo test --workspace: 115 acceptance + 4 unit green. Cargo.lock left untracked. docs/ untouched.
 ```
 
