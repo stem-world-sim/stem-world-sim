@@ -17,7 +17,8 @@
 //! S = clamp(sum alive shade, 0, 1); E_eff = E * (1 - S). PlantStub shade default 0.25.
 //! Occupants: per-cell list ≤ MAX_OCCUPANTS; PlantStub uptake by root mask; wilt at T_WILT.
 //! Catalog: typed OccupantParams from embedded kernel_catalog.csv; root_mask by depth/form.
-//! S12: world climate (T_air_c, rain_year_mm); catalog envelope veto on plant/tick.
+//! S12/S12.1: world climate (T_air_c, rain_year_mm); live plant/tick use T only;
+//! catch_up may still apply rain_year vs EcoCrop. Hydro: waterlog/submerge from drain_ok+height.
 //! catch_up(K, rain): optional source dump; then K blocks of (≤N_ET hydro, 1 unit sink).
 //! catch_up_chunk: same calendar on one chunk + 1-cell halo; other chunks unchanged.
 //! Unique-min-H chute revoked. Capillary stays.
@@ -68,6 +69,18 @@ pub const T_SETTLE: u64 = 64;
 
 /// Chunk edge length in cells (`chunk_id(x,y) = (x/CHUNK, y/CHUNK)`). S09.
 pub const CHUNK: usize = 8;
+
+/// Surface pond depth that counts as waterlogged (metres). S12.1.
+pub const H_POND: f64 = 0.02;
+
+/// Consecutive live ticks of waterlog before remove (default). S12.1.
+pub const T_WL: u32 = 7;
+
+/// Waterlog ticks when `drain_ok` is exactly `"D"` after trim. S12.1.
+pub const T_WL_D: u32 = 3;
+
+/// Consecutive live ticks submerged (h_surf >= height) before remove. S12.1.
+pub const T_SUB: u32 = 7;
 
 /// Soil texture: porosity, field capacity, infiltrate and drain rate limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,6 +141,10 @@ pub struct Occupant {
     pub dry_steps: u32,
     /// Catalog taxon key for S12 climate envelope; None = no climate veto.
     pub taxon_id: Option<String>,
+    /// Consecutive live ticks under waterlog condition. S12.1.
+    pub waterlog_steps: u32,
+    /// Consecutive live ticks with h_surf >= effective height. S12.1.
+    pub submerge_steps: u32,
 }
 
 impl Occupant {
@@ -141,6 +158,8 @@ impl Occupant {
             shade: 0.25,
             dry_steps: 0,
             taxon_id: None,
+            waterlog_steps: 0,
+            submerge_steps: 0,
         }
     }
 
@@ -154,6 +173,8 @@ impl Occupant {
             shade: 0.25,
             dry_steps: 0,
             taxon_id: None,
+            waterlog_steps: 0,
+            submerge_steps: 0,
         }
     }
 }
@@ -173,6 +194,15 @@ pub enum ClimateReject {
     RMax,
 }
 
+/// S12.1 hydro reject reason (waterlog / submerge). Independent of climate_reject.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum HydroReject {
+    #[default]
+    None,
+    Waterlog,
+    Submerged,
+}
+
 /// Error from [`World::plant_taxon`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlantTaxonError {
@@ -181,8 +211,8 @@ pub enum PlantTaxonError {
     Climate(ClimateReject),
 }
 
-/// First matching EcoCrop clause wins; `None` fields do not fire. S12.
-fn climate_envelope_reject(params: &OccupantParams, t_air_c: f64, rain_year_mm: f64) -> ClimateReject {
+/// Live plant/tick: t_min / t_max vs current T_air only. S12.1.
+fn climate_temp_reject(params: &OccupantParams, t_air_c: f64) -> ClimateReject {
     if let Some(t_min) = params.t_min_c {
         if t_air_c < t_min {
             return ClimateReject::TMin;
@@ -193,6 +223,11 @@ fn climate_envelope_reject(params: &OccupantParams, t_air_c: f64, rain_year_mm: 
             return ClimateReject::TMax;
         }
     }
+    ClimateReject::None
+}
+
+/// Catch-up (no irrigation ledger): rain_year vs EcoCrop rain. S12.1.
+fn climate_rain_reject(params: &OccupantParams, rain_year_mm: f64) -> ClimateReject {
     if let Some(r_min) = params.rain_min_mm {
         if rain_year_mm < r_min {
             return ClimateReject::RMin;
@@ -204,6 +239,51 @@ fn climate_envelope_reject(params: &OccupantParams, t_air_c: f64, rain_year_mm: 
         }
     }
     ClimateReject::None
+}
+
+/// Temp then rain; used on catch_up paths. `None` fields do not fire. S12/S12.1.
+fn climate_envelope_reject(params: &OccupantParams, t_air_c: f64, rain_year_mm: f64) -> ClimateReject {
+    let t = climate_temp_reject(params, t_air_c);
+    if t != ClimateReject::None {
+        return t;
+    }
+    climate_rain_reject(params, rain_year_mm)
+}
+
+/// Mature height, or form defaults when catalog height is null. S12.1.
+fn effective_height_m(params: &OccupantParams) -> f64 {
+    if let Some(h) = params.height_m_mature {
+        return h;
+    }
+    match params.form {
+        Form::Herb => 0.4,
+        Form::Shrub => 2.0,
+        Form::Tree => 8.0,
+    }
+}
+
+/// Pond present or top layer at porosity. S12.1.
+fn cell_waterlogged(col: &Column) -> bool {
+    if col.surface_water_m >= H_POND {
+        return true;
+    }
+    if let Some(top) = col.layers.first() {
+        if top.theta >= top.texture.porosity() - MASS_EPSILON {
+            return true;
+        }
+    }
+    false
+}
+
+fn waterlog_limit(drain_ok: Option<&str>) -> u32 {
+    match drain_ok.map(str::trim) {
+        Some("D") => T_WL_D,
+        _ => T_WL,
+    }
+}
+
+fn drain_ok_has_w(drain_ok: Option<&str>) -> bool {
+    drain_ok.map(|s| s.contains('W')).unwrap_or(false)
 }
 
 /// Historical S09 busy signal. S09.1: [`World::ignore_chunk`] always succeeds (never Err).
@@ -625,6 +705,8 @@ pub struct World {
     catalog: Catalog,
     /// Last climate reject reason per cell. S12.
     climate_reject: Vec<ClimateReject>,
+    /// Last hydro reject reason per cell. S12.1.
+    hydro_reject: Vec<HydroReject>,
 }
 
 impl World {
@@ -653,6 +735,7 @@ impl World {
             rain_year_mm: 1000.0,
             catalog: Catalog::load_embedded().expect("embedded kernel catalog"),
             climate_reject: vec![ClimateReject::None],
+            hydro_reject: vec![HydroReject::None],
         }
     }
 
@@ -688,6 +771,7 @@ impl World {
             rain_year_mm: 1000.0,
             catalog: Catalog::load_embedded().expect("embedded kernel catalog"),
             climate_reject: vec![ClimateReject::None; n],
+            hydro_reject: vec![HydroReject::None; n],
         }
     }
 
@@ -918,11 +1002,12 @@ impl World {
                     break;
                 }
                 self.hydro_step_active_ids(&step_ids, Some(&region_set));
+                self.apply_hydro_filter_ids(&step_ids);
             }
             let mut sink_busy: HashSet<usize> = HashSet::new();
             self.et_pass_ids(&mut sink_busy, &region_ids);
             self.occupant_pass_ids(&mut sink_busy, &region_ids);
-            self.apply_climate_filter_ids(&region_ids);
+            self.apply_climate_filter_ids(&region_ids, true);
             self.lake_snap_ids(&region_ids);
             for &i in &region_ids {
                 let is_busy = sink_busy.contains(&i);
@@ -1139,6 +1224,7 @@ impl World {
         }
         col.occupants.push(occ);
         self.climate_reject[i] = ClimateReject::None;
+        self.hydro_reject[i] = HydroReject::None;
         self.wake_idx(i);
         Ok(())
     }
@@ -1182,6 +1268,11 @@ impl World {
         self.climate_reject[self.idx(x, y)]
     }
 
+    /// Last hydro reject reason for cell (x,y). S12.1.
+    pub fn hydro_reject(&self, x: usize, y: usize) -> HydroReject {
+        self.hydro_reject[self.idx(x, y)]
+    }
+
     /// Replace the world's catalog (tests / custom packs). S12.
     pub fn set_catalog(&mut self, catalog: Catalog) {
         self.catalog = catalog;
@@ -1212,8 +1303,7 @@ impl World {
             .map_err(|_| PlantTaxonError::OccupantsFull)
     }
 
-    /// Evaluate catalog envelope for an occupant against current climate.
-    /// Returns Some(reason) if vetoed; None if no taxon / empty fields / in range.
+    /// Live plant path: T_air vs t_min/t_max only (rain_year is not a live kill). S12.1.
     fn climate_veto_for(&self, occ: &Occupant) -> Option<ClimateReject> {
         let Some(ref tid) = occ.taxon_id else {
             return None;
@@ -1221,7 +1311,7 @@ impl World {
         let Ok(params) = self.catalog.get(tid) else {
             return None;
         };
-        let reason = climate_envelope_reject(params, self.t_air_c, self.rain_year_mm);
+        let reason = climate_temp_reject(params, self.t_air_c);
         if reason == ClimateReject::None {
             None
         } else {
@@ -1229,14 +1319,15 @@ impl World {
         }
     }
 
-    /// Apply climate envelope to all alive occupants in `ids`; remove rejects. S12.
-    fn apply_climate_filter_ids(&mut self, ids: &[usize]) {
+    /// Apply climate filter to occupants in `ids`. S12/S12.1.
+    /// `include_rain`: false on live tick (T only); true on catch_up (T + rain_year).
+    fn apply_climate_filter_ids(&mut self, ids: &[usize], include_rain: bool) {
         for &i in ids {
-            self.apply_climate_filter_at(i);
+            self.apply_climate_filter_at(i, include_rain);
         }
     }
 
-    fn apply_climate_filter_at(&mut self, i: usize) {
+    fn apply_climate_filter_at(&mut self, i: usize, include_rain: bool) {
         let t_air = self.t_air_c;
         let rain_year = self.rain_year_mm;
         // Collect reject decisions without holding &mut columns + catalog together.
@@ -1253,7 +1344,11 @@ impl World {
                 let Ok(params) = self.catalog.get(tid) else {
                     continue;
                 };
-                let reason = climate_envelope_reject(params, t_air, rain_year);
+                let reason = if include_rain {
+                    climate_envelope_reject(params, t_air, rain_year)
+                } else {
+                    climate_temp_reject(params, t_air)
+                };
                 if reason != ClimateReject::None {
                     out.push((oi, reason));
                 }
@@ -1274,6 +1369,91 @@ impl World {
         // First hit wins for cell reason; remove all rejecting indices (high→low).
         self.climate_reject[i] = decisions[0].1;
         let mut remove: Vec<usize> = decisions.into_iter().map(|(oi, _)| oi).collect();
+        remove.sort_unstable();
+        remove.dedup();
+        for oi in remove.into_iter().rev() {
+            self.columns[i].occupants.remove(oi);
+        }
+    }
+
+    /// Waterlog / submerge counters on live visit set. S12.1.
+    fn apply_hydro_filter_ids(&mut self, ids: &[usize]) {
+        for &i in ids {
+            self.apply_hydro_filter_at(i);
+        }
+    }
+
+    fn apply_hydro_filter_at(&mut self, i: usize) {
+        let h_surf = self.columns[i].surface_water_m;
+        let waterlogged = cell_waterlogged(&self.columns[i]);
+
+        // Snapshot catalog-derived decisions (avoid borrow clash).
+        #[derive(Clone, Copy)]
+        enum Kill {
+            Waterlog,
+            Submerged,
+        }
+        let mut kills: Vec<(usize, Kill)> = Vec::new();
+        let occ_len = self.columns[i].occupants.len();
+        for oi in 0..occ_len {
+            if !self.columns[i].occupants[oi].alive {
+                continue;
+            }
+            let Some(ref tid) = self.columns[i].occupants[oi].taxon_id.clone() else {
+                continue;
+            };
+            let Ok(params) = self.catalog.get(&tid) else {
+                continue;
+            };
+            let height = effective_height_m(params);
+            let drain = params.drain_ok.as_deref();
+            let immune_wl = drain_ok_has_w(drain);
+            let wl_limit = waterlog_limit(drain);
+
+            // Submerge counter (even W taxa).
+            if h_surf >= height {
+                self.columns[i].occupants[oi].submerge_steps =
+                    self.columns[i].occupants[oi].submerge_steps.saturating_add(1);
+            } else {
+                self.columns[i].occupants[oi].submerge_steps = 0;
+            }
+
+            // Waterlog counter (skip if drain_ok contains W).
+            if immune_wl {
+                self.columns[i].occupants[oi].waterlog_steps = 0;
+            } else if waterlogged {
+                self.columns[i].occupants[oi].waterlog_steps =
+                    self.columns[i].occupants[oi].waterlog_steps.saturating_add(1);
+            } else {
+                self.columns[i].occupants[oi].waterlog_steps = 0;
+            }
+
+            let sub_steps = self.columns[i].occupants[oi].submerge_steps;
+            let wl_steps = self.columns[i].occupants[oi].waterlog_steps;
+            if sub_steps >= T_SUB {
+                kills.push((oi, Kill::Submerged));
+            } else if !immune_wl && wl_steps >= wl_limit {
+                kills.push((oi, Kill::Waterlog));
+            }
+        }
+
+        if kills.is_empty() {
+            let had_taxon = self.columns[i]
+                .occupants
+                .iter()
+                .any(|o| o.alive && o.taxon_id.is_some());
+            if had_taxon {
+                self.hydro_reject[i] = HydroReject::None;
+            }
+            return;
+        }
+
+        // First kill wins for cell reason; remove all (high→low).
+        self.hydro_reject[i] = match kills[0].1 {
+            Kill::Waterlog => HydroReject::Waterlog,
+            Kill::Submerged => HydroReject::Submerged,
+        };
+        let mut remove: Vec<usize> = kills.into_iter().map(|(oi, _)| oi).collect();
         remove.sort_unstable();
         remove.dedup();
         for oi in remove.into_iter().rev() {
@@ -1332,10 +1512,11 @@ impl World {
                 self.prune_awake();
             }
         }
-        // S12: climate envelope after every live tick (visit set).
+        // S12.1: live climate = T only; hydro waterlog/submerge on visit set.
         let climate_ids = self.visit_indices();
         if !climate_ids.is_empty() {
-            self.apply_climate_filter_ids(&climate_ids);
+            self.apply_climate_filter_ids(&climate_ids, false);
+            self.apply_hydro_filter_ids(&climate_ids);
         }
     }
 
@@ -1367,13 +1548,17 @@ impl World {
                     break;
                 }
                 self.hydro_step();
+                let hydro_ids = self.visit_indices();
+                if !hydro_ids.is_empty() {
+                    self.apply_hydro_filter_ids(&hydro_ids);
+                }
             }
             let mut sink_busy = vec![false; n];
             self.et_pass(&mut sink_busy, None);
             self.occupant_pass(&mut sink_busy, None);
-            // S12: climate envelope after sink extract.
+            // S12.1: catch_up climate = T + rain_year.
             let all_ids: Vec<usize> = (0..self.columns.len()).collect();
-            self.apply_climate_filter_ids(&all_ids);
+            self.apply_climate_filter_ids(&all_ids, true);
             self.lake_snap();
             for i in 0..n {
                 self.at_rest[i] = !sink_busy[i];

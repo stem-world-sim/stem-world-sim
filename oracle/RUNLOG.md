@@ -1,13 +1,13 @@
 # Oracle RUNLOG
 
 ```
-sprint: S12
+sprint: S12.1
 result: green
-branch: feat/s12-climate-envelope
-date: 2026-09-19 (PT)
+branch: feat/s12.1-event-hydro
+date: 2026-09-20 (PT)
 epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15; H_REST=0.02 m; V_REST=1e-4 m
-constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25; T_SETTLE=64; CHUNK=8
-invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9 + D91 + D10 + D11 + D12
+constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25; T_SETTLE=64; CHUNK=8; H_POND=0.02; T_WL=7; T_WL_D=3; T_SUB=7
+invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9 + D91 + D10 + D11 + D12 + D121
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -105,5 +105,13 @@ tests:
   - d12_bucket_is_not_climate
   - d12_empty_envelope_no_veto
   - d12_no_species_name_match
-notes: S12 climate envelope filter. World holds t_air_c + rain_year_mm (defaults 20°C / 1000 mm) and embedded Catalog; set_climate / t_air_c / rain_year_mm; add_rain does not flip rain_year_mm. Occupant.taxon_id: Option<String> (None for plant_stub helpers); OccupantParams::to_plant_stub sets Some(taxon_id). plant_taxon + add_occupant + post-tick/catch_up filter: TMin→TMax→RMin→RMax first hit; None fields skip; reject removes occupant (not a mass sink). climate_reject(x,y) → ClimateReject. Demo envelopes via Catalog::get (oryza_sativa / triticum_aestivum) — no species-name physics. cargo test --workspace: 96 acceptance + 4 unit green. Cargo.lock left untracked. docs/ untouched.
+  - d121_plant_rice_in_dry_year_if_warm
+  - d121_rice_dies_when_air_turns_cold
+  - d121_wheat_waterlogs_in_pond
+  - d121_rice_pond_no_waterlog
+  - d121_wheat_submerged_over_height
+  - d121_oak_not_submerged_in_shallow_pond
+  - d121_drought_kills_at_good_rain_year
+  - d121_no_species_name_match
+notes: S12.1 event hydro. Live plant/tick climate = climate_temp_reject (T only); catch_up keeps climate_envelope_reject (T+rain). Amended d12_rice_dies_dry_year (T=22/rain_year=200 rice remains) and d12_bucket_is_not_climate (0.05 m rain leaves rain_year; rice remains). Book B: H_POND/T_WL/T_WL_D/T_SUB; Occupant waterlog_steps+submerge_steps; hydro_reject query; pond or top at φ waterlogs unless drain_ok contains W; submerge even for W; height from catalog or form defaults (herb 0.4 / shrub 2.0 / tree 8.0). Drought stays T_WILT / dry_steps, independent of rain_year. No species-name match. cargo test --workspace: 104 acceptance + 4 unit green. Cargo.lock left untracked. docs/ untouched.
 ```
