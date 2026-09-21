@@ -19,7 +19,7 @@
 //! Catalog: typed OccupantParams from embedded kernel_catalog.csv; root_mask by depth/form.
 //! S12/S12.1: world climate (T_air_c, rain_year_mm); live plant/tick use T only;
 //! catch_up may still apply rain_year vs EcoCrop. Hydro: waterlog/submerge from drain_ok+height.
-//! S13: height-sorted light L0=1; alpha from SLA/form; dark kill T_DARK; ET uses same alpha.
+//! S13/S13.1: height-band light L0=1, H_BAND=0.05; alpha from SLA/form; dark kill T_DARK; ET uses same alpha.
 //! catch_up(K, rain): optional source dump; then K blocks of (≤N_ET hydro, 1 unit sink).
 //! catch_up_chunk: same calendar on one chunk + 1-cell halo; other chunks unchanged.
 //! Unique-min-H chute revoked. Capillary stays.
@@ -88,6 +88,9 @@ pub const T_DARK: u32 = 7;
 
 /// Incident light at canopy top (dimensionless). S13.
 pub const L0: f64 = 1.0;
+
+/// Same-tile height band (metres): occupants with |Δh| ≤ H_BAND share incoming L. S13.1.
+pub const H_BAND: f64 = 0.05;
 
 /// Soil texture: porosity, field capacity, infiltrate and drain rate limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,7 +221,7 @@ pub enum HydroReject {
     Submerged,
 }
 
-/// S13 light reject reason (height-layered dark). Independent of climate/hydro reject.
+/// S13/S13.1 light reject reason (height-band dark). Independent of climate/hydro reject.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum LightReject {
     #[default]
@@ -1545,7 +1548,7 @@ impl World {
         }
     }
 
-    /// Height-layered light filter on live visit set. S13.
+    /// Height-band light filter on live visit set. S13.1.
     fn apply_light_filter_ids(&mut self, ids: &[usize]) {
         for &i in ids {
             self.apply_light_filter_at(i);
@@ -1575,19 +1578,34 @@ impl World {
 
         let mut l = L0;
         let mut kills: Vec<usize> = Vec::new();
-        for &(oi, _h, alpha, l_min) in &rows {
+        let mut idx = 0;
+        while idx < rows.len() {
+            // Band: consecutive (sorted) occupants within H_BAND of the tallest member.
+            let band_top_h = rows[idx].1;
+            let mut end = idx;
+            while end + 1 < rows.len() && band_top_h - rows[end + 1].1 <= H_BAND {
+                end += 1;
+            }
+
+            // All members of the band receive the same incoming L.
             let received = l;
-            self.columns[i].occupants[oi].last_light = Some(received);
-            if received < l_min {
-                self.columns[i].occupants[oi].dark_steps =
-                    self.columns[i].occupants[oi].dark_steps.saturating_add(1);
-            } else {
-                self.columns[i].occupants[oi].dark_steps = 0;
+            let mut sum_alpha = 0.0;
+            for &(oi, _h, alpha, l_min) in &rows[idx..=end] {
+                sum_alpha += alpha;
+                self.columns[i].occupants[oi].last_light = Some(received);
+                if received < l_min {
+                    self.columns[i].occupants[oi].dark_steps =
+                        self.columns[i].occupants[oi].dark_steps.saturating_add(1);
+                } else {
+                    self.columns[i].occupants[oi].dark_steps = 0;
+                }
+                if self.columns[i].occupants[oi].dark_steps >= T_DARK {
+                    kills.push(oi);
+                }
             }
-            if self.columns[i].occupants[oi].dark_steps >= T_DARK {
-                kills.push(oi);
-            }
-            l *= 1.0 - alpha;
+            // Band transmits L * (1 - min(1, sum alpha)); dead already excluded.
+            l *= 1.0 - sum_alpha.min(1.0);
+            idx = end + 1;
         }
 
         if kills.is_empty() {
@@ -1657,7 +1675,7 @@ impl World {
                 self.prune_awake();
             }
         }
-        // S12.1/S13: live climate = T only; hydro + height-layered light on visit set.
+        // S12.1/S13.1: live climate = T only; hydro + height-band light on visit set.
         let climate_ids = self.visit_indices();
         if !climate_ids.is_empty() {
             self.apply_climate_filter_ids(&climate_ids, false);
