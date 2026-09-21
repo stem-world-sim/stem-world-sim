@@ -2,10 +2,8 @@
 
 Do not delete prior names.
 
-## S13.1
-- d131_two_oaks_same_light
-- d131_two_oaks_darker_grass_than_one
-- d131_no_id_order_shade
-- d131_no_species_name_match
-
-Prior d13_* remain. d13_two_herbs_neither_dark = two ryegrass both L~1.
+## S13.2
+- d132_understory_never_zero
+- d132_eight_oaks_hits_cap
+- d132_two_oaks_not_black
+- d132_no_species_name_match
