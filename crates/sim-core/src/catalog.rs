@@ -102,6 +102,7 @@ impl OccupantParams {
         let mut occ = Occupant::plant_stub_with_root(self.root_mask);
         occ.taxon_id = Some(self.taxon_id.clone());
         occ.shade_class = self.shade;
+        occ.drain_ok = self.drain_ok.clone();
         occ.height_frac = 1.0;
         occ
     }

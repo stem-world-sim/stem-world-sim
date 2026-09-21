@@ -1,14 +1,14 @@
 # Oracle RUNLOG
 
 ```
-sprint: S14.1
+sprint: S14.2
 result: green
-branch: feat/s14.1-catchup-growth
+branch: feat/s14.2-drain-fw
 date: 2026-09-21 (PT)
 epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15; H_REST=0.02 m; V_REST=1e-4 m
 constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25; T_SETTLE=64; CHUNK=8; H_POND=0.02; T_WL=7; T_WL_D=3; T_SUB=7; T_DARK=7; L0=1; H_BAND=0.05; T_MIN=0.05; C_MAX=0.85; H0=0.10; T_MATURE herb/shrub/tree=20/80/200; L_opt I|empty=1.00 M=0.60 T=0.35; theta_pwp=0.5*theta_fc
-growth_cadence: once per live tick on visit set, after light filter (uses last_light); catch_up/catch_up_chunk once per calendar block after hydro before sinks (light walk if no L yet; hold last_light; same Δ0·f_L·f_w·f_T; wilted f_w=0)
-invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9 + D91 + D10 + D11 + D12 + D121 + D13 + D131 + D132 + D14 + D141
+growth_cadence: once per live tick on visit set, after light filter (uses last_light); catch_up/catch_up_chunk once per calendar block after hydro before sinks (light walk if no L yet; hold last_light; same Δ0·f_L·f_w·f_T; f_w drain-shaped; wilted f_w=0)
+invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9 + D91 + D10 + D11 + D12 + D121 + D13 + D131 + D132 + D14 + D141 + D142
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -143,5 +143,12 @@ tests:
   - d141_matches_live
   - d141_wilt_block_no_grow
   - d141_ignore_without_catchup_frozen
-notes: S14.1 catch_up advances height_frac. Same Δ0/f_L/f_w/f_T/H0/clamp as S14; one growth step per calendar block on catch_up and catch_up_chunk work set after hydro before sinks; one light walk if any living occupant lacks last_light, then hold for the block; wilted => f_w=0 via existing helpers; ignore without catch_up still freezes height. No second growth model; plant_taxon remains mature; no species if; docs/ untouched. cargo test --workspace: 133 acceptance + 4 unit green. Cargo.lock left untracked.
+  - d142_wetland_beats_mesic_when_ponded
+  - d142_mesic_full_at_fc_no_pond
+  - d142_xeric_slower_at_fc
+  - d142_pond_zeros_xeric_fw
+  - d142_wilt_still_zero
+  - d142_catchup_pond_same_as_live
+  - d142_no_species_name_match
+notes: S14.2 drain_ok shapes f_w. Wilted => 0; s = mean rooted clamp((θ-pwp)/(fc-pwp),0,1); P=1 if h_surf>0; wetland (W not D) s_opt=1 p=1; xeric (D not W) s_opt=0.5 p=0; mesic (else/empty/WMD) s_opt=1 p=0.3; f_soil=clamp(1-|s-s_opt|,0,1); f_w=f_soil*(p if P else 1). Same Δ=Δ0·f_L·f_w·f_T; catch_up uses this f_w; T_WL death unchanged; drain_ok snapshotted on Occupant like shade; no species if; docs/ untouched. cargo test --workspace: 140 acceptance + 4 unit green. Cargo.lock left untracked.
 ```
