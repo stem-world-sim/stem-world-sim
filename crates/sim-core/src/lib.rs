@@ -20,8 +20,9 @@
 //! S12/S12.1: world climate (T_air_c, rain_year_mm); live plant/tick use T only;
 //! catch_up may still apply rain_year vs EcoCrop. Hydro: waterlog/submerge from drain_ok+height.
 //! S13/S13.1/S13.2: height-band light L0=1, H_BAND=0.05; overlap cover T=max(T_MIN,1-min(C_MAX,1-Π(1-α))); dark kill T_DARK; ET same C.
-//! S14: height_frac growth; alpha_eff=α·h²; plant_taxon mature; seedling H0; f_L from shade L_opt; growth once/live tick after light.
-//! catch_up(K, rain): optional source dump; then K blocks of (≤N_ET hydro, 1 unit sink).
+//! S14/S14.1: height_frac growth; alpha_eff=α·h²; plant_taxon mature; seedling H0; f_L from shade L_opt;
+//! growth once/live tick after light; catch_up advances height_frac once per calendar block (same Δ0·f_L·f_w·f_T).
+//! catch_up(K, rain): optional source dump; then K blocks of (≤N_ET hydro, 1 unit sink, light-if-needed, growth).
 //! catch_up_chunk: same calendar on one chunk + 1-cell halo; other chunks unchanged.
 //! Unique-min-H chute revoked. Capillary stays.
 
@@ -1230,6 +1231,8 @@ impl World {
                 self.hydro_step_active_ids(&step_ids, Some(&region_set));
                 self.apply_hydro_filter_ids(&step_ids);
             }
+            // S14.1: after hydro (θ aggregates), before sinks — one light if needed, one growth.
+            self.apply_catchup_light_and_growth(&region_ids);
             let mut sink_busy: HashSet<usize> = HashSet::new();
             self.et_pass_ids(&mut sink_busy, &region_ids);
             self.occupant_pass_ids(&mut sink_busy, &region_ids);
@@ -1834,6 +1837,30 @@ impl World {
         }
     }
 
+    /// True if any living occupant on `ids` still lacks last_light. S14.1.
+    fn work_set_needs_light(&self, ids: &[usize]) -> bool {
+        for &i in ids {
+            for occ in &self.columns[i].occupants {
+                if occ.alive && occ.last_light.is_none() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// One light walk if needed, then one growth step on the work set. S14.1.
+    /// L held for the block via last_light; θ/T from current catch_up aggregates.
+    fn apply_catchup_light_and_growth(&mut self, ids: &[usize]) {
+        if ids.is_empty() {
+            return;
+        }
+        if self.work_set_needs_light(ids) {
+            self.apply_light_filter_ids(ids);
+        }
+        self.apply_growth_ids(ids);
+    }
+
     /// Infiltrate every column (rate-limited); no runoff/drain; advances clock.
     pub fn tick_infiltration(&mut self) {
         self.infiltrate_all();
@@ -1929,11 +1956,13 @@ impl World {
                     self.apply_hydro_filter_ids(&hydro_ids);
                 }
             }
+            // S14.1: after hydro (θ aggregates), before sinks — one light if needed, one growth.
+            let all_ids: Vec<usize> = (0..self.columns.len()).collect();
+            self.apply_catchup_light_and_growth(&all_ids);
             let mut sink_busy = vec![false; n];
             self.et_pass(&mut sink_busy, None);
             self.occupant_pass(&mut sink_busy, None);
             // S12.1: catch_up climate = T + rain_year.
-            let all_ids: Vec<usize> = (0..self.columns.len()).collect();
             self.apply_climate_filter_ids(&all_ids, true);
             self.lake_snap();
             for i in 0..n {

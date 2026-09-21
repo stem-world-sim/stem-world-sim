@@ -4657,3 +4657,136 @@ z_test,z test,Z test,0,shrub,2,0.5,both,15,0,40,0,2000,M,MD,,,\n";
         l_min_for_form(sim_core::Form::Tree),
     );
 }
+
+// --- Sprint 14.1 — catch_up advances height_frac ------------------------------------
+
+/// D141: I pine seedling, wet, in-envelope T, full sun; ignore; catch_up(20); frac > H0.
+#[test]
+fn d141_catchup_grows() {
+    let pinus_i = params_with_shade("pinus_taeda", ShadeClass::Intolerant);
+    let mut world = World::new(14101, light_sand_column());
+    world.set_climate(19.5, 1000.0); // mid-envelope → f_T=1
+    world.plant_params(0, 0, &pinus_i, H0).unwrap();
+    assert!((height_frac_of(&world, 0, 0, "pinus_taeda") - H0).abs() < 1e-15);
+
+    // Keep soil wet across calendar sinks so f_w stays near 1.
+    // force_sleep_all avoids rest_all ticks that would advance growth early.
+    world.force_sleep_all();
+    ignore_all_chunks(&mut world);
+    world.catch_up(20, 0.05);
+
+    let hf = height_frac_of(&world, 0, 0, "pinus_taeda");
+    assert!(
+        hf > H0 + 1e-4,
+        "catch_up must advance height_frac: got {hf} H0={H0}"
+    );
+    assert!(
+        world
+            .column_at(0, 0)
+            .occupants
+            .iter()
+            .any(|o| o.alive && o.taxon_id.as_deref() == Some("pinus_taeda")),
+        "seedling must remain alive after wet catch_up"
+    );
+}
+
+/// D141: A live 20 ticks, B ignore + catch_up(20); |frac_A-frac_B| within d91 tolerance.
+#[test]
+fn d141_matches_live() {
+    let pinus_i = params_with_shade("pinus_taeda", ShadeClass::Intolerant);
+    let tol = 1e-6; // d91_matches_live_100 state tolerance
+
+    let mut live = World::new(14102, light_sand_column());
+    live.set_climate(19.5, 1000.0);
+    live.plant_params(0, 0, &pinus_i, H0).unwrap();
+
+    let mut caught = World::new(14103, light_sand_column());
+    caught.set_climate(19.5, 1000.0);
+    caught.plant_params(0, 0, &pinus_i, H0).unwrap();
+
+    for _ in 0..20u32 {
+        live.add_rain_at(0, 0, 0.05);
+        live.tick();
+    }
+
+    caught.force_sleep_all();
+    ignore_all_chunks(&mut caught);
+    // Same per-step rain dump so f_w≈1 on both paths (growth once per calendar block).
+    caught.catch_up(20, 0.05);
+
+    let hf_a = height_frac_of(&live, 0, 0, "pinus_taeda");
+    let hf_b = height_frac_of(&caught, 0, 0, "pinus_taeda");
+    assert!(
+        (hf_a - hf_b).abs() <= tol,
+        "live vs catch_up height_frac diverge: live={hf_a} caught={hf_b} tol={tol}"
+    );
+    assert!(hf_a > H0 + 1e-4, "precondition: live must have grown, got {hf_a}");
+}
+
+/// D141: dry seedling drought catch_up T_WILT; frac still ~0.10.
+#[test]
+fn d141_wilt_block_no_grow() {
+    let pinus_i = params_with_shade("pinus_taeda", ShadeClass::Intolerant);
+    let dry = {
+        let tex = Texture::Sand;
+        Column::new(
+            0.0,
+            0.0,
+            vec![
+                SoilLayer::new(0.3, 0.0, tex),
+                SoilLayer::new(0.5, 0.0, tex),
+            ],
+        )
+    };
+    let mut world = World::new(14104, dry);
+    world.set_climate(19.5, 1000.0);
+    world.plant_params(0, 0, &pinus_i, H0).unwrap();
+    assert!((height_frac_of(&world, 0, 0, "pinus_taeda") - H0).abs() < 1e-15);
+
+    world.force_sleep_all();
+    ignore_all_chunks(&mut world);
+    world.catch_up(T_WILT, 0.0);
+
+    let hf = height_frac_of(&world, 0, 0, "pinus_taeda");
+    assert!(
+        (hf - H0).abs() < 1e-9,
+        "drought catch_up must not grow: frac={hf} expect ~{H0}"
+    );
+    // Wilted after T_WILT dry sinks (occupant may remain with alive=false).
+    let wilted = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .any(|o| o.taxon_id.as_deref() == Some("pinus_taeda") && !o.alive);
+    let gone = !world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .any(|o| o.taxon_id.as_deref() == Some("pinus_taeda"));
+    assert!(
+        wilted || gone || !world.plant_at(0, 0),
+        "expected wilt after drought catch_up T_WILT"
+    );
+}
+
+/// D141: ignore, no catch_up; frac still ~0.10.
+#[test]
+fn d141_ignore_without_catchup_frozen() {
+    let pinus_i = params_with_shade("pinus_taeda", ShadeClass::Intolerant);
+    let mut world = World::new(14105, light_sand_column());
+    world.set_climate(19.5, 1000.0);
+    world.plant_params(0, 0, &pinus_i, H0).unwrap();
+
+    // force_sleep_all: no ticks (rest_all would advance growth on live visit).
+    world.force_sleep_all();
+    ignore_all_chunks(&mut world);
+    for _ in 0..20u32 {
+        world.tick(); // ignored + asleep → no visit, no growth
+    }
+
+    let hf = height_frac_of(&world, 0, 0, "pinus_taeda");
+    assert!(
+        (hf - H0).abs() < 1e-15,
+        "ignore without catch_up must freeze height: got {hf}"
+    );
+}
