@@ -5,10 +5,10 @@
 //! Grid mass: sum of column M.
 
 use sim_core::{
-    Catalog, ChunkBusy, ClimateReject, Column, HydroReject, Occupant, OccupantParams,
-    PlantTaxonError, SoilLayer, Texture, World, CHUNK, E_OPEN, E_SOIL, H_POND, H_REST,
-    MASS_EPSILON, MAX_OCCUPANTS, N_ET, N_LAYERS, P_MAX, R_MAX, T_SETTLE, T_SUB, T_WILT, T_WL,
-    V_REST,
+    alpha_for_occupant, alpha_from_params, Catalog, ChunkBusy, ClimateReject, Column,
+    HydroReject, LightReject, Occupant, OccupantParams, PlantTaxonError, SoilLayer, Texture,
+    World, CHUNK, E_OPEN, E_SOIL, H_POND, H_REST, L0, MASS_EPSILON, MAX_OCCUPANTS, N_ET,
+    N_LAYERS, P_MAX, R_MAX, T_DARK, T_SETTLE, T_SUB, T_WILT, T_WL, V_REST,
 };
 
 fn assert_mass_close(actual: f64, expected: f64) {
@@ -3650,4 +3650,250 @@ fn d121_no_species_name_match() {
         }
     }
     let _params: &OccupantParams = rice;
+}
+
+// --- Sprint 13 — height-layered light -------------------------------------------------
+
+fn light_sand_column() -> Column {
+    climate_sand_column()
+}
+
+fn alpha_sla(s: f64) -> f64 {
+    (0.55 - 0.01 * (s - 20.0)).clamp(0.15, 0.85)
+}
+
+/// D13: grass alone receives L0=1 and survives well past T_DARK.
+#[test]
+fn d13_grass_alone_full_light() {
+    let mut world = World::new(1301, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    assert!(world.plant_at(0, 0));
+
+    for _ in 0..(T_DARK + 3) {
+        world.tick();
+    }
+    assert!(world.plant_at(0, 0), "grass alone must not dark-kill");
+    assert_eq!(world.light_reject(0, 0), LightReject::None);
+    let occ = &world.column_at(0, 0).occupants[0];
+    assert_eq!(occ.taxon_id.as_deref(), Some("lolium_perenne"));
+    let light = occ.last_light.expect("light pass sets last_light");
+    assert!(
+        (light - L0).abs() < 1e-12,
+        "grass alone must see full L0, got {light}"
+    );
+    assert_eq!(occ.dark_steps, 0);
+}
+
+/// D13: oak over grass reduces grass last_light below L0; oak keeps L0.
+#[test]
+fn d13_oak_over_grass_shades() {
+    let mut world = World::new(1302, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    world.plant_taxon(0, 0, "quercus_alba").unwrap();
+
+    world.tick();
+    let col = world.column_at(0, 0);
+    assert_eq!(col.occupants.len(), 2);
+    let mut grass_l = None;
+    let mut oak_l = None;
+    let mut oak_alpha = None;
+    for o in &col.occupants {
+        match o.taxon_id.as_deref() {
+            Some("lolium_perenne") => grass_l = o.last_light,
+            Some("quercus_alba") => {
+                oak_l = o.last_light;
+                oak_alpha = Some(alpha_for_occupant(world.catalog(), o));
+            }
+            _ => {}
+        }
+    }
+    let grass_l = grass_l.expect("grass light");
+    let oak_l = oak_l.expect("oak light");
+    let oak_alpha = oak_alpha.unwrap();
+    assert!((oak_l - L0).abs() < 1e-12, "oak tallest sees L0, got {oak_l}");
+    let expect = L0 * (1.0 - oak_alpha);
+    assert!(
+        (grass_l - expect).abs() < 1e-9,
+        "grass last_light={grass_l} expect {expect} (oak alpha={oak_alpha})"
+    );
+    assert!(grass_l < L0 - 1e-9, "oak must shade grass");
+    assert!(world.plant_at(0, 0));
+    assert_eq!(world.light_reject(0, 0), LightReject::None);
+}
+
+/// D13: deep oak shade (two oaks) drives grass below herb L_min → Dark remove.
+#[test]
+fn d13_grass_dies_in_oak_shade() {
+    let mut world = World::new(1303, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    // Two oak canopies: L_grass = (1-a)^2 < herb L_min=0.25 with catalog SLA alphas.
+    world.plant_taxon(0, 0, "quercus_alba").unwrap();
+    world.plant_taxon(0, 0, "quercus_alba").unwrap();
+
+    let oak = world.catalog().get("quercus_alba").unwrap();
+    let a = alpha_from_params(oak);
+    let l_grass = L0 * (1.0 - a) * (1.0 - a);
+    assert!(
+        l_grass < 0.25,
+        "precondition: two-oak shade {l_grass} must be < herb L_min"
+    );
+
+    for t in 1..=T_DARK {
+        world.tick();
+        if t < T_DARK {
+            assert!(
+                world.column_at(0, 0)
+                    .occupants
+                    .iter()
+                    .any(|o| o.taxon_id.as_deref() == Some("lolium_perenne")),
+                "grass should remain through tick {t}/{T_DARK}"
+            );
+            assert_eq!(world.light_reject(0, 0), LightReject::None);
+        }
+    }
+    assert!(
+        world
+            .column_at(0, 0)
+            .occupants
+            .iter()
+            .all(|o| o.taxon_id.as_deref() != Some("lolium_perenne")),
+        "grass must be removed after T_DARK under deep oak shade"
+    );
+    assert_eq!(world.light_reject(0, 0), LightReject::Dark);
+    // Oaks remain (tree L_min is low).
+    assert!(
+        world
+            .column_at(0, 0)
+            .occupants
+            .iter()
+            .any(|o| o.taxon_id.as_deref() == Some("quercus_alba")),
+        "oaks should survive their own canopy light"
+    );
+}
+
+/// D13: remove oak canopy → grass stays lit and lives.
+#[test]
+fn d13_remove_oak_grass_lives() {
+    let mut world = World::new(1304, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    world.plant_taxon(0, 0, "quercus_alba").unwrap();
+    world.plant_taxon(0, 0, "quercus_alba").unwrap();
+    // One tick records shade, then clear oaks only.
+    world.tick();
+    let grass = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .find(|o| o.taxon_id.as_deref() == Some("lolium_perenne"))
+        .unwrap()
+        .clone();
+    world.clear_occupants(0, 0);
+    world.add_occupant(0, 0, grass).unwrap();
+
+    for _ in 0..(T_DARK + 3) {
+        world.tick();
+    }
+    assert!(
+        world
+            .column_at(0, 0)
+            .occupants
+            .iter()
+            .any(|o| o.alive && o.taxon_id.as_deref() == Some("lolium_perenne")),
+        "grass lives once oak canopy is removed"
+    );
+    assert_eq!(world.light_reject(0, 0), LightReject::None);
+    let light = world.column_at(0, 0).occupants[0]
+        .last_light
+        .expect("last_light");
+    assert!((light - L0).abs() < 1e-12);
+}
+
+/// D13: two herbs — neither falls below L_min under mutual shade.
+#[test]
+fn d13_two_herbs_neither_dark() {
+    let mut world = World::new(1305, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    // agrostis taller (0.3) than lolium (0.272); second still above herb L_min.
+    world.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    world.plant_taxon(0, 0, "agrostis_stolonifera").unwrap();
+
+    let agro = world.catalog().get("agrostis_stolonifera").unwrap();
+    let a = alpha_from_params(agro);
+    let l_second = L0 * (1.0 - a);
+    assert!(l_second >= 0.25, "precondition second light {l_second}");
+
+    for _ in 0..(T_DARK + 3) {
+        world.tick();
+    }
+    assert_eq!(world.occupant_count(0, 0), 2);
+    assert!(world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .all(|o| o.alive && o.dark_steps == 0));
+    assert_eq!(world.light_reject(0, 0), LightReject::None);
+}
+
+/// D13: ET uses alpha_for (SLA/form), not the shade field alone.
+#[test]
+fn d13_et_uses_alpha() {
+    let h0 = 0.10;
+    let mut world = World::new(1306, saturated_column(0.0, h0));
+    world.set_climate(20.0, 1000.0);
+    // Reach the tick before the first ET without a taxon plant (pond waterlogs
+    // MD herbs after T_WL live ticks). Plant just in time for the ET step.
+    while world.tick_count() + 1 < N_ET {
+        world.tick();
+    }
+    world.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    let grass = world.catalog().get("lolium_perenne").unwrap();
+    let a = alpha_from_params(grass);
+    assert!((a - alpha_sla(grass.sla_m2_kg.unwrap())).abs() < 1e-12);
+    assert!((world.column_at(0, 0).occupants[0].shade - 0.25).abs() < 1e-12);
+    assert!((a - 0.25).abs() > 1e-3, "SLA alpha should differ from shade field");
+
+    let h_before = world.surface_water_m();
+    world.tick(); // N_ET: ET then filters
+    let h1 = world.surface_water_m();
+    let expected = E_OPEN * (1.0 - a.clamp(0.0, 1.0));
+    assert_approx_eq(h_before - h1, expected, "pond ET scaled by SLA alpha");
+    assert_approx_eq(world.et_lost(), expected, "et_lost matches alpha shade");
+}
+
+/// D13: light uses form/SLA/height ids — no species-name branching.
+#[test]
+fn d13_no_species_name_match() {
+    let cat = Catalog::load_embedded().expect("embedded catalog");
+    let grass = cat.get("lolium_perenne").expect("lolium_perenne");
+    let oak = cat.get("quercus_alba").expect("quercus_alba");
+    assert_eq!(grass.form, sim_core::Form::Herb);
+    assert_eq!(oak.form, sim_core::Form::Tree);
+    assert!(grass.sla_m2_kg.is_some());
+    assert_eq!(oak.height_m_mature, Some(20.1));
+    assert!(cat.get("grass").is_err());
+    assert!(cat.get("oak").is_err());
+
+    let lib = include_str!("../src/lib.rs");
+    let catalog = include_str!("../src/catalog.rs");
+    for (label, src) in [("lib.rs", lib), ("catalog.rs", catalog)] {
+        for pat in [
+            r#"== "grass""#,
+            r#"== "oak""#,
+            r#"== "lolium""#,
+            r#"name == "oak""#,
+            "if name ==",
+            "match name",
+        ] {
+            assert!(
+                !src.contains(pat),
+                "{label} contains forbidden species-name pattern: {pat}"
+            );
+        }
+    }
+    let _a = alpha_from_params(grass);
+    let _b = alpha_from_params(oak);
 }
