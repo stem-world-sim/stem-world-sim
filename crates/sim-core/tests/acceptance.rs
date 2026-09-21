@@ -5,10 +5,11 @@
 //! Grid mass: sum of column M.
 
 use sim_core::{
-    alpha_for_occupant, alpha_from_params, Catalog, ChunkBusy, ClimateReject, Column,
-    HydroReject, LightReject, Occupant, OccupantParams, PlantTaxonError, SoilLayer, Texture,
-    World, CHUNK, E_OPEN, E_SOIL, H_BAND, H_POND, H_REST, L0, MASS_EPSILON, MAX_OCCUPANTS,
-    N_ET, N_LAYERS, P_MAX, R_MAX, T_DARK, T_SETTLE, T_SUB, T_WILT, T_WL, V_REST,
+    alpha_for_occupant, alpha_from_params, cover_transmission, overlap_cover_from_alphas,
+    Catalog, ChunkBusy, ClimateReject, Column, HydroReject, LightReject, Occupant,
+    OccupantParams, PlantTaxonError, SoilLayer, Texture, World, CHUNK, C_MAX, E_OPEN, E_SOIL,
+    H_BAND, H_POND, H_REST, L0, MASS_EPSILON, MAX_OCCUPANTS, N_ET, N_LAYERS, P_MAX, R_MAX,
+    T_DARK, T_MIN, T_SETTLE, T_SUB, T_WILT, T_WL, V_REST,
 };
 
 fn assert_mass_close(actual: f64, expected: f64) {
@@ -2005,7 +2006,7 @@ fn d6_cap_eight() {
 
 // ---------------------------------------------------------------------------
 // Sprint 7 — shade scales ET (ε = MASS_EPSILON = 1e-9)
-// S = clamp(sum alive shade, 0, 1); E_eff = E*(1-S). PlantStub shade default 0.25.
+// S13.2: C = min(C_MAX, 1-Π(1-α)); E_eff = E*(1-C). PlantStub alpha 0.25.
 // ---------------------------------------------------------------------------
 
 /// D7: no occupants; one ET-step; pond loss == E_OPEN.
@@ -2047,7 +2048,7 @@ fn d7_one_plant_cuts_pond_et() {
     assert_mass_close(closed_mass(&world), m0);
 }
 
-/// D7: two alive; pond loss == 0.50 * E_OPEN.
+/// D7: two alive; pond loss uses product cover (not sum).
 #[test]
 fn d7_two_sum() {
     let h0 = 0.10;
@@ -2059,13 +2060,17 @@ fn d7_two_sum() {
     tick_through_next_et(&mut world);
 
     let h1 = world.surface_water_m();
-    let expected = 0.50 * E_OPEN;
-    assert_approx_eq(h0 - h1, expected, "two plants pond drop == 0.50*E_OPEN");
-    assert_approx_eq(world.et_lost(), expected, "et_lost == 0.50*E_OPEN");
+    let c = overlap_cover_from_alphas([0.25, 0.25]);
+    assert!((c - 0.4375).abs() < 1e-12);
+    let expected = E_OPEN * (1.0 - c);
+    assert_approx_eq(h0 - h1, expected, "two plants pond drop == E*(1-C) product");
+    assert_approx_eq(world.et_lost(), expected, "et_lost == E*(1-C) product");
+    // Sum form would be 0.50*E_OPEN; product is strictly larger remaining ET.
+    assert!(expected > 0.50 * E_OPEN + 1e-12);
     assert_mass_close(closed_mass(&world), m0);
 }
 
-/// D7: four alive; pond loss == 0 (S capped at 1).
+/// D7: four alive; product cover (not sum-to-1 blackout); uptake still runs.
 #[test]
 fn d7_shade_cap_one() {
     let h0 = 0.10;
@@ -2078,10 +2083,16 @@ fn d7_shade_cap_one() {
     tick_through_next_et(&mut world);
 
     let h1 = world.surface_water_m();
-    assert_approx_eq(h0 - h1, 0.0, "four plants: pond ET fully shaded");
-    assert_approx_eq(world.et_lost(), 0.0, "et_lost == 0 when S=1");
+    let c = overlap_cover_from_alphas([0.25, 0.25, 0.25, 0.25]);
+    // Sum of four 0.25 would clamp to 1 → zero ET; product leaves residual.
+    assert!(c < 1.0 - 1e-9);
+    assert!(c < C_MAX);
+    let expected = E_OPEN * (1.0 - c);
+    assert_approx_eq(h0 - h1, expected, "four plants: E*(1-C) product cover");
+    assert_approx_eq(world.et_lost(), expected, "et_lost matches product cover");
+    assert!(expected > MASS_EPSILON, "product cover must not zero ET at four stubs");
     // Uptake still runs (plants drink soil, not pond).
-    assert!(world.extract_lost() > MASS_EPSILON, "uptake still runs under full shade");
+    assert!(world.extract_lost() > MASS_EPSILON, "uptake still runs under shade");
     assert_mass_close(closed_mass(&world), m0);
 }
 
@@ -3662,6 +3673,12 @@ fn alpha_sla(s: f64) -> f64 {
     (0.55 - 0.01 * (s - 20.0)).clamp(0.15, 0.85)
 }
 
+/// Band / understory light after overlap cover of the given alphas. S13.2.
+fn overlap_transmit(alphas: &[f64]) -> f64 {
+    let c = overlap_cover_from_alphas(alphas.iter().copied());
+    cover_transmission(c)
+}
+
 /// D13: grass alone receives L0=1 and survives well past T_DARK.
 #[test]
 fn d13_grass_alone_full_light() {
@@ -3723,19 +3740,27 @@ fn d13_oak_over_grass_shades() {
     assert_eq!(world.light_reject(0, 0), LightReject::None);
 }
 
-/// D13: deep oak shade (two oaks, same band) drives grass below herb L_min → Dark remove.
+/// D13/S13.2: two-oak overlap cover → grass L≈0.16 (>0, not black) but < herb L_min → Dark.
 #[test]
 fn d13_grass_dies_in_oak_shade() {
     let mut world = World::new(1303, light_sand_column());
     world.set_climate(20.0, 1000.0);
     world.plant_taxon(0, 0, "lolium_perenne").unwrap();
-    // Two oaks same band: both see L0; grass gets L0*(1-min(1,2*alpha)).
+    // Two oaks same band: both see L0; grass gets overlap T (not sum-to-black).
     world.plant_taxon(0, 0, "quercus_alba").unwrap();
     world.plant_taxon(0, 0, "quercus_alba").unwrap();
 
     let oak = world.catalog().get("quercus_alba").unwrap();
     let a = alpha_from_params(oak);
-    let l_grass = L0 * (1.0 - (2.0 * a).min(1.0));
+    let l_grass = L0 * overlap_transmit(&[a, a]);
+    assert!(
+        l_grass > 0.0 + 1e-12,
+        "precondition: overlap cover must leave grass L>0, got {l_grass}"
+    );
+    assert!(
+        (l_grass - 0.16).abs() < 0.02,
+        "precondition: two-oak grass L~0.16, got {l_grass}"
+    );
     assert!(
         l_grass < 0.25,
         "precondition: two-oak band shade {l_grass} must be < herb L_min"
@@ -3759,8 +3784,9 @@ fn d13_grass_dies_in_oak_shade() {
     let grass_l = grass_l.expect("grass light");
     assert!(
         (grass_l - l_grass).abs() < 1e-9,
-        "grass last_light={grass_l} expect band transmit {l_grass}"
+        "grass last_light={grass_l} expect overlap transmit {l_grass}"
     );
+    assert!(grass_l > 0.0, "S13.2: grass L must not be black floor");
 
     for t in 1..=T_DARK {
         if t > 1 {
@@ -3870,7 +3896,7 @@ fn d13_two_herbs_neither_dark() {
     assert_eq!(world.light_reject(0, 0), LightReject::None);
 }
 
-/// D13: ET uses alpha_for (SLA/form), not the shade field alone.
+/// D13/S13.2: ET uses overlap C from alpha_for product form, not sum of alphas / shade field.
 #[test]
 fn d13_et_uses_alpha() {
     let h0 = 0.10;
@@ -3882,18 +3908,32 @@ fn d13_et_uses_alpha() {
         world.tick();
     }
     world.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    world.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
     let grass = world.catalog().get("lolium_perenne").unwrap();
     let a = alpha_from_params(grass);
     assert!((a - alpha_sla(grass.sla_m2_kg.unwrap())).abs() < 1e-12);
+    let stub_a = 0.25;
     assert!((world.column_at(0, 0).occupants[0].shade - 0.25).abs() < 1e-12);
     assert!((a - 0.25).abs() > 1e-3, "SLA alpha should differ from shade field");
+
+    let c = overlap_cover_from_alphas([a, stub_a]);
+    let sum_clamp = (a + stub_a).clamp(0.0, 1.0);
+    assert!(
+        (c - sum_clamp).abs() > 1e-3,
+        "product C must differ from sum clamp so the test distinguishes forms"
+    );
 
     let h_before = world.surface_water_m();
     world.tick(); // N_ET: ET then filters
     let h1 = world.surface_water_m();
-    let expected = E_OPEN * (1.0 - a.clamp(0.0, 1.0));
-    assert_approx_eq(h_before - h1, expected, "pond ET scaled by SLA alpha");
-    assert_approx_eq(world.et_lost(), expected, "et_lost matches alpha shade");
+    let expected = E_OPEN * (1.0 - c);
+    assert_approx_eq(h_before - h1, expected, "pond ET scaled by overlap C (product)");
+    assert_approx_eq(world.et_lost(), expected, "et_lost matches product C");
+    let sum_expected = E_OPEN * (1.0 - sum_clamp);
+    assert!(
+        (world.et_lost() - sum_expected).abs() > 1e-6,
+        "ET must not follow sum-of-alphas shade"
+    );
 }
 
 /// D13: light uses form/SLA/height ids — no species-name branching.
@@ -3953,7 +3993,7 @@ fn d131_two_oaks_same_light() {
     assert!((lights[0] - lights[1]).abs() < 1e-15);
 }
 
-/// D131: two oaks shade grass darker than one oak (band sum alpha).
+/// D131/S13.2: two oaks shade grass darker than one oak (overlap cover, not sum).
 #[test]
 fn d131_two_oaks_darker_grass_than_one() {
     let oak = Catalog::load_embedded()
@@ -3962,9 +4002,10 @@ fn d131_two_oaks_darker_grass_than_one() {
         .unwrap()
         .clone();
     let a = alpha_from_params(&oak);
-    let one = L0 * (1.0 - a.min(1.0));
-    let two = L0 * (1.0 - (2.0 * a).min(1.0));
+    let one = L0 * overlap_transmit(&[a]);
+    let two = L0 * overlap_transmit(&[a, a]);
     assert!(two < one - 1e-9, "precondition two-oak band darker than one");
+    assert!(two > 0.0, "overlap cover leaves residual light");
 
     let mut one_oak = World::new(1312, light_sand_column());
     one_oak.set_climate(20.0, 1000.0);
@@ -4053,7 +4094,7 @@ fn d131_no_id_order_shade() {
         assert!((o.last_light.unwrap() - L0).abs() < 1e-12);
     }
     let oak_a = alpha_from_params(c.catalog().get("quercus_alba").unwrap());
-    let expect_g = L0 * (1.0 - (2.0 * oak_a).min(1.0));
+    let expect_g = L0 * overlap_transmit(&[oak_a, oak_a]);
     let g = d
         .column_at(0, 0)
         .occupants
@@ -4106,4 +4147,182 @@ fn d131_no_species_name_match() {
     }
     assert!(lib.contains("H_BAND"));
     let _ = (alpha_from_params(grass), alpha_from_params(oak));
+}
+
+/// D132: understory light never reaches exact zero (T_MIN / overlap cover floor).
+#[test]
+fn d132_understory_never_zero() {
+    assert!((T_MIN - 0.05).abs() < 1e-15);
+    assert!((C_MAX - 0.85).abs() < 1e-15);
+
+    let mut world = World::new(1321, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    // Fill remaining slots with oaks (MAX_OCCUPANTS=8).
+    for _ in 0..(MAX_OCCUPANTS - 1) {
+        world.plant_taxon(0, 0, "quercus_alba").unwrap();
+    }
+    assert_eq!(world.occupant_count(0, 0), MAX_OCCUPANTS);
+
+    world.tick();
+    let grass_l = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .find(|o| o.taxon_id.as_deref() == Some("lolium_perenne"))
+        .expect("grass present")
+        .last_light
+        .expect("light");
+    assert!(
+        grass_l > 0.0 + 1e-12,
+        "understory must never see exact-zero light, got {grass_l}"
+    );
+    assert!(
+        grass_l + 1e-12 >= L0 * T_MIN,
+        "understory L={grass_l} must respect T_MIN floor relative to L0"
+    );
+}
+
+/// D132: eight same-band oaks hit C_MAX; transmission is 1-C_MAX (not black).
+#[test]
+fn d132_eight_oaks_hits_cap() {
+    let oak = Catalog::load_embedded()
+        .unwrap()
+        .get("quercus_alba")
+        .unwrap()
+        .clone();
+    let a = alpha_from_params(&oak);
+    let alphas: Vec<f64> = vec![a; MAX_OCCUPANTS];
+    let c_raw = {
+        let mut prod = 1.0;
+        for x in &alphas {
+            prod *= 1.0 - *x;
+        }
+        1.0 - prod
+    };
+    assert!(c_raw > C_MAX, "precondition: eight oaks C_raw {c_raw} > C_MAX");
+    let c = overlap_cover_from_alphas(alphas.iter().copied());
+    assert!((c - C_MAX).abs() < 1e-12, "C must cap at C_MAX, got {c}");
+    let t = cover_transmission(c);
+    assert!((t - (1.0 - C_MAX)).abs() < 1e-12);
+    assert!(t > T_MIN - 1e-15);
+
+    let mut world = World::new(1322, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    // Only 7 oaks fit with grass (cap 8); use grass-free cell of 8 oaks + check
+    // transmission via a short understory planted after measuring canopy C on ET,
+    // and a second world with 7 oaks over grass for understory L = L0*T(7).
+    // Cap hit: plant 8 oaks alone and assert ET uses C_MAX.
+    let mut canopy = World::new(1323, saturated_column(0.0, 0.10));
+    canopy.set_climate(20.0, 1000.0);
+    while canopy.tick_count() + 1 < N_ET {
+        canopy.tick();
+    }
+    for _ in 0..MAX_OCCUPANTS {
+        canopy.plant_taxon(0, 0, "quercus_alba").unwrap();
+    }
+    let h_before = canopy.surface_water_m();
+    canopy.tick();
+    let expected_et = E_OPEN * (1.0 - C_MAX);
+    assert_approx_eq(
+        h_before - canopy.surface_water_m(),
+        expected_et,
+        "eight oaks ET uses C_MAX",
+    );
+    assert_approx_eq(canopy.et_lost(), expected_et, "et_lost at C_MAX");
+
+    // Understory with 7 oaks (cell full): L = overlap T of 7 oaks.
+    for _ in 0..(MAX_OCCUPANTS - 1) {
+        world.plant_taxon(0, 0, "quercus_alba").unwrap();
+    }
+    world.tick();
+    let seven: Vec<f64> = vec![a; MAX_OCCUPANTS - 1];
+    let expect_g = L0 * overlap_transmit(&seven);
+    let grass_l = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .find(|o| o.taxon_id.as_deref() == Some("lolium_perenne"))
+        .unwrap()
+        .last_light
+        .unwrap();
+    assert!((grass_l - expect_g).abs() < 1e-9, "seven-oak understory {grass_l} vs {expect_g}");
+    // Eight-oak C is at cap; seven-oak C_raw may or may not exceed C_MAX — still >0.
+    assert!(grass_l > 0.0);
+}
+
+/// D132: two oaks do not black out understory (product residual, not sum-to-1).
+#[test]
+fn d132_two_oaks_not_black() {
+    let oak = Catalog::load_embedded()
+        .unwrap()
+        .get("quercus_alba")
+        .unwrap()
+        .clone();
+    let a = alpha_from_params(&oak);
+    let sum_t = 1.0 - (2.0 * a).min(1.0);
+    let overlap_t = overlap_transmit(&[a, a]);
+    assert!(
+        sum_t <= 1e-12,
+        "precondition: sum form would black out (T={sum_t})"
+    );
+    assert!(
+        overlap_t > 0.1,
+        "precondition: overlap T~0.16, got {overlap_t}"
+    );
+
+    let mut world = World::new(1324, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    world.plant_taxon(0, 0, "quercus_alba").unwrap();
+    world.plant_taxon(0, 0, "quercus_alba").unwrap();
+    world.tick();
+    let grass_l = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .find(|o| o.taxon_id.as_deref() == Some("lolium_perenne"))
+        .unwrap()
+        .last_light
+        .unwrap();
+    assert!((grass_l - L0 * overlap_t).abs() < 1e-9);
+    assert!(grass_l > 0.0 + 1e-12, "two oaks must not black out grass");
+    assert!(grass_l > sum_t + 1e-9, "must exceed sum-form black floor");
+}
+
+/// D132: overlap cover uses form/SLA/height ids — no species-name branching.
+#[test]
+fn d132_no_species_name_match() {
+    let cat = Catalog::load_embedded().expect("embedded catalog");
+    let grass = cat.get("lolium_perenne").expect("lolium_perenne");
+    let oak = cat.get("quercus_alba").expect("quercus_alba");
+    assert_eq!(grass.form, sim_core::Form::Herb);
+    assert_eq!(oak.form, sim_core::Form::Tree);
+    assert!(cat.get("grass").is_err());
+    assert!(cat.get("oak").is_err());
+
+    let lib = include_str!("../src/lib.rs");
+    let catalog = include_str!("../src/catalog.rs");
+    for (label, src) in [("lib.rs", lib), ("catalog.rs", catalog)] {
+        for pat in [
+            r#"== "grass""#,
+            r#"== "oak""#,
+            r#"== "lolium""#,
+            r#"name == "oak""#,
+            "if name ==",
+            "match name",
+        ] {
+            assert!(
+                !src.contains(pat),
+                "{label} contains forbidden species-name pattern: {pat}"
+            );
+        }
+    }
+    assert!(lib.contains("T_MIN"));
+    assert!(lib.contains("C_MAX"));
+    assert!(lib.contains("overlap_cover_from_alphas"));
+    let a = alpha_from_params(oak);
+    let c = overlap_cover_from_alphas([a, a]);
+    let _ = (c, cover_transmission(c), alpha_from_params(grass));
 }
