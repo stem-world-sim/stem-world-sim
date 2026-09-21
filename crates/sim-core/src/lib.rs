@@ -20,7 +20,8 @@
 //! S12/S12.1: world climate (T_air_c, rain_year_mm); live plant/tick use T only;
 //! catch_up may still apply rain_year vs EcoCrop. Hydro: waterlog/submerge from drain_ok+height.
 //! S13/S13.1/S13.2: height-band light L0=1, H_BAND=0.05; overlap cover T=max(T_MIN,1-min(C_MAX,1-Π(1-α))); dark kill T_DARK; ET same C.
-//! S14/S14.1: height_frac growth; alpha_eff=α·h²; plant_taxon mature; seedling H0; f_L from shade L_opt;
+//! S14/S14.1/S14.2: height_frac growth; alpha_eff=α·h²; plant_taxon mature; seedling H0; f_L from shade L_opt;
+//! f_w from rooted s + drain_ok (wetland/xeric/mesic) and pond factor; wilted => 0;
 //! growth once/live tick after light; catch_up advances height_frac once per calendar block (same Δ0·f_L·f_w·f_T).
 //! catch_up(K, rain): optional source dump; then K blocks of (≤N_ET hydro, 1 unit sink, light-if-needed, growth).
 //! catch_up_chunk: same calendar on one chunk + 1-cell halo; other chunks unchanged.
@@ -184,6 +185,8 @@ pub struct Occupant {
     pub height_frac: f64,
     /// USDA shade class snapshotted at plant time. S14.
     pub shade_class: ShadeClass,
+    /// Catalog `drain_ok` snapshotted at plant time (f_w shape + hydro). S14.2.
+    pub drain_ok: Option<String>,
 }
 
 impl Occupant {
@@ -203,6 +206,7 @@ impl Occupant {
             last_light: None,
             height_frac: 1.0,
             shade_class: ShadeClass::Empty,
+            drain_ok: None,
         }
     }
 
@@ -222,6 +226,7 @@ impl Occupant {
             last_light: None,
             height_frac: 1.0,
             shade_class: ShadeClass::Empty,
+            drain_ok: None,
         }
     }
 }
@@ -416,11 +421,26 @@ pub fn f_t_growth(t_air: f64, t_min: Option<f64>, t_max: Option<f64>) -> f64 {
     }
 }
 
-/// Root-weighted soil moisture factor between PWP and FC. Wilted → 0. S14.
-pub fn f_w_growth(col: &Column, occ: &Occupant) -> f64 {
-    if !occ.alive {
-        return 0.0;
+/// (s_opt, pond factor p) from `drain_ok` letters. S14.2.
+///
+/// - wetland: has W not D → s_opt=1, p=1
+/// - xeric: has D not W → s_opt=0.5, p=0
+/// - mesic: else (empty, WMD, …) → s_opt=1, p=0.3
+pub fn drain_fw_params(drain_ok: Option<&str>) -> (f64, f64) {
+    let s = drain_ok.map(str::trim).unwrap_or("");
+    let has_w = s.contains('W');
+    let has_d = s.contains('D');
+    if has_w && !has_d {
+        (1.0, 1.0)
+    } else if has_d && !has_w {
+        (0.5, 0.0)
+    } else {
+        (1.0, 0.3)
     }
+}
+
+/// Mean rooted-layer moisture index s = clamp((θ−pwp)/(fc−pwp), 0, 1). S14/S14.2.
+fn mean_rooted_s(col: &Column, occ: &Occupant) -> f64 {
     let mut wsum = 0.0;
     let mut fsum = 0.0;
     for k in 0..N_LAYERS {
@@ -452,6 +472,21 @@ pub fn f_w_growth(col: &Column, occ: &Occupant) -> f64 {
     } else {
         fsum / wsum
     }
+}
+
+/// Drain-shaped soil moisture factor. Wilted → 0. S14/S14.2.
+///
+/// s = mean rooted clamp((θ−pwp)/(fc−pwp),0,1); P=1 if h_surf>0;
+/// f_soil = clamp(1−|s−s_opt|,0,1); f_w = f_soil · (p if P else 1).
+pub fn f_w_growth(col: &Column, occ: &Occupant) -> f64 {
+    if !occ.alive {
+        return 0.0;
+    }
+    let s = mean_rooted_s(col, occ);
+    let (s_opt, p) = drain_fw_params(occ.drain_ok.as_deref());
+    let f_soil = (1.0 - (s - s_opt).abs()).clamp(0.0, 1.0);
+    let ponded = col.surface_water_m > 0.0;
+    f_soil * if ponded { p } else { 1.0 }
 }
 
 /// Size-scaled canopy alpha: α_eff = α · height_frac². S14.
@@ -1545,8 +1580,8 @@ impl World {
         self.plant_params(x, y, &params, H0)
     }
 
-    /// Plant with explicit OccupantParams and height_frac (test overrides for shade). S14.
-    /// Production plant_taxon / plant_seedling load shade from the catalog row.
+    /// Plant with explicit OccupantParams and height_frac (test overrides for shade/drain). S14/S14.2.
+    /// Production plant_taxon / plant_seedling load shade and drain_ok from the catalog row.
     pub fn plant_params(
         &mut self,
         x: usize,
@@ -1557,6 +1592,7 @@ impl World {
         let mut occ = params.to_plant_stub();
         occ.height_frac = height_frac.clamp(0.0, 1.0);
         occ.shade_class = params.shade;
+        occ.drain_ok = params.drain_ok.clone();
         if let Some(reason) = self.climate_veto_for(&occ) {
             let i = self.idx(x, y);
             self.climate_reject[i] = reason;
@@ -1670,7 +1706,7 @@ impl World {
             };
             let hf = self.columns[i].occupants[oi].height_frac.clamp(0.0, 1.0);
             let height = effective_height_m(params) * hf;
-            let drain = params.drain_ok.as_deref();
+            let drain = self.columns[i].occupants[oi].drain_ok.as_deref();
             let immune_wl = drain_ok_has_w(drain);
             let wl_limit = waterlog_limit(drain);
 

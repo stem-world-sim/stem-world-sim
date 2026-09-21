@@ -5,11 +5,11 @@
 //! Grid mass: sum of column M.
 
 use sim_core::{
-    alpha_for_occupant, alpha_from_params, cover_transmission, delta0_for_form, f_l_growth,
-    f_t_growth, l_min_for_form, l_opt_for_shade, overlap_cover_from_alphas, t_mature_for_form,
-    Catalog, ChunkBusy, ClimateReject, Column, HydroReject, LightReject, Occupant,
-    OccupantParams, PlantTaxonError, ShadeClass, SoilLayer, Texture, World, CHUNK, C_MAX,
-    E_OPEN, E_SOIL, H0, H_BAND, H_POND, H_REST, L0, MASS_EPSILON, MAX_OCCUPANTS, N_ET,
+    alpha_for_occupant, alpha_from_params, cover_transmission, delta0_for_form, drain_fw_params,
+    f_l_growth, f_t_growth, f_w_growth, l_min_for_form, l_opt_for_shade, overlap_cover_from_alphas,
+    t_mature_for_form, Catalog, ChunkBusy, ClimateReject, Column, HydroReject, LightReject,
+    Occupant, OccupantParams, PlantTaxonError, ShadeClass, SoilLayer, Texture, World, CHUNK,
+    C_MAX, E_OPEN, E_SOIL, H0, H_BAND, H_POND, H_REST, L0, MASS_EPSILON, MAX_OCCUPANTS, N_ET,
     N_LAYERS, P_MAX, R_MAX, T_DARK, T_MATURE_HERB, T_MATURE_TREE, T_MIN, T_SETTLE, T_SUB,
     T_WILT, T_WL, V_REST,
 };
@@ -4332,6 +4332,8 @@ fn d132_no_species_name_match() {
 // --- Sprint 14 — growth clock ---------------------------------------------------------
 
 /// Clone catalog row with an explicit shade class (demo CSV has no shade column).
+/// Sets drain_ok=W so rain/pond used to keep θ wet does not apply the mesic pond factor
+/// (isolates f_L / f_T / catch_up cadence under test). S14/S14.2.
 fn params_with_shade(taxon_id: &str, shade: ShadeClass) -> OccupantParams {
     let mut p = Catalog::load_embedded()
         .expect("embedded catalog")
@@ -4339,6 +4341,7 @@ fn params_with_shade(taxon_id: &str, shade: ShadeClass) -> OccupantParams {
         .unwrap_or_else(|_| panic!("missing {taxon_id}"))
         .clone();
     p.shade = shade;
+    p.drain_ok = Some("W".to_string());
     p
 }
 
@@ -4789,4 +4792,255 @@ fn d141_ignore_without_catchup_frozen() {
         (hf - H0).abs() < 1e-15,
         "ignore without catch_up must freeze height: got {hf}"
     );
+}
+
+// --- Sprint 14.2 — drainage shapes f_w ------------------------------------------------
+
+/// Clone catalog row with shade + drain_ok overrides (no English-name branching).
+fn params_with_shade_drain(
+    taxon_id: &str,
+    shade: ShadeClass,
+    drain_ok: Option<&str>,
+) -> OccupantParams {
+    let mut p = Catalog::load_embedded()
+        .expect("embedded catalog")
+        .get(taxon_id)
+        .unwrap_or_else(|_| panic!("missing {taxon_id}"))
+        .clone();
+    p.shade = shade;
+    p.drain_ok = drain_ok.map(|s| s.to_string());
+    p
+}
+
+/// Saturated pores + pond so infiltrate cannot drink the surface (P stays 1).
+fn sat_column_with_pond(h_surf: f64) -> Column {
+    let tex = Texture::Sand;
+    let phi = tex.porosity();
+    Column::new(
+        0.0,
+        h_surf,
+        vec![
+            SoilLayer::new(0.3, phi, tex),
+            SoilLayer::new(0.5, phi, tex),
+        ],
+    )
+}
+
+/// D142: wetland (W) grows faster than mesic when ponded at FC.
+#[test]
+fn d142_wetland_beats_mesic_when_ponded() {
+    let wet = params_with_shade_drain("pinus_taeda", ShadeClass::Intolerant, Some("W"));
+    let mes = params_with_shade_drain("pinus_taeda", ShadeClass::Intolerant, Some("WMD"));
+    let (s_w, p_w) = drain_fw_params(Some("W"));
+    let (s_m, p_m) = drain_fw_params(Some("WMD"));
+    assert!((s_w - 1.0).abs() < 1e-15 && (p_w - 1.0).abs() < 1e-15);
+    assert!((s_m - 1.0).abs() < 1e-15 && (p_m - 0.3).abs() < 1e-15);
+
+    let mut w_wet = World::new(14201, sat_column_with_pond(0.05));
+    w_wet.set_climate(19.5, 1000.0);
+    w_wet.plant_params(0, 0, &wet, H0).unwrap();
+
+    let mut w_mes = World::new(14202, sat_column_with_pond(0.05));
+    w_mes.set_climate(19.5, 1000.0);
+    w_mes.plant_params(0, 0, &mes, H0).unwrap();
+
+    // Spot-check f_w before ticks: wetland 1, mesic 0.3 at FC+pond.
+    let fw_w = f_w_growth(w_wet.column_at(0, 0), &w_wet.column_at(0, 0).occupants[0]);
+    let fw_m = f_w_growth(w_mes.column_at(0, 0), &w_mes.column_at(0, 0).occupants[0]);
+    assert!((fw_w - 1.0).abs() < 1e-9, "wetland f_w={fw_w}");
+    assert!((fw_m - 0.3).abs() < 1e-9, "mesic ponded f_w={fw_m}");
+
+    for _ in 0..5u32 {
+        // Keep a pond so P stays 1 (infiltrate won't drink pores already at FC).
+        if w_wet.column_at(0, 0).surface_water_m <= 0.0 {
+            w_wet.add_rain_at(0, 0, 0.05);
+        }
+        if w_mes.column_at(0, 0).surface_water_m <= 0.0 {
+            w_mes.add_rain_at(0, 0, 0.05);
+        }
+        w_wet.tick();
+        w_mes.tick();
+    }
+    let hf_w = height_frac_of(&w_wet, 0, 0, "pinus_taeda");
+    let hf_m = height_frac_of(&w_mes, 0, 0, "pinus_taeda");
+    assert!(
+        hf_w > hf_m + 1e-4,
+        "wetland ponded={hf_w} must beat mesic ponded={hf_m}"
+    );
+}
+
+/// D142: mesic at FC with no pond has f_w = 1.
+#[test]
+fn d142_mesic_full_at_fc_no_pond() {
+    let mes = params_with_shade_drain("pinus_taeda", ShadeClass::Intolerant, Some("WMD"));
+    let mut world = World::new(14203, light_sand_column()); // FC, h_surf=0
+    world.set_climate(19.5, 1000.0);
+    world.plant_params(0, 0, &mes, H0).unwrap();
+    let col = world.column_at(0, 0);
+    assert!(col.surface_water_m <= 0.0);
+    let fw = f_w_growth(col, &col.occupants[0]);
+    assert!((fw - 1.0).abs() < 1e-9, "mesic at FC no pond f_w={fw}");
+    // Empty drain_ok is also mesic.
+    let empty = params_with_shade_drain("pinus_taeda", ShadeClass::Intolerant, None);
+    let mut w2 = World::new(14204, light_sand_column());
+    w2.set_climate(19.5, 1000.0);
+    w2.plant_params(0, 0, &empty, H0).unwrap();
+    let fw2 = f_w_growth(w2.column_at(0, 0), &w2.column_at(0, 0).occupants[0]);
+    assert!((fw2 - 1.0).abs() < 1e-9, "empty drain_ok mesic f_w={fw2}");
+}
+
+/// D142: xeric at FC (no pond) has f_w = 0.5 — slower than mesic.
+#[test]
+fn d142_xeric_slower_at_fc() {
+    let xer = params_with_shade_drain("pinus_taeda", ShadeClass::Intolerant, Some("D"));
+    let mes = params_with_shade_drain("pinus_taeda", ShadeClass::Intolerant, Some("WMD"));
+    let (s_x, p_x) = drain_fw_params(Some("D"));
+    assert!((s_x - 0.5).abs() < 1e-15 && p_x.abs() < 1e-15);
+    // MD (has D not W) is also xeric.
+    let (s_md, _) = drain_fw_params(Some("MD"));
+    assert!((s_md - 0.5).abs() < 1e-15);
+
+    let mut w_x = World::new(14205, light_sand_column());
+    w_x.set_climate(19.5, 1000.0);
+    w_x.plant_params(0, 0, &xer, H0).unwrap();
+    let mut w_m = World::new(14206, light_sand_column());
+    w_m.set_climate(19.5, 1000.0);
+    w_m.plant_params(0, 0, &mes, H0).unwrap();
+
+    let fw_x = f_w_growth(w_x.column_at(0, 0), &w_x.column_at(0, 0).occupants[0]);
+    let fw_m = f_w_growth(w_m.column_at(0, 0), &w_m.column_at(0, 0).occupants[0]);
+    assert!((fw_x - 0.5).abs() < 1e-9, "xeric at FC f_w={fw_x}");
+    assert!((fw_m - 1.0).abs() < 1e-9, "mesic at FC f_w={fw_m}");
+
+    // No rain: stay at FC, h_surf=0 so P=0; both share the same θ path.
+    for _ in 0..10u32 {
+        w_x.tick();
+        w_m.tick();
+    }
+    let hf_x = height_frac_of(&w_x, 0, 0, "pinus_taeda");
+    let hf_m = height_frac_of(&w_m, 0, 0, "pinus_taeda");
+    assert!(
+        hf_m > hf_x + 1e-4,
+        "mesic={hf_m} must beat xeric={hf_x} at FC"
+    );
+}
+
+/// D142: pond zeros xeric f_w (p=0).
+#[test]
+fn d142_pond_zeros_xeric_fw() {
+    let xer = params_with_shade_drain("pinus_taeda", ShadeClass::Intolerant, Some("MD"));
+    let mut world = World::new(14207, sat_column_with_pond(0.05));
+    world.set_climate(19.5, 1000.0);
+    world.plant_params(0, 0, &xer, H0).unwrap();
+    assert!(world.column_at(0, 0).surface_water_m > 0.0);
+    let fw = f_w_growth(world.column_at(0, 0), &world.column_at(0, 0).occupants[0]);
+    assert!(fw.abs() < 1e-15, "ponded xeric f_w must be 0, got {fw}");
+
+    let hf0 = height_frac_of(&world, 0, 0, "pinus_taeda");
+    for _ in 0..3u32 {
+        // Stay under T_WL so plant remains; top up pond (ET may skim surface).
+        if world.column_at(0, 0).surface_water_m <= 0.0 {
+            world.add_rain_at(0, 0, 0.05);
+        }
+        world.tick();
+        assert!(
+            world.column_at(0, 0).surface_water_m > 0.0
+                || f_w_growth(world.column_at(0, 0), &world.column_at(0, 0).occupants[0]).abs()
+                    < 1e-15,
+            "expected pond or zero f_w during xeric pond test"
+        );
+    }
+    let hf1 = height_frac_of(&world, 0, 0, "pinus_taeda");
+    assert!(
+        (hf1 - hf0).abs() < 1e-15,
+        "ponded xeric must not grow: {hf0} -> {hf1}"
+    );
+}
+
+/// D142: wilted still forces f_w = 0 (even wetland + FC + pond).
+#[test]
+fn d142_wilt_still_zero() {
+    let wet = params_with_shade_drain("pinus_taeda", ShadeClass::Intolerant, Some("W"));
+    let mut world = World::new(14208, sat_column_with_pond(0.05));
+    world.set_climate(19.5, 1000.0);
+    world.plant_params(0, 0, &wet, H0).unwrap();
+    world.column_at_mut(0, 0).occupants[0].alive = false;
+    let fw = f_w_growth(world.column_at(0, 0), &world.column_at(0, 0).occupants[0]);
+    assert!(fw.abs() < 1e-15, "wilted f_w must be 0, got {fw}");
+}
+
+/// D142: catch_up with pond matches live growth under same drain_ok shape.
+#[test]
+fn d142_catchup_pond_same_as_live() {
+    let wet = params_with_shade_drain("pinus_taeda", ShadeClass::Intolerant, Some("W"));
+    let tol = 1e-6;
+
+    let mut live = World::new(14209, sat_column_with_pond(0.05));
+    live.set_climate(19.5, 1000.0);
+    live.plant_params(0, 0, &wet, H0).unwrap();
+
+    let mut caught = World::new(14210, sat_column_with_pond(0.05));
+    caught.set_climate(19.5, 1000.0);
+    caught.plant_params(0, 0, &wet, H0).unwrap();
+
+    for _ in 0..10u32 {
+        live.add_rain_at(0, 0, 0.05);
+        live.tick();
+    }
+
+    caught.force_sleep_all();
+    ignore_all_chunks(&mut caught);
+    // Same per-step rain; wetland p=1 so pond does not penalize f_w.
+    caught.catch_up(10, 0.05);
+
+    let hf_a = height_frac_of(&live, 0, 0, "pinus_taeda");
+    let hf_b = height_frac_of(&caught, 0, 0, "pinus_taeda");
+    assert!(
+        (hf_a - hf_b).abs() <= tol,
+        "live vs catch_up pond diverge: live={hf_a} caught={hf_b}"
+    );
+    assert!(hf_a > H0 + 1e-4, "precondition: must have grown, got {hf_a}");
+}
+
+/// D142: no species-name branching; drain_ok letters drive f_w.
+#[test]
+fn d142_no_species_name_match() {
+    // Letter classes (including WMD → mesic).
+    for (label, got, exp) in [
+        ("W", drain_fw_params(Some("W")), (1.0, 1.0)),
+        ("D", drain_fw_params(Some("D")), (0.5, 0.0)),
+        ("MD", drain_fw_params(Some("MD")), (0.5, 0.0)),
+        ("WMD", drain_fw_params(Some("WMD")), (1.0, 0.3)),
+        ("empty", drain_fw_params(Some("")), (1.0, 0.3)),
+        ("None", drain_fw_params(None), (1.0, 0.3)),
+    ] {
+        assert!(
+            (got.0 - exp.0).abs() < 1e-15 && (got.1 - exp.1).abs() < 1e-15,
+            "{label}: got {got:?} expect {exp:?}"
+        );
+    }
+
+    let lib = include_str!("../src/lib.rs");
+    let catalog = include_str!("../src/catalog.rs");
+    for (label, src) in [("lib.rs", lib), ("catalog.rs", catalog)] {
+        for pat in [
+            r#"== "grass""#,
+            r#"== "oak""#,
+            r#"== "pinus""#,
+            r#"== "ryegrass""#,
+            r#"== "lolium""#,
+            r#"== "rice""#,
+            r#"== "wheat""#,
+            "if name ==",
+            "match name",
+        ] {
+            assert!(
+                !src.contains(pat),
+                "{label} contains forbidden species-name pattern: {pat}"
+            );
+        }
+    }
+    assert!(lib.contains("drain_fw_params"));
+    assert!(lib.contains("f_w_growth"));
+    assert!(lib.contains("mean_rooted_s") || lib.contains("f_soil"));
 }
