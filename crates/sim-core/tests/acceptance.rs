@@ -5,11 +5,13 @@
 //! Grid mass: sum of column M.
 
 use sim_core::{
-    alpha_for_occupant, alpha_from_params, cover_transmission, overlap_cover_from_alphas,
+    alpha_for_occupant, alpha_from_params, cover_transmission, delta0_for_form, f_l_growth,
+    f_t_growth, l_min_for_form, l_opt_for_shade, overlap_cover_from_alphas, t_mature_for_form,
     Catalog, ChunkBusy, ClimateReject, Column, HydroReject, LightReject, Occupant,
-    OccupantParams, PlantTaxonError, SoilLayer, Texture, World, CHUNK, C_MAX, E_OPEN, E_SOIL,
-    H_BAND, H_POND, H_REST, L0, MASS_EPSILON, MAX_OCCUPANTS, N_ET, N_LAYERS, P_MAX, R_MAX,
-    T_DARK, T_MIN, T_SETTLE, T_SUB, T_WILT, T_WL, V_REST,
+    OccupantParams, PlantTaxonError, ShadeClass, SoilLayer, Texture, World, CHUNK, C_MAX,
+    E_OPEN, E_SOIL, H0, H_BAND, H_POND, H_REST, L0, MASS_EPSILON, MAX_OCCUPANTS, N_ET,
+    N_LAYERS, P_MAX, R_MAX, T_DARK, T_MATURE_HERB, T_MATURE_TREE, T_MIN, T_SETTLE, T_SUB,
+    T_WILT, T_WL, V_REST,
 };
 
 fn assert_mass_close(actual: f64, expected: f64) {
@@ -4325,4 +4327,333 @@ fn d132_no_species_name_match() {
     let a = alpha_from_params(oak);
     let c = overlap_cover_from_alphas([a, a]);
     let _ = (c, cover_transmission(c), alpha_from_params(grass));
+}
+
+// --- Sprint 14 — growth clock ---------------------------------------------------------
+
+/// Clone catalog row with an explicit shade class (demo CSV has no shade column).
+fn params_with_shade(taxon_id: &str, shade: ShadeClass) -> OccupantParams {
+    let mut p = Catalog::load_embedded()
+        .expect("embedded catalog")
+        .get(taxon_id)
+        .unwrap_or_else(|_| panic!("missing {taxon_id}"))
+        .clone();
+    p.shade = shade;
+    p
+}
+
+fn height_frac_of(world: &World, x: usize, y: usize, taxon_id: &str) -> f64 {
+    world
+        .column_at(x, y)
+        .occupants
+        .iter()
+        .find(|o| o.taxon_id.as_deref() == Some(taxon_id))
+        .expect("occupant")
+        .height_frac
+}
+
+/// D14: plant_taxon installs mature plants (height_frac = 1).
+#[test]
+fn d14_plant_taxon_is_mature() {
+    let mut world = World::new(1401, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "quercus_alba").unwrap();
+    world.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    for o in &world.column_at(0, 0).occupants {
+        assert!(
+            (o.height_frac - 1.0).abs() < 1e-15,
+            "plant_taxon must be mature, got {}",
+            o.height_frac
+        );
+    }
+    // After many ticks mature stays capped at 1.
+    for _ in 0..30 {
+        world.tick();
+    }
+    for o in &world.column_at(0, 0).occupants {
+        assert!((o.height_frac - 1.0).abs() < 1e-12);
+    }
+}
+
+/// D14: seedling API starts at H0=0.10.
+#[test]
+fn d14_seedling_starts_short() {
+    assert!((H0 - 0.10).abs() < 1e-15);
+    let mut world = World::new(1402, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_seedling(0, 0, "quercus_alba").unwrap();
+    let hf = height_frac_of(&world, 0, 0, "quercus_alba");
+    assert!((hf - H0).abs() < 1e-15, "seedling height_frac={hf} expect H0={H0}");
+}
+
+/// D14: seedling oak shades little — grass under it survives past T_DARK.
+#[test]
+fn d14_seedling_oak_grass_lives() {
+    let mut world = World::new(1403, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    world.plant_seedling(0, 0, "quercus_alba").unwrap();
+
+    world.tick();
+    let grass_l = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .find(|o| o.taxon_id.as_deref() == Some("lolium_perenne"))
+        .unwrap()
+        .last_light
+        .unwrap();
+    let oak = world.catalog().get("quercus_alba").unwrap();
+    let a_eff = alpha_from_params(oak) * H0 * H0;
+    let expect = L0 * cover_transmission(overlap_cover_from_alphas([a_eff]));
+    assert!(
+        (grass_l - expect).abs() < 1e-9,
+        "grass L={grass_l} expect {expect} under seedling oak"
+    );
+    assert!(grass_l > 0.25, "seedling oak must leave grass above herb L_min");
+
+    for _ in 0..(T_DARK + 3) {
+        world.tick();
+    }
+    assert!(
+        world
+            .column_at(0, 0)
+            .occupants
+            .iter()
+            .any(|o| o.alive && o.taxon_id.as_deref() == Some("lolium_perenne")),
+        "grass must live under seedling oak"
+    );
+    assert_eq!(world.light_reject(0, 0), LightReject::None);
+}
+
+/// D14: intolerant (I) grows faster in full sun than under one mature oak.
+#[test]
+fn d14_intolerant_prefers_sun() {
+    let pinus_i = params_with_shade("pinus_taeda", ShadeClass::Intolerant);
+    assert!((l_opt_for_shade(ShadeClass::Intolerant) - 1.00).abs() < 1e-15);
+
+    // Full sun seedling.
+    let mut sun = World::new(1404, light_sand_column());
+    sun.set_climate(19.5, 1000.0); // pinus mid-envelope → f_T=1
+    sun.plant_params(0, 0, &pinus_i, H0).unwrap();
+
+    // Under mature oak.
+    let mut shade = World::new(1405, light_sand_column());
+    shade.set_climate(19.5, 1000.0);
+    shade.plant_taxon(0, 0, "quercus_alba").unwrap();
+    shade.plant_params(0, 0, &pinus_i, H0).unwrap();
+
+    let steps = 40u32;
+    for _ in 0..steps {
+        sun.tick();
+        shade.tick();
+    }
+    let hf_sun = height_frac_of(&sun, 0, 0, "pinus_taeda");
+    let hf_shade = height_frac_of(&shade, 0, 0, "pinus_taeda");
+    assert!(
+        hf_sun > hf_shade + 1e-4,
+        "intolerant sun={hf_sun} must beat shade={hf_shade}"
+    );
+    // f_L sun = 1; under oak L≈0.40 → f_L≈0.40 for I.
+    assert!(hf_sun > H0 + 1e-4, "sun seedling must grow");
+}
+
+/// D14: tolerant (T) under one oak (gap light) grows faster than the same T in full sun.
+#[test]
+fn d14_tolerant_prefers_gap() {
+    let rye_t = params_with_shade("lolium_perenne", ShadeClass::Tolerant);
+    assert!((l_opt_for_shade(ShadeClass::Tolerant) - 0.35).abs() < 1e-15);
+
+    let mut gap = World::new(1406, light_sand_column());
+    gap.set_climate(19.5, 1000.0);
+    gap.plant_taxon(0, 0, "quercus_alba").unwrap(); // mature canopy
+    gap.plant_params(0, 0, &rye_t, H0).unwrap();
+
+    let mut sun = World::new(1407, light_sand_column());
+    sun.set_climate(19.5, 1000.0);
+    sun.plant_params(0, 0, &rye_t, H0).unwrap();
+
+    let steps = 15u32;
+    for _ in 0..steps {
+        gap.tick();
+        sun.tick();
+    }
+    let hf_gap = height_frac_of(&gap, 0, 0, "lolium_perenne");
+    let hf_sun = height_frac_of(&sun, 0, 0, "lolium_perenne");
+    assert!(
+        hf_gap > hf_sun + 1e-4,
+        "tolerant gap={hf_gap} must beat full sun={hf_sun}"
+    );
+}
+
+/// D14: intolerant seedling in good conditions reaches mature after T_MATURE tree steps.
+#[test]
+fn d14_grown_intolerant_reaches_mature() {
+    let pinus_i = params_with_shade("pinus_taeda", ShadeClass::Intolerant);
+    let mut world = World::new(1408, light_sand_column());
+    // Midpoint of pinus [10,29] → f_T = 1.
+    world.set_climate(19.5, 1000.0);
+    world.plant_params(0, 0, &pinus_i, H0).unwrap();
+
+    assert!((t_mature_for_form(sim_core::Form::Tree) - T_MATURE_TREE).abs() < 1e-15);
+    let n = T_MATURE_TREE as u32;
+    for _ in 0..n {
+        // Keep θ near FC so f_w≈1 and uptake prevents wilt (dry_steps).
+        world.add_rain_at(0, 0, 0.02);
+        world.tick();
+    }
+    let hf = height_frac_of(&world, 0, 0, "pinus_taeda");
+    assert!(
+        (hf - 1.0).abs() < 1e-6,
+        "after {n} optimal growth steps expect mature, got {hf}"
+    );
+    assert!(
+        world
+            .column_at(0, 0)
+            .occupants
+            .iter()
+            .any(|o| o.alive && o.taxon_id.as_deref() == Some("pinus_taeda")),
+        "intolerant must remain alive while growing to mature"
+    );
+}
+
+/// D14: mature oak (plant_taxon) still shades grass like S13.
+#[test]
+fn d14_mature_oak_still_shades() {
+    let mut world = World::new(1409, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    world.plant_taxon(0, 0, "quercus_alba").unwrap();
+    world.tick();
+
+    let mut grass_l = None;
+    let mut oak_alpha = None;
+    for o in &world.column_at(0, 0).occupants {
+        match o.taxon_id.as_deref() {
+            Some("lolium_perenne") => grass_l = o.last_light,
+            Some("quercus_alba") => {
+                assert!((o.height_frac - 1.0).abs() < 1e-15);
+                oak_alpha = Some(alpha_for_occupant(world.catalog(), o));
+            }
+            _ => {}
+        }
+    }
+    let grass_l = grass_l.expect("grass");
+    let oak_alpha = oak_alpha.unwrap();
+    let expect = L0 * cover_transmission(overlap_cover_from_alphas([oak_alpha]));
+    assert!(
+        (grass_l - expect).abs() < 1e-9,
+        "mature oak must shade grass: got {grass_l} expect {expect}"
+    );
+    assert!(grass_l < L0 - 0.1, "mature oak shade must be substantial");
+}
+
+/// D14: wilted occupant does not grow (f_w = 0).
+#[test]
+fn d14_wilt_stops_growth() {
+    let mut world = World::new(1410, light_sand_column());
+    world.set_climate(19.5, 1000.0);
+    world.plant_seedling(0, 0, "lolium_perenne").unwrap();
+    // Force wilt without waiting for dry sinks.
+    world.column_at_mut(0, 0).occupants[0].alive = false;
+    let hf0 = world.column_at(0, 0).occupants[0].height_frac;
+    for _ in 0..20 {
+        world.tick();
+    }
+    // Wilted may still be present; height must not advance.
+    let col = world.column_at(0, 0);
+    if let Some(o) = col
+        .occupants
+        .iter()
+        .find(|o| o.taxon_id.as_deref() == Some("lolium_perenne"))
+    {
+        assert!(
+            (o.height_frac - hf0).abs() < 1e-15,
+            "wilted must not grow: {} vs {}",
+            o.height_frac,
+            hf0
+        );
+    }
+}
+
+/// D14: cool air (below mid-envelope) yields slower growth than optimal T.
+#[test]
+fn d14_cool_grows_slower_than_opt() {
+    let rye = Catalog::load_embedded()
+        .unwrap()
+        .get("lolium_perenne")
+        .unwrap()
+        .clone();
+    // lolium [4, 35], mid=19.5
+    assert!((f_t_growth(19.5, rye.t_min_c, rye.t_max_c) - 1.0).abs() < 1e-12);
+    let f_cool = f_t_growth(8.0, rye.t_min_c, rye.t_max_c);
+    assert!(f_cool > 0.0 && f_cool < 1.0 - 1e-6, "cool f_T={f_cool}");
+
+    let mut opt = World::new(1411, light_sand_column());
+    opt.set_climate(19.5, 1000.0);
+    opt.plant_seedling(0, 0, "lolium_perenne").unwrap();
+
+    let mut cool = World::new(1412, light_sand_column());
+    cool.set_climate(8.0, 1000.0);
+    cool.plant_seedling(0, 0, "lolium_perenne").unwrap();
+
+    for _ in 0..12 {
+        opt.tick();
+        cool.tick();
+    }
+    let hf_opt = height_frac_of(&opt, 0, 0, "lolium_perenne");
+    let hf_cool = height_frac_of(&cool, 0, 0, "lolium_perenne");
+    assert!(
+        hf_opt > hf_cool + 1e-4,
+        "opt={hf_opt} must grow faster than cool={hf_cool}"
+    );
+}
+
+/// D14: no species-name branching for shade/growth; catalog shade optional/empty OK.
+#[test]
+fn d14_no_species_name_match() {
+    let cat = Catalog::load_embedded().expect("embedded catalog");
+    // Demo CSV has no shade column → Empty → L_opt=1 for all.
+    for p in cat.iter() {
+        assert_eq!(p.shade, ShadeClass::Empty);
+        assert!((l_opt_for_shade(p.shade) - 1.00).abs() < 1e-15);
+    }
+    // Parser accepts optional shade by header name.
+    let with_shade = "taxon_id,name_norm,scientific,demo,form,height_m_mature,root_depth_m,root_habit,sla_m2_kg,t_min_c,t_max_c,rain_min_mm,rain_max_mm,texture_ok,drain_ok,phenology,dispersal,shade\n\
+x_test,x test,X test,0,herb,1,0.2,top,20,0,40,0,2000,M,MD,,,I\n\
+y_test,y test,Y test,0,tree,10,1,both,10,0,40,0,2000,M,MD,,,T\n\
+z_test,z test,Z test,0,shrub,2,0.5,both,15,0,40,0,2000,M,MD,,,\n";
+    let c2 = Catalog::from_csv_str(with_shade).expect("parse with shade");
+    assert_eq!(c2.get("x_test").unwrap().shade, ShadeClass::Intolerant);
+    assert_eq!(c2.get("y_test").unwrap().shade, ShadeClass::Tolerant);
+    assert_eq!(c2.get("z_test").unwrap().shade, ShadeClass::Empty);
+
+    let lib = include_str!("../src/lib.rs");
+    let catalog = include_str!("../src/catalog.rs");
+    for (label, src) in [("lib.rs", lib), ("catalog.rs", catalog)] {
+        for pat in [
+            r#"== "grass""#,
+            r#"== "oak""#,
+            r#"== "pinus""#,
+            r#"== "ryegrass""#,
+            r#"== "lolium""#,
+            "if name ==",
+            "match name",
+        ] {
+            assert!(
+                !src.contains(pat),
+                "{label} contains forbidden species-name pattern: {pat}"
+            );
+        }
+    }
+    // Growth uses shade class / form constants, not English names.
+    assert!(lib.contains("height_frac"));
+    assert!(lib.contains("f_l_growth"));
+    assert!(catalog.contains("ShadeClass"));
+    let _ = (
+        delta0_for_form(sim_core::Form::Herb),
+        T_MATURE_HERB,
+        f_l_growth(1.0, 0.25, 1.0),
+        l_min_for_form(sim_core::Form::Tree),
+    );
 }

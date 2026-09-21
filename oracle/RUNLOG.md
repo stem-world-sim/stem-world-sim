@@ -1,13 +1,14 @@
 # Oracle RUNLOG
 
 ```
-sprint: S13.2
+sprint: S14
 result: green
-branch: feat/s13.2-overlap-cover
-date: 2026-09-20 (PT)
+branch: feat/s14-growth-clock
+date: 2026-09-21 (PT)
 epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15; H_REST=0.02 m; V_REST=1e-4 m
-constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25; T_SETTLE=64; CHUNK=8; H_POND=0.02; T_WL=7; T_WL_D=3; T_SUB=7; T_DARK=7; L0=1; H_BAND=0.05; T_MIN=0.05; C_MAX=0.85
-invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9 + D91 + D10 + D11 + D12 + D121 + D13 + D131 + D132
+constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25; T_SETTLE=64; CHUNK=8; H_POND=0.02; T_WL=7; T_WL_D=3; T_SUB=7; T_DARK=7; L0=1; H_BAND=0.05; T_MIN=0.05; C_MAX=0.85; H0=0.10; T_MATURE herb/shrub/tree=20/80/200; L_opt I|empty=1.00 M=0.60 T=0.35; theta_pwp=0.5*theta_fc
+growth_cadence: once per live tick on visit set, after light filter (uses last_light); not on sink/ET cadence; catch_up does not advance height_frac
+invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9 + D91 + D10 + D11 + D12 + D121 + D13 + D131 + D132 + D14
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -128,5 +129,15 @@ tests:
   - d132_eight_oaks_hits_cap
   - d132_two_oaks_not_black
   - d132_no_species_name_match
-notes: S13.2 overlap cover / no black floor. T_MIN=0.05 C_MAX=0.85; C_raw=1-Π(1-α); C=min(C_MAX,C_raw); band T=max(T_MIN,1-C); L_out=L_in*T (peers still share incoming L). ET: E_eff=E*(1-C) with same product C over living alphas (not sum). Amended d13_grass_dies_in_oak_shade (grass L~0.16>0, still dark after T_DARK); d13_et_uses_alpha (product C not sum); d131_two_oaks_darker_grass_than_one + d131_no_id_order_shade use overlap T; d7_two_sum/d7_shade_cap_one product ET. New d132_understory_never_zero, d132_eight_oaks_hits_cap, d132_two_oaks_not_black, d132_no_species_name_match. No radius/growth/density/solar angle. No species-name match. cargo test --workspace: 119 acceptance + 4 unit green. Cargo.lock left untracked. docs/ untouched.
+  - d14_plant_taxon_is_mature
+  - d14_seedling_starts_short
+  - d14_seedling_oak_grass_lives
+  - d14_intolerant_prefers_sun
+  - d14_tolerant_prefers_gap
+  - d14_grown_intolerant_reaches_mature
+  - d14_mature_oak_still_shades
+  - d14_wilt_stops_growth
+  - d14_cool_grows_slower_than_opt
+  - d14_no_species_name_match
+notes: S14 growth clock. plant_taxon height_frac=1; plant_seedling/plant_params H0=0.10; alpha_eff=α·h² for light+ET; effective height = H_mat·h for bands/submerge. Δ0=(1-H0)/T_MATURE; frac+=Δ0·f_L·f_w·f_T clamp [H0,1]. f_L from shade L_opt; f_w wilted=0 else root-weighted θ ramp pwp→fc; f_T triangular envelope else 1. Catalog optional shade column by header (demo CSV has none → Empty → L_opt=1); I/T tests use plant_params with OccupantParams.shade override — no species-name match in sim-core. docs/ untouched. cargo test --workspace: 129 acceptance + 4 unit green. Cargo.lock left untracked.
 ```

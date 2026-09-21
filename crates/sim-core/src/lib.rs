@@ -20,6 +20,7 @@
 //! S12/S12.1: world climate (T_air_c, rain_year_mm); live plant/tick use T only;
 //! catch_up may still apply rain_year vs EcoCrop. Hydro: waterlog/submerge from drain_ok+height.
 //! S13/S13.1/S13.2: height-band light L0=1, H_BAND=0.05; overlap cover T=max(T_MIN,1-min(C_MAX,1-Π(1-α))); dark kill T_DARK; ET same C.
+//! S14: height_frac growth; alpha_eff=α·h²; plant_taxon mature; seedling H0; f_L from shade L_opt; growth once/live tick after light.
 //! catch_up(K, rain): optional source dump; then K blocks of (≤N_ET hydro, 1 unit sink).
 //! catch_up_chunk: same calendar on one chunk + 1-cell halo; other chunks unchanged.
 //! Unique-min-H chute revoked. Capillary stays.
@@ -30,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 
 pub mod catalog;
 pub use catalog::{
-    root_mask_from_depth, Catalog, CatalogError, Form, OccupantParams,
+    root_mask_from_depth, Catalog, CatalogError, Form, OccupantParams, ShadeClass,
 };
 
 pub const MASS_EPSILON: f64 = 1e-9;
@@ -98,6 +99,14 @@ pub const T_MIN: f64 = 0.05;
 /// Cap on overlap cover fraction C. S13.2.
 pub const C_MAX: f64 = 0.85;
 
+/// Seedling starting height fraction. S14.
+pub const H0: f64 = 0.10;
+
+/// Growth steps to mature by form. S14.
+pub const T_MATURE_HERB: f64 = 20.0;
+pub const T_MATURE_SHRUB: f64 = 80.0;
+pub const T_MATURE_TREE: f64 = 200.0;
+
 /// Soil texture: porosity, field capacity, infiltrate and drain rate limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Texture {
@@ -119,6 +128,11 @@ impl Texture {
     /// Field capacity θ_fc = 0.50 * φ.
     pub fn theta_fc(self) -> f64 {
         0.50 * self.porosity()
+    }
+
+    /// Permanent wilting point ≈ half field capacity (f_w ramp). S14.
+    pub fn theta_pwp(self) -> f64 {
+        0.50 * self.theta_fc()
     }
 
     /// Max infiltrate depth per tick (metres water, A = 1).
@@ -165,6 +179,10 @@ pub struct Occupant {
     pub dark_steps: u32,
     /// Last incoming light (before own alpha) from the light pass. S13.
     pub last_light: Option<f64>,
+    /// Fractional mature height in [H0, 1]; plant_taxon=1, seedling=H0. S14.
+    pub height_frac: f64,
+    /// USDA shade class snapshotted at plant time. S14.
+    pub shade_class: ShadeClass,
 }
 
 impl Occupant {
@@ -182,6 +200,8 @@ impl Occupant {
             submerge_steps: 0,
             dark_steps: 0,
             last_light: None,
+            height_frac: 1.0,
+            shade_class: ShadeClass::Empty,
         }
     }
 
@@ -199,6 +219,8 @@ impl Occupant {
             submerge_steps: 0,
             dark_steps: 0,
             last_light: None,
+            height_frac: 1.0,
+            shade_class: ShadeClass::Empty,
         }
     }
 }
@@ -340,18 +362,116 @@ pub fn l_min_for_form(form: Form) -> f64 {
     }
 }
 
-/// Alpha for an alive occupant; PlantStub without taxon_id → herb 0.25. Dead → 0. S13.
+/// T_MATURE growth steps for a form. S14.
+pub fn t_mature_for_form(form: Form) -> f64 {
+    match form {
+        Form::Herb => T_MATURE_HERB,
+        Form::Shrub => T_MATURE_SHRUB,
+        Form::Tree => T_MATURE_TREE,
+    }
+}
+
+/// Base growth increment Δ0 = (1 − H0) / T_MATURE. S14.
+pub fn delta0_for_form(form: Form) -> f64 {
+    (1.0 - H0) / t_mature_for_form(form)
+}
+
+/// L_opt from shade class. S14.
+pub fn l_opt_for_shade(shade: ShadeClass) -> f64 {
+    shade.l_opt()
+}
+
+/// Growth light factor: 0 if L < L_min else clamp(1 − |L − L_opt|, 0, 1). S14.
+pub fn f_l_growth(l: f64, l_min: f64, l_opt: f64) -> f64 {
+    if l < l_min {
+        0.0
+    } else {
+        (1.0 - (l - l_opt).abs()).clamp(0.0, 1.0)
+    }
+}
+
+/// Triangular temperature factor in [t_min, t_max]; 1 if either bound missing. S14.
+pub fn f_t_growth(t_air: f64, t_min: Option<f64>, t_max: Option<f64>) -> f64 {
+    let (Some(t0), Some(t1)) = (t_min, t_max) else {
+        return 1.0;
+    };
+    if t1 <= t0 {
+        return 1.0;
+    }
+    if t_air <= t0 || t_air >= t1 {
+        return 0.0;
+    }
+    let mid = 0.5 * (t0 + t1);
+    if t_air <= mid {
+        if mid <= t0 {
+            1.0
+        } else {
+            (t_air - t0) / (mid - t0)
+        }
+    } else if t1 <= mid {
+        1.0
+    } else {
+        (t1 - t_air) / (t1 - mid)
+    }
+}
+
+/// Root-weighted soil moisture factor between PWP and FC. Wilted → 0. S14.
+pub fn f_w_growth(col: &Column, occ: &Occupant) -> f64 {
+    if !occ.alive {
+        return 0.0;
+    }
+    let mut wsum = 0.0;
+    let mut fsum = 0.0;
+    for k in 0..N_LAYERS {
+        let w = occ.root[k];
+        if w <= 0.0 {
+            continue;
+        }
+        if k >= col.layers.len() {
+            break;
+        }
+        let layer = &col.layers[k];
+        let fc = layer.theta_fc();
+        let pwp = layer.texture.theta_pwp();
+        let denom = fc - pwp;
+        let factor = if denom <= MASS_EPSILON {
+            if layer.theta >= fc {
+                1.0
+            } else {
+                0.0
+            }
+        } else {
+            ((layer.theta - pwp) / denom).clamp(0.0, 1.0)
+        };
+        wsum += w;
+        fsum += w * factor;
+    }
+    if wsum <= MASS_EPSILON {
+        0.0
+    } else {
+        fsum / wsum
+    }
+}
+
+/// Size-scaled canopy alpha: α_eff = α · height_frac². S14.
+pub fn alpha_eff(alpha: f64, height_frac: f64) -> f64 {
+    alpha * height_frac * height_frac
+}
+
+/// Alpha for an alive occupant; PlantStub without taxon_id → herb 0.25. Dead → 0.
+/// Uses alpha_eff (height_frac²). S13/S14.
 pub fn alpha_for_occupant(catalog: &Catalog, occ: &Occupant) -> f64 {
     if !occ.alive {
         return 0.0;
     }
-    match occ.taxon_id.as_deref() {
+    let base = match occ.taxon_id.as_deref() {
         Some(tid) => match catalog.get(tid) {
             Ok(p) => alpha_from_params(p),
             Err(_) => 0.25,
         },
         None => 0.25,
-    }
+    };
+    alpha_eff(base, occ.height_frac)
 }
 
 /// Overlap cover from alphas: C_raw = 1 − Π(1−α_i); C = min(C_MAX, C_raw). S13.2.
@@ -372,8 +492,8 @@ pub fn cover_transmission(c: f64) -> f64 {
 }
 
 fn light_traits_for_occupant(catalog: &Catalog, occ: &Occupant) -> (f64, f64, f64) {
-    // (height_m, alpha, l_min)
-    match occ.taxon_id.as_deref() {
+    // (height_m * height_frac, alpha_eff, l_min)
+    let (h_mat, alpha, l_min) = match occ.taxon_id.as_deref() {
         Some(tid) => match catalog.get(tid) {
             Ok(p) => (
                 effective_height_m(p),
@@ -383,7 +503,9 @@ fn light_traits_for_occupant(catalog: &Catalog, occ: &Occupant) -> (f64, f64, f6
             Err(_) => (0.4, 0.25, 0.25),
         },
         None => (0.4, 0.25, 0.25),
-    }
+    };
+    let hf = occ.height_frac.clamp(0.0, 1.0);
+    (h_mat * hf, alpha_eff(alpha, hf), l_min)
 }
 
 /// Historical S09 busy signal. S09.1: [`World::ignore_chunk`] always succeeds (never Err).
@@ -1392,7 +1514,7 @@ impl World {
         &self.catalog
     }
 
-    /// Plant a catalog taxon at (x,y) after climate check. S12.
+    /// Plant a catalog taxon at (x,y) after climate check. Mature: height_frac=1. S12/S14.
     pub fn plant_taxon(
         &mut self,
         x: usize,
@@ -1403,7 +1525,35 @@ impl World {
             Ok(p) => p.clone(),
             Err(_) => return Err(PlantTaxonError::UnknownTaxon),
         };
-        let occ = params.to_plant_stub();
+        self.plant_params(x, y, &params, 1.0)
+    }
+
+    /// Plant a catalog seedling at (x,y): height_frac=H0. S14.
+    pub fn plant_seedling(
+        &mut self,
+        x: usize,
+        y: usize,
+        taxon_id: &str,
+    ) -> Result<(), PlantTaxonError> {
+        let params = match self.catalog.get(taxon_id) {
+            Ok(p) => p.clone(),
+            Err(_) => return Err(PlantTaxonError::UnknownTaxon),
+        };
+        self.plant_params(x, y, &params, H0)
+    }
+
+    /// Plant with explicit OccupantParams and height_frac (test overrides for shade). S14.
+    /// Production plant_taxon / plant_seedling load shade from the catalog row.
+    pub fn plant_params(
+        &mut self,
+        x: usize,
+        y: usize,
+        params: &OccupantParams,
+        height_frac: f64,
+    ) -> Result<(), PlantTaxonError> {
+        let mut occ = params.to_plant_stub();
+        occ.height_frac = height_frac.clamp(0.0, 1.0);
+        occ.shade_class = params.shade;
         if let Some(reason) = self.climate_veto_for(&occ) {
             let i = self.idx(x, y);
             self.climate_reject[i] = reason;
@@ -1515,7 +1665,8 @@ impl World {
             let Ok(params) = self.catalog.get(&tid) else {
                 continue;
             };
-            let height = effective_height_m(params);
+            let hf = self.columns[i].occupants[oi].height_frac.clamp(0.0, 1.0);
+            let height = effective_height_m(params) * hf;
             let drain = params.drain_ok.as_deref();
             let immune_wl = drain_ok_has_w(drain);
             let wl_limit = waterlog_limit(drain);
@@ -1649,6 +1800,40 @@ impl World {
         }
     }
 
+    /// Growth clock on live visit set (once per live tick, after light). S14.
+    fn apply_growth_ids(&mut self, ids: &[usize]) {
+        for &i in ids {
+            self.apply_growth_at(i);
+        }
+    }
+
+    fn apply_growth_at(&mut self, i: usize) {
+        let t_air = self.t_air_c;
+        let occ_len = self.columns[i].occupants.len();
+        for oi in 0..occ_len {
+            if !self.columns[i].occupants[oi].alive {
+                continue;
+            }
+            let Some(ref tid) = self.columns[i].occupants[oi].taxon_id.clone() else {
+                continue;
+            };
+            let Ok(params) = self.catalog.get(&tid) else {
+                continue;
+            };
+            let form = params.form;
+            let l_min = l_min_for_form(form);
+            let l_opt = l_opt_for_shade(self.columns[i].occupants[oi].shade_class);
+            let l = self.columns[i].occupants[oi].last_light.unwrap_or(0.0);
+            let f_l = f_l_growth(l, l_min, l_opt);
+            let f_w = f_w_growth(&self.columns[i], &self.columns[i].occupants[oi]);
+            let f_t = f_t_growth(t_air, params.t_min_c, params.t_max_c);
+            let d0 = delta0_for_form(form);
+            let hf = self.columns[i].occupants[oi].height_frac;
+            let next = (hf + d0 * f_l * f_w * f_t).clamp(H0, 1.0);
+            self.columns[i].occupants[oi].height_frac = next;
+        }
+    }
+
     /// Infiltrate every column (rate-limited); no runoff/drain; advances clock.
     pub fn tick_infiltration(&mut self) {
         self.infiltrate_all();
@@ -1700,12 +1885,14 @@ impl World {
                 self.prune_awake();
             }
         }
-        // S12.1/S13.1: live climate = T only; hydro + height-band light on visit set.
+        // S12.1/S13.1/S14: live climate = T only; hydro + light + growth on visit set.
         let climate_ids = self.visit_indices();
         if !climate_ids.is_empty() {
             self.apply_climate_filter_ids(&climate_ids, false);
             self.apply_hydro_filter_ids(&climate_ids);
             self.apply_light_filter_ids(&climate_ids);
+            // Growth once per live tick after light (uses last_light). Not on sink cadence.
+            self.apply_growth_ids(&climate_ids);
         }
     }
 
