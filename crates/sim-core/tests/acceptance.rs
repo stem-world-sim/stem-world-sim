@@ -5,9 +5,10 @@
 //! Grid mass: sum of column M.
 
 use sim_core::{
-    Catalog, ChunkBusy, ClimateReject, Column, Occupant, OccupantParams, PlantTaxonError,
-    SoilLayer, Texture, World, CHUNK, E_OPEN, E_SOIL, H_REST, MASS_EPSILON, MAX_OCCUPANTS, N_ET,
-    N_LAYERS, P_MAX, R_MAX, T_SETTLE, T_WILT, V_REST,
+    Catalog, ChunkBusy, ClimateReject, Column, HydroReject, Occupant, OccupantParams,
+    PlantTaxonError, SoilLayer, Texture, World, CHUNK, E_OPEN, E_SOIL, H_POND, H_REST,
+    MASS_EPSILON, MAX_OCCUPANTS, N_ET, N_LAYERS, P_MAX, R_MAX, T_SETTLE, T_SUB, T_WILT, T_WL,
+    V_REST,
 };
 
 fn assert_mass_close(actual: f64, expected: f64) {
@@ -3355,41 +3356,39 @@ fn d12_wheat_dies_above_tmax() {
     assert_eq!(world.climate_reject(0, 0), ClimateReject::TMax);
 }
 
-/// D12: rice dies when rain_year_mm < catalog rain_min (800).
+/// D12/S12.1: dry rain_year is not a live kill; rice remains at T=22 / 200 mm.
 #[test]
 fn d12_rice_dies_dry_year() {
     let mut world = World::new(1205, climate_sand_column());
-    world.set_climate(25.0, 500.0); // dry year
-    let err = world.plant_taxon(0, 0, "oryza_sativa");
+    world.set_climate(22.0, 200.0); // warm; dry year
+    world.plant_taxon(0, 0, "oryza_sativa").unwrap();
+    assert!(world.plant_at(0, 0), "live plant must ignore rain_year");
+    world.tick();
     assert!(
-        matches!(err, Err(PlantTaxonError::Climate(ClimateReject::RMin))),
-        "expected RMin reject, got {err:?}"
+        world.plant_at(0, 0),
+        "live tick must not kill on dry rain_year when T in envelope"
     );
-    assert!(!world.plant_at(0, 0));
-    assert_eq!(world.climate_reject(0, 0), ClimateReject::RMin);
+    assert_eq!(world.climate_reject(0, 0), ClimateReject::None);
 }
 
-/// D12: add_rain (metres into the column) is not rain_year_mm; set_climate owns the envelope axis.
+/// D12/S12.1: 0.05 m rain must not change rain_year_mm; rice remains if T in envelope.
 #[test]
 fn d12_bucket_is_not_climate() {
     let mut world = World::new(1206, climate_sand_column());
-    world.set_climate(25.0, 500.0); // dry year — rice r_min=800
+    world.set_climate(25.0, 500.0); // dry year — rain_year still orthogonal to bucket
     assert!((world.rain_year_mm() - 500.0).abs() < 1e-12);
-    // Irrigation bucket: metres of water into the column.
-    world.add_rain(2.0);
-    assert!((world.rain_year_mm() - 500.0).abs() < 1e-12, "add_rain must not flip rain_year_mm");
-    let err = world.plant_taxon(0, 0, "oryza_sativa");
+    world.add_rain(0.05);
     assert!(
-        matches!(err, Err(PlantTaxonError::Climate(ClimateReject::RMin))),
-        "bucket alone must not satisfy rain envelope; got {err:?}"
+        (world.rain_year_mm() - 500.0).abs() < 1e-12,
+        "0.05 m add_rain must not flip rain_year_mm"
     );
-    assert!(!world.plant_at(0, 0));
-    // set_climate still controls the rain envelope axis.
-    world.set_climate(25.0, 1200.0);
-    assert!((world.rain_year_mm() - 1200.0).abs() < 1e-12);
+    // Live path: T in envelope → rice plants; rain_year is not a live kill.
     world.plant_taxon(0, 0, "oryza_sativa").unwrap();
     assert!(world.plant_at(0, 0));
+    world.tick();
+    assert!(world.plant_at(0, 0), "rice remains when T in envelope");
     assert_eq!(world.climate_reject(0, 0), ClimateReject::None);
+    assert!((world.rain_year_mm() - 500.0).abs() < 1e-12);
 }
 
 /// D12: empty envelope / PlantStub without taxon — no climate veto at extreme set_climate.
@@ -3435,6 +3434,210 @@ fn d12_no_species_name_match() {
         for pat in [
             r#"== "rice""#,
             r#"== "wheat""#,
+            r#"name == "rice""#,
+            r#"name == "wheat""#,
+            "if name ==",
+            "match name",
+        ] {
+            assert!(
+                !src.contains(pat),
+                "{label} contains forbidden species-name pattern: {pat}"
+            );
+        }
+    }
+    let _params: &OccupantParams = rice;
+}
+
+
+// --- Sprint 12.1 — event hydro / current conditions vs year envelope -------------
+
+fn hydro_pond_column(h_surf: f64) -> Column {
+    // Saturated soil so pond stays on the surface (no infiltrate room).
+    saturated_column(0.0, h_surf)
+}
+
+fn hydro_dry_column() -> Column {
+    let tex = Texture::Sand;
+    Column::new(
+        0.0,
+        0.0,
+        vec![
+            SoilLayer::new(0.3, 0.0, tex),
+            SoilLayer::new(0.5, 0.0, tex),
+        ],
+    )
+}
+
+/// D121: plant rice under dry rain_year when air is warm (live T-only gate).
+#[test]
+fn d121_plant_rice_in_dry_year_if_warm() {
+    let mut world = World::new(12101, climate_sand_column());
+    world.set_climate(22.0, 200.0); // below rice rain_min=800
+    world.plant_taxon(0, 0, "oryza_sativa").unwrap();
+    assert!(world.plant_at(0, 0));
+    assert_eq!(world.climate_reject(0, 0), ClimateReject::None);
+}
+
+/// D121: rice planted warm then air turns cold → climate TMin remove.
+#[test]
+fn d121_rice_dies_when_air_turns_cold() {
+    let mut world = World::new(12102, climate_sand_column());
+    world.set_climate(22.0, 200.0);
+    world.plant_taxon(0, 0, "oryza_sativa").unwrap();
+    assert!(world.plant_at(0, 0));
+    world.set_climate(10.0, 200.0); // below rice t_min=16
+    world.tick();
+    assert!(!world.plant_at(0, 0));
+    assert_eq!(world.climate_reject(0, 0), ClimateReject::TMin);
+}
+
+/// D121: wheat (drain_ok=MD) waterlogs in pond after T_WL live ticks.
+#[test]
+fn d121_wheat_waterlogs_in_pond() {
+    let mut world = World::new(12103, hydro_pond_column(0.05));
+    world.set_climate(20.0, 1000.0); // inside wheat T 5–27
+    world.plant_taxon(0, 0, "triticum_aestivum").unwrap();
+    assert!(world.plant_at(0, 0));
+    assert!(world.surface_water_m() >= H_POND);
+
+    for t in 1..=T_WL {
+        if world.surface_water_m() < H_POND {
+            world.add_rain(H_POND - world.surface_water_m() + 0.01);
+        }
+        world.tick();
+        if t < T_WL {
+            assert!(
+                world.plant_at(0, 0),
+                "wheat should still be alive after {t} waterlog ticks (T_WL={T_WL})"
+            );
+            assert_eq!(world.hydro_reject(0, 0), HydroReject::None);
+        }
+    }
+    assert!(!world.plant_at(0, 0), "wheat should waterlog after T_WL={T_WL}");
+    assert_eq!(world.hydro_reject(0, 0), HydroReject::Waterlog);
+}
+
+/// D121: rice (drain_ok=W) survives pond — no waterlog kill.
+#[test]
+fn d121_rice_pond_no_waterlog() {
+    let mut world = World::new(12104, hydro_pond_column(0.05));
+    world.set_climate(22.0, 1000.0);
+    world.plant_taxon(0, 0, "oryza_sativa").unwrap();
+    for _ in 0..(T_WL + 3) {
+        if world.surface_water_m() < H_POND {
+            world.add_rain(H_POND - world.surface_water_m() + 0.01);
+        }
+        world.tick();
+    }
+    assert!(world.plant_at(0, 0), "rice drain_ok=W must not waterlog in pond");
+    assert_eq!(world.hydro_reject(0, 0), HydroReject::None);
+}
+
+/// D121: wheat height 0.8 m — pond over height for T_SUB → Submerged.
+#[test]
+fn d121_wheat_submerged_over_height() {
+    let wheat_h = 0.8;
+    let mut world = World::new(12105, hydro_pond_column(wheat_h + 0.10));
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "triticum_aestivum").unwrap();
+    assert!(world.surface_water_m() >= wheat_h);
+
+    for t in 1..=T_SUB {
+        if world.surface_water_m() < wheat_h {
+            world.add_rain(wheat_h - world.surface_water_m() + 0.10);
+        }
+        world.tick();
+        if t < T_SUB {
+            assert!(
+                world.plant_at(0, 0),
+                "wheat should survive {t} submerge ticks (T_SUB={T_SUB})"
+            );
+        }
+    }
+    assert!(!world.plant_at(0, 0), "wheat submerged after T_SUB");
+    assert_eq!(world.hydro_reject(0, 0), HydroReject::Submerged);
+}
+
+/// D121: oak height 20.1 — shallow pond is not a submerge kill.
+#[test]
+fn d121_oak_not_submerged_in_shallow_pond() {
+    let mut world = World::new(12106, hydro_pond_column(0.05));
+    world.set_climate(20.0, 1000.0); // oak t_min=7 t_max=32
+    world.plant_taxon(0, 0, "quercus_alba").unwrap();
+    let oak_h = world
+        .catalog()
+        .get("quercus_alba")
+        .unwrap()
+        .height_m_mature
+        .unwrap();
+    assert!((oak_h - 20.1).abs() < 1e-9);
+    assert!(0.05 < oak_h);
+
+    for _ in 0..T_SUB {
+        if world.surface_water_m() < H_POND {
+            world.add_rain(0.05);
+        }
+        world.tick();
+        // Never a Submerged reject (oak is tall). May waterlog at T_WL==T_SUB.
+        assert_ne!(
+            world.hydro_reject(0, 0),
+            HydroReject::Submerged,
+            "shallow pond must not report Submerged for tall oak"
+        );
+    }
+}
+
+/// D121: drought wilt with good rain_year — rain_year is not the drought axis.
+#[test]
+fn d121_drought_kills_at_good_rain_year() {
+    let mut world = World::new(12107, hydro_dry_column());
+    world.set_climate(22.0, 1200.0); // good rain_year; dry soil
+    world.plant_taxon(0, 0, "oryza_sativa").unwrap();
+    assert!(world.plant_at(0, 0));
+
+    for step in 1..=T_WILT {
+        tick_through_next_et(&mut world);
+        if step < T_WILT {
+            assert!(
+                world.plant_at(0, 0),
+                "alive after {step} dry sinks (T_WILT={T_WILT})"
+            );
+        }
+    }
+    assert!(
+        !world.plant_at(0, 0),
+        "plant should wilt after T_WILT dry sinks despite good rain_year"
+    );
+    // Wilt leaves occupant (alive=false); not a climate/hydro remove.
+    assert_eq!(world.climate_reject(0, 0), ClimateReject::None);
+    assert_eq!(world.hydro_reject(0, 0), HydroReject::None);
+    assert!(world.occupant_count(0, 0) >= 1, "wilt keeps occupant slot");
+}
+
+/// D121: hydro uses catalog drain_ok + height — no species-name branching.
+#[test]
+fn d121_no_species_name_match() {
+    let cat = Catalog::load_embedded().expect("embedded catalog");
+    let rice = cat.get("oryza_sativa").expect("oryza_sativa");
+    let wheat = cat.get("triticum_aestivum").expect("triticum_aestivum");
+    let oak = cat.get("quercus_alba").expect("quercus_alba");
+
+    assert_eq!(rice.drain_ok.as_deref(), Some("W"));
+    assert_eq!(wheat.drain_ok.as_deref(), Some("MD"));
+    assert_eq!(oak.height_m_mature, Some(20.1));
+    assert_eq!(wheat.height_m_mature, Some(0.8));
+
+    assert!(cat.get("rice").is_err());
+    assert!(cat.get("wheat").is_err());
+    assert!(cat.get("oak").is_err());
+
+    let lib = include_str!("../src/lib.rs");
+    let catalog = include_str!("../src/catalog.rs");
+    for (label, src) in [("lib.rs", lib), ("catalog.rs", catalog)] {
+        for pat in [
+            r#"== "rice""#,
+            r#"== "wheat""#,
+            r#"== "oak""#,
             r#"name == "rice""#,
             r#"name == "wheat""#,
             "if name ==",
