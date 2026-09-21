@@ -3,8 +3,9 @@
 //! Occupant scalars come from a row keyed by `taxon_id`. Missing numeric/
 //! string fields are `None`; `root_mask` uses form defaults when depth is null.
 //! S12: climate Option fields drive World envelope vetoes.
+//! S14: optional `shade` column (I/M/T/empty) → ShadeClass; missing → Empty.
 
-use crate::{Occupant, N_LAYERS};
+use crate::{Occupant, H0, N_LAYERS};
 use std::collections::HashMap;
 
 /// Growth form used for root-mask defaults when `root_depth_m` is absent.
@@ -34,6 +35,41 @@ impl Form {
     }
 }
 
+/// USDA shade tolerance class from optional catalog `shade` column. S14.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ShadeClass {
+    /// Missing column or empty cell → treat as full-sun optimum (L_opt=1).
+    #[default]
+    Empty,
+    /// Intolerant (I) — L_opt = 1.00.
+    Intolerant,
+    /// Moderate (M) — L_opt = 0.60.
+    Moderate,
+    /// Tolerant (T) — L_opt = 0.35.
+    Tolerant,
+}
+
+impl ShadeClass {
+    /// Parse catalog cell: I/M/T (case-insensitive); empty → Empty.
+    pub fn parse(s: &str) -> Self {
+        match s.trim() {
+            "I" | "i" => ShadeClass::Intolerant,
+            "M" | "m" => ShadeClass::Moderate,
+            "T" | "t" => ShadeClass::Tolerant,
+            _ => ShadeClass::Empty,
+        }
+    }
+
+    /// Optimal received light for growth factor f_L. S14.
+    pub fn l_opt(self) -> f64 {
+        match self {
+            ShadeClass::Empty | ShadeClass::Intolerant => 1.00,
+            ShadeClass::Moderate => 0.60,
+            ShadeClass::Tolerant => 0.35,
+        }
+    }
+}
+
 /// Typed row for one taxon. Climate fields feed the S12 envelope filter.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OccupantParams {
@@ -54,15 +90,26 @@ pub struct OccupantParams {
     pub drain_ok: Option<String>,
     pub phenology: Option<String>,
     pub dispersal: Option<String>,
+    /// Optional USDA shade class (I/M/T); missing column/cell → Empty. S14.
+    pub shade: ShadeClass,
     /// Presence mask derived from `root_depth_m` / form (not normalized weights).
     pub root_mask: [f64; N_LAYERS],
 }
 
 impl OccupantParams {
-    /// Build a PlantStub occupant: uptake [`P_MAX`], shade 0.25 (PlantStub default).
+    /// Mature PlantStub: height_frac=1, catalog shade class. Uptake P_MAX; ET field shade 0.25.
     pub fn to_plant_stub(&self) -> Occupant {
         let mut occ = Occupant::plant_stub_with_root(self.root_mask);
         occ.taxon_id = Some(self.taxon_id.clone());
+        occ.shade_class = self.shade;
+        occ.height_frac = 1.0;
+        occ
+    }
+
+    /// Seedling PlantStub: height_frac=H0. S14.
+    pub fn to_seedling(&self) -> Occupant {
+        let mut occ = self.to_plant_stub();
+        occ.height_frac = H0;
         occ
     }
 }
@@ -140,6 +187,8 @@ impl Catalog {
         let i_drain = idx("drain_ok")?;
         let i_phen = idx("phenology")?;
         let i_disp = idx("dispersal")?;
+        // Optional: missing header → all Empty (demo CSV has no shade yet).
+        let i_shade = cols.iter().position(|c| c.as_str() == "shade");
 
         let mut by_id = HashMap::new();
         for (lineno, line) in lines.enumerate() {
@@ -179,6 +228,10 @@ impl Catalog {
                 drain_ok: opt_string(get(i_drain)),
                 phenology: opt_string(get(i_phen)),
                 dispersal: opt_string(get(i_disp)),
+                shade: match i_shade {
+                    Some(i) => ShadeClass::parse(get(i)),
+                    None => ShadeClass::Empty,
+                },
                 root_mask,
             };
             if by_id.insert(taxon_id.clone(), params).is_some() {
