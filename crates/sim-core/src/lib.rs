@@ -23,7 +23,8 @@
 //! S14/S14.1/S14.2: height_frac growth; alpha_eff=α·h²; plant_taxon mature; seedling H0; f_L from shade L_opt;
 //! f_w from rooted s + drain_ok (wetland/xeric/mesic) and pond factor; wilted => 0;
 //! growth once/live tick after light; catch_up advances height_frac once per calendar block (same Δ0·f_L·f_w·f_T).
-//! catch_up(K, rain): optional source dump; then K blocks of (≤N_ET hydro, 1 unit sink, light-if-needed, growth).
+//! S15: band load A_b=Σ(α·h²) in crown H_BAND; A_b>1 → s_b=1/A_b scales α_eff+uptake then S13.2; T_CROWD thin.
+//! catch_up(K, rain): optional source dump; then K blocks of (≤N_ET hydro, 1 unit sink, light+compress+crowd, growth).
 //! catch_up_chunk: same calendar on one chunk + 1-cell halo; other chunks unchanged.
 //! Unique-min-H chute revoked. Capillary stays.
 
@@ -88,6 +89,9 @@ pub const T_SUB: u32 = 7;
 
 /// Consecutive live ticks below L_min before light-dark remove. S13.
 pub const T_DARK: u32 = 7;
+
+/// Consecutive overcrowded (A_b>1) ticks before thinning weakest in band. S15.
+pub const T_CROWD: u32 = 7;
 
 /// Incident light at canopy top (dimensionless). S13.
 pub const L0: f64 = 1.0;
@@ -187,6 +191,10 @@ pub struct Occupant {
     pub shade_class: ShadeClass,
     /// Catalog `drain_ok` snapshotted at plant time (f_w shape + hydro). S14.2.
     pub drain_ok: Option<String>,
+    /// Consecutive ticks this crown-band had A_b>1. S15.
+    pub crowd_steps: u32,
+    /// Band compress scale s_b (1 if A_b≤1); scales uptake. S15.
+    pub band_scale: f64,
 }
 
 impl Occupant {
@@ -207,6 +215,8 @@ impl Occupant {
             height_frac: 1.0,
             shade_class: ShadeClass::Empty,
             drain_ok: None,
+            crowd_steps: 0,
+            band_scale: 1.0,
         }
     }
 
@@ -227,6 +237,8 @@ impl Occupant {
             height_frac: 1.0,
             shade_class: ShadeClass::Empty,
             drain_ok: None,
+            crowd_steps: 0,
+            band_scale: 1.0,
         }
     }
 }
@@ -492,6 +504,19 @@ pub fn f_w_growth(col: &Column, occ: &Occupant) -> f64 {
 /// Size-scaled canopy alpha: α_eff = α · height_frac². S14.
 pub fn alpha_eff(alpha: f64, height_frac: f64) -> f64 {
     alpha * height_frac * height_frac
+}
+
+/// Band load A_b and compress scale s_b = 1/A_b if A_b>1 else 1. S15.
+pub fn band_compress_scale<I>(alphas: I) -> (f64, f64)
+where
+    I: IntoIterator<Item = f64>,
+{
+    let a_b: f64 = alphas.into_iter().sum();
+    if a_b > 1.0 {
+        (a_b, 1.0 / a_b)
+    } else {
+        (a_b, 1.0)
+    }
 }
 
 /// Alpha for an alive occupant; PlantStub without taxon_id → herb 0.25. Dead → 0.
@@ -1774,7 +1799,7 @@ impl World {
             return;
         }
 
-        // Traits snapshot: (oi, height, alpha, l_min) for alive occupants.
+        // Traits snapshot: (oi, height, alpha_eff, l_min) for alive occupants.
         let mut rows: Vec<(usize, f64, f64, f64)> = Vec::new();
         for oi in 0..occ_len {
             if !self.columns[i].occupants[oi].alive {
@@ -1790,7 +1815,8 @@ impl World {
         });
 
         let mut l = L0;
-        let mut kills: Vec<usize> = Vec::new();
+        let mut dark_kills: Vec<usize> = Vec::new();
+        let mut crowd_kills: Vec<usize> = Vec::new();
         let mut idx = 0;
         while idx < rows.len() {
             // Band: consecutive (sorted) occupants within H_BAND of the tallest member.
@@ -1800,12 +1826,17 @@ impl World {
                 end += 1;
             }
 
+            // Band load A_b = Σ α_eff (crown band only). Compress before S13.2. S15.
+            let raw_alphas: Vec<f64> = rows[idx..=end].iter().map(|r| r.2).collect();
+            let (_a_b, s_b) = band_compress_scale(raw_alphas.iter().copied());
+            let compressed: Vec<f64> = raw_alphas.iter().map(|a| a * s_b).collect();
+
             // All members of the band receive the same incoming L (S13.1 H_BAND).
             let received = l;
-            let mut band_alphas: Vec<f64> = Vec::with_capacity(end - idx + 1);
-            for &(oi, _h, alpha, l_min) in &rows[idx..=end] {
-                band_alphas.push(alpha);
+            for (slot, &(oi, _h, _alpha, l_min)) in rows[idx..=end].iter().enumerate() {
+                let _ = slot;
                 self.columns[i].occupants[oi].last_light = Some(received);
+                self.columns[i].occupants[oi].band_scale = s_b;
                 if received < l_min {
                     self.columns[i].occupants[oi].dark_steps =
                         self.columns[i].occupants[oi].dark_steps.saturating_add(1);
@@ -1813,16 +1844,66 @@ impl World {
                     self.columns[i].occupants[oi].dark_steps = 0;
                 }
                 if self.columns[i].occupants[oi].dark_steps >= T_DARK {
-                    kills.push(oi);
+                    dark_kills.push(oi);
                 }
             }
-            // Overlap cover transmission: C=min(C_MAX,1-Π(1-α)); T=max(T_MIN,1-C).
-            let c = overlap_cover_from_alphas(band_alphas);
+
+            // Crowd counter / thin (A_b>1 ⇔ s_b < 1). S15.
+            if s_b < 1.0 {
+                for &(oi, _, _, _) in &rows[idx..=end] {
+                    self.columns[i].occupants[oi].crowd_steps =
+                        self.columns[i].occupants[oi].crowd_steps.saturating_add(1);
+                }
+                let overcrowded = rows[idx..=end]
+                    .iter()
+                    .any(|&(oi, _, _, _)| self.columns[i].occupants[oi].crowd_steps >= T_CROWD);
+                if overcrowded {
+                    // Weakest: lowest f_L·f_w·f_T·height_frac; tie lower frac, then lower index.
+                    let t_air = self.t_air_c;
+                    let mut best: Option<(f64, f64, usize)> = None;
+                    for &(oi, _, _, _) in &rows[idx..=end] {
+                        if dark_kills.contains(&oi) {
+                            continue;
+                        }
+                        let fit = self.crowd_fitness_at(i, oi, received, t_air);
+                        let hf = self.columns[i].occupants[oi].height_frac;
+                        let key = (fit, hf, oi);
+                        match best {
+                            None => best = Some(key),
+                            Some(cur) => {
+                                let worse = key.0 < cur.0
+                                    || (key.0 == cur.0 && key.1 < cur.1)
+                                    || (key.0 == cur.0 && key.1 == cur.1 && key.2 < cur.2);
+                                if worse {
+                                    best = Some(key);
+                                }
+                            }
+                        }
+                    }
+                    if let Some((_, _, oi)) = best {
+                        crowd_kills.push(oi);
+                    }
+                    // Reset band counters after a thin so the next streak starts fresh.
+                    for &(oi, _, _, _) in &rows[idx..=end] {
+                        self.columns[i].occupants[oi].crowd_steps = 0;
+                    }
+                }
+            } else {
+                for &(oi, _, _, _) in &rows[idx..=end] {
+                    self.columns[i].occupants[oi].crowd_steps = 0;
+                }
+            }
+
+            // Overlap cover transmission AFTER compress: C=min(C_MAX,1-Π(1-α')); T=max(T_MIN,1-C).
+            let c = overlap_cover_from_alphas(compressed);
             let t = cover_transmission(c);
             l *= t;
             idx = end + 1;
         }
 
+        let mut kills = dark_kills;
+        let had_dark = !kills.is_empty();
+        kills.extend(crowd_kills);
         if kills.is_empty() {
             let had_alive = self.columns[i].occupants.iter().any(|o| o.alive);
             if had_alive {
@@ -1831,12 +1912,43 @@ impl World {
             return;
         }
 
-        self.light_reject[i] = LightReject::Dark;
+        if had_dark {
+            self.light_reject[i] = LightReject::Dark;
+        } else {
+            // Crowd thin only — not a dark reject.
+            let had_alive = self.columns[i].occupants.iter().any(|o| o.alive);
+            if had_alive {
+                self.light_reject[i] = LightReject::None;
+            }
+        }
         kills.sort_unstable();
         kills.dedup();
         for oi in kills.into_iter().rev() {
-            self.columns[i].occupants.remove(oi);
+            if oi < self.columns[i].occupants.len() {
+                self.columns[i].occupants.remove(oi);
+            }
         }
+    }
+
+    /// Fitness score for crowd thin: f_L · f_w · f_T · height_frac. S15.
+    fn crowd_fitness_at(&self, i: usize, oi: usize, received: f64, t_air: f64) -> f64 {
+        let occ = &self.columns[i].occupants[oi];
+        if !occ.alive {
+            return f64::INFINITY; // skip dead
+        }
+        let (form, t_min, t_max) = match occ.taxon_id.as_deref() {
+            Some(tid) => match self.catalog.get(tid) {
+                Ok(p) => (p.form, p.t_min_c, p.t_max_c),
+                Err(_) => (Form::Herb, None, None),
+            },
+            None => (Form::Herb, None, None),
+        };
+        let l_min = l_min_for_form(form);
+        let l_opt = l_opt_for_shade(occ.shade_class);
+        let f_l = f_l_growth(received, l_min, l_opt);
+        let f_w = f_w_growth(&self.columns[i], occ);
+        let f_t = f_t_growth(t_air, t_min, t_max);
+        f_l * f_w * f_t * occ.height_frac
     }
 
     /// Growth clock on live visit set (once per live tick, after light). S14.
@@ -1885,13 +1997,18 @@ impl World {
         false
     }
 
-    /// One light walk if needed, then one growth step on the work set. S14.1.
+    /// One light walk (compress + crowd) then one growth step on the work set. S14.1/S15.
+    /// When any living occupant is present, light runs every calendar block so the crowd
+    /// counter matches live per-block cadence; empty work sets skip the O(n) light walk.
     /// L held for the block via last_light; θ/T from current catch_up aggregates.
     fn apply_catchup_light_and_growth(&mut self, ids: &[usize]) {
         if ids.is_empty() {
             return;
         }
-        if self.work_set_needs_light(ids) {
+        let any_alive = ids.iter().any(|&i| {
+            self.columns[i].occupants.iter().any(|o| o.alive)
+        });
+        if any_alive {
             self.apply_light_filter_ids(ids);
         }
         self.apply_growth_ids(ids);
@@ -2265,7 +2382,8 @@ impl World {
                 if !self.columns[i].occupants[oi].alive {
                     continue;
                 }
-                let u = self.columns[i].occupants[oi].uptake_max;
+                let u = self.columns[i].occupants[oi].uptake_max
+                    * self.columns[i].occupants[oi].band_scale;
                 let root = self.columns[i].occupants[oi].root;
                 let mut taken = 0.0f64;
                 for k in 0..N_LAYERS {
@@ -3223,7 +3341,8 @@ impl World {
                 if !self.columns[i].occupants[oi].alive {
                     continue;
                 }
-                let u = self.columns[i].occupants[oi].uptake_max;
+                let u = self.columns[i].occupants[oi].uptake_max
+                    * self.columns[i].occupants[oi].band_scale;
                 let root = self.columns[i].occupants[oi].root;
                 let mut taken = 0.0f64;
                 for k in 0..N_LAYERS {

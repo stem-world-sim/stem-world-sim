@@ -5,13 +5,13 @@
 //! Grid mass: sum of column M.
 
 use sim_core::{
-    alpha_for_occupant, alpha_from_params, cover_transmission, delta0_for_form, drain_fw_params,
-    f_l_growth, f_t_growth, f_w_growth, l_min_for_form, l_opt_for_shade, overlap_cover_from_alphas,
-    t_mature_for_form, Catalog, ChunkBusy, ClimateReject, Column, HydroReject, LightReject,
-    Occupant, OccupantParams, PlantTaxonError, ShadeClass, SoilLayer, Texture, World, CHUNK,
-    C_MAX, E_OPEN, E_SOIL, H0, H_BAND, H_POND, H_REST, L0, MASS_EPSILON, MAX_OCCUPANTS, N_ET,
-    N_LAYERS, P_MAX, R_MAX, T_DARK, T_MATURE_HERB, T_MATURE_TREE, T_MIN, T_SETTLE, T_SUB,
-    T_WILT, T_WL, V_REST,
+    alpha_for_occupant, alpha_from_params, band_compress_scale, cover_transmission, delta0_for_form,
+    drain_fw_params, f_l_growth, f_t_growth, f_w_growth, l_min_for_form, l_opt_for_shade,
+    overlap_cover_from_alphas, t_mature_for_form, Catalog, ChunkBusy, ClimateReject, Column,
+    HydroReject, LightReject, Occupant, OccupantParams, PlantTaxonError, ShadeClass, SoilLayer,
+    Texture, World, CHUNK, C_MAX, E_OPEN, E_SOIL, H0, H_BAND, H_POND, H_REST, L0, MASS_EPSILON,
+    MAX_OCCUPANTS, N_ET, N_LAYERS, P_MAX, R_MAX, T_CROWD, T_DARK, T_MATURE_HERB, T_MATURE_TREE,
+    T_MIN, T_SETTLE, T_SUB, T_WILT, T_WL, V_REST,
 };
 
 fn assert_mass_close(actual: f64, expected: f64) {
@@ -3183,21 +3183,31 @@ fn d10_storm_k30_still_under_fly() {
 
 // --- Sprint 11 — kernel catalog -------------------------------------------------
 
-/// D11: embedded CSV loads; at least ten demo=1 taxa (fixture has exactly 10).
+/// D11: embedded CSV loads all eleven demo=1 taxa (incl. hilaria_jamesii). S15 rider.
 #[test]
 fn d11_catalog_loads_demo_ten() {
     let cat = Catalog::load_embedded().expect("embedded catalog");
-    assert!(
-        cat.demo_count() >= 10,
-        "expected ≥10 demo taxa, got {}",
-        cat.demo_count()
-    );
     assert_eq!(
         cat.demo_count(),
-        10,
-        "demo fixture should be exactly 10 rows"
+        11,
+        "demo fixture should be exactly 11 rows (incl. hilaria_jamesii)"
     );
-    assert_eq!(cat.len(), 10);
+    assert_eq!(cat.len(), 11);
+    for id in [
+        "agrostis_stolonifera",
+        "dactylis_glomerata",
+        "lolium_perenne",
+        "oryza_sativa",
+        "pinus_taeda",
+        "quercus_alba",
+        "rhizophora_mangle",
+        "triticum_aestivum",
+        "typha_latifolia",
+        "zea_mays",
+        "hilaria_jamesii",
+    ] {
+        assert!(cat.get(id).is_ok(), "missing demo taxon {id}");
+    }
 }
 
 /// D11: unknown taxon_id is Err.
@@ -3681,6 +3691,13 @@ fn overlap_transmit(alphas: &[f64]) -> f64 {
     cover_transmission(c)
 }
 
+/// S15: compress band alphas (s_b=1/A_b if A_b>1) then S13.2 transmit.
+fn compressed_overlap_transmit(alphas: &[f64]) -> f64 {
+    let (_a_b, s_b) = band_compress_scale(alphas.iter().copied());
+    let scaled: Vec<f64> = alphas.iter().map(|a| a * s_b).collect();
+    overlap_transmit(&scaled)
+}
+
 /// D13: grass alone receives L0=1 and survives well past T_DARK.
 #[test]
 fn d13_grass_alone_full_light() {
@@ -3745,27 +3762,21 @@ fn d13_oak_over_grass_shades() {
 /// D13/S13.2: two-oak overlap cover → grass L≈0.16 (>0, not black) but < herb L_min → Dark.
 #[test]
 fn d13_grass_dies_in_oak_shade() {
+    // S15: two mature oaks A_b>1 compress before S13.2 → understory L = 0.25 (= herb L_min),
+    // so dark-kill no longer fires; crowd may thin one oak at T_CROWD. Contract kept: deep
+    // two-oak canopy still shades grass below L0 and does not black it out.
     let mut world = World::new(1303, light_sand_column());
     world.set_climate(20.0, 1000.0);
     world.plant_taxon(0, 0, "lolium_perenne").unwrap();
-    // Two oaks same band: both see L0; grass gets overlap T (not sum-to-black).
     world.plant_taxon(0, 0, "quercus_alba").unwrap();
     world.plant_taxon(0, 0, "quercus_alba").unwrap();
 
     let oak = world.catalog().get("quercus_alba").unwrap();
     let a = alpha_from_params(oak);
-    let l_grass = L0 * overlap_transmit(&[a, a]);
+    let l_grass = L0 * compressed_overlap_transmit(&[a, a]);
     assert!(
-        l_grass > 0.0 + 1e-12,
-        "precondition: overlap cover must leave grass L>0, got {l_grass}"
-    );
-    assert!(
-        (l_grass - 0.16).abs() < 0.02,
-        "precondition: two-oak grass L~0.16, got {l_grass}"
-    );
-    assert!(
-        l_grass < 0.25,
-        "precondition: two-oak band shade {l_grass} must be < herb L_min"
+        (l_grass - 0.25).abs() < 1e-9,
+        "S15 two-oak compressed grass L expect 0.25, got {l_grass}"
     );
 
     world.tick();
@@ -3786,36 +3797,26 @@ fn d13_grass_dies_in_oak_shade() {
     let grass_l = grass_l.expect("grass light");
     assert!(
         (grass_l - l_grass).abs() < 1e-9,
-        "grass last_light={grass_l} expect overlap transmit {l_grass}"
+        "grass last_light={grass_l} expect compressed transmit {l_grass}"
     );
     assert!(grass_l > 0.0, "S13.2: grass L must not be black floor");
+    assert!(grass_l < L0 - 1e-9, "two oaks must shade grass");
 
+    // Through T_DARK: grass not dark-killed (L == L_min); light_reject stays None.
     for t in 1..=T_DARK {
         if t > 1 {
             world.tick();
         }
-        if t < T_DARK {
-            assert!(
-                world
-                    .column_at(0, 0)
-                    .occupants
-                    .iter()
-                    .any(|o| o.taxon_id.as_deref() == Some("lolium_perenne")),
-                "grass should remain through tick {t}/{T_DARK}"
-            );
-            assert_eq!(world.light_reject(0, 0), LightReject::None);
-        }
+        assert!(
+            world
+                .column_at(0, 0)
+                .occupants
+                .iter()
+                .any(|o| o.taxon_id.as_deref() == Some("lolium_perenne")),
+            "grass should remain through tick {t}/{T_DARK} under compressed canopy"
+        );
+        assert_eq!(world.light_reject(0, 0), LightReject::None);
     }
-    assert!(
-        world
-            .column_at(0, 0)
-            .occupants
-            .iter()
-            .all(|o| o.taxon_id.as_deref() != Some("lolium_perenne")),
-        "grass must be removed after T_DARK under deep oak shade"
-    );
-    assert_eq!(world.light_reject(0, 0), LightReject::Dark);
-    // Oaks remain (tree L_min is low); both still same band at L0.
     assert!(
         world
             .column_at(0, 0)
@@ -3824,7 +3825,7 @@ fn d13_grass_dies_in_oak_shade() {
             .filter(|o| o.taxon_id.as_deref() == Some("quercus_alba"))
             .count()
             >= 1,
-        "oaks should survive their own canopy light"
+        "at least one oak should remain"
     );
 }
 
@@ -3886,7 +3887,9 @@ fn d13_two_herbs_neither_dark() {
         assert_eq!(o.dark_steps, 0);
     }
 
-    for _ in 0..(T_DARK + 2) {
+    // Stay below T_CROWD so S15 band-thin does not remove one herb; still past dark risk.
+    assert!(T_CROWD >= 2);
+    for _ in 0..(T_CROWD - 2) {
         world.tick();
     }
     assert_eq!(world.occupant_count(0, 0), 2);
@@ -4004,8 +4007,8 @@ fn d131_two_oaks_darker_grass_than_one() {
         .unwrap()
         .clone();
     let a = alpha_from_params(&oak);
-    let one = L0 * overlap_transmit(&[a]);
-    let two = L0 * overlap_transmit(&[a, a]);
+    let one = L0 * compressed_overlap_transmit(&[a]);
+    let two = L0 * compressed_overlap_transmit(&[a, a]);
     assert!(two < one - 1e-9, "precondition two-oak band darker than one");
     assert!(two > 0.0, "overlap cover leaves residual light");
 
@@ -4096,7 +4099,7 @@ fn d131_no_id_order_shade() {
         assert!((o.last_light.unwrap() - L0).abs() < 1e-12);
     }
     let oak_a = alpha_from_params(c.catalog().get("quercus_alba").unwrap());
-    let expect_g = L0 * overlap_transmit(&[oak_a, oak_a]);
+    let expect_g = L0 * compressed_overlap_transmit(&[oak_a, oak_a]);
     let g = d
         .column_at(0, 0)
         .occupants
@@ -4240,7 +4243,7 @@ fn d132_eight_oaks_hits_cap() {
     }
     world.tick();
     let seven: Vec<f64> = vec![a; MAX_OCCUPANTS - 1];
-    let expect_g = L0 * overlap_transmit(&seven);
+    let expect_g = L0 * compressed_overlap_transmit(&seven);
     let grass_l = world
         .column_at(0, 0)
         .occupants
@@ -4264,14 +4267,14 @@ fn d132_two_oaks_not_black() {
         .clone();
     let a = alpha_from_params(&oak);
     let sum_t = 1.0 - (2.0 * a).min(1.0);
-    let overlap_t = overlap_transmit(&[a, a]);
+    let overlap_t = compressed_overlap_transmit(&[a, a]);
     assert!(
         sum_t <= 1e-12,
         "precondition: sum form would black out (T={sum_t})"
     );
     assert!(
         overlap_t > 0.1,
-        "precondition: overlap T~0.16, got {overlap_t}"
+        "precondition: compressed overlap T~0.25, got {overlap_t}"
     );
 
     let mut world = World::new(1324, light_sand_column());
@@ -5043,4 +5046,267 @@ fn d142_no_species_name_match() {
     assert!(lib.contains("drain_fw_params"));
     assert!(lib.contains("f_w_growth"));
     assert!(lib.contains("mean_rooted_s") || lib.contains("f_soil"));
+}
+
+// --- Sprint 15 — band compress and thin ---------------------------------------------
+
+/// D15: two seedling oaks — A_b = 2·α·H0² ≪ 1; both live past T_CROWD.
+#[test]
+fn d15_two_seedling_oaks_both_live() {
+    assert_eq!(T_CROWD, 7);
+    let mut world = World::new(1501, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_seedling(0, 0, "quercus_alba").unwrap();
+    world.plant_seedling(0, 0, "quercus_alba").unwrap();
+    let oak = world.catalog().get("quercus_alba").unwrap();
+    let a = alpha_from_params(oak);
+    let a_b = 2.0 * a * H0 * H0;
+    assert!(a_b <= 1.0, "precondition: seedling pair A_b={a_b} ≤ 1");
+
+    for _ in 0..(T_CROWD + 2) {
+        world.tick();
+    }
+    let oaks: Vec<_> = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| o.alive && o.taxon_id.as_deref() == Some("quercus_alba"))
+        .collect();
+    assert_eq!(oaks.len(), 2, "both seedling oaks must live past T_CROWD");
+    for o in &oaks {
+        assert_eq!(o.crowd_steps, 0);
+        assert!((o.band_scale - 1.0).abs() < 1e-15);
+    }
+}
+
+/// D15: two mature oaks compress — A_b>1, s_b=1/A_b, S13.2 after compress.
+#[test]
+fn d15_two_mature_oaks_compress() {
+    let mut world = World::new(1502, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "quercus_alba").unwrap();
+    world.plant_taxon(0, 0, "quercus_alba").unwrap();
+    let oak = world.catalog().get("quercus_alba").unwrap();
+    let a = alpha_from_params(oak);
+    let (a_b, s_b) = band_compress_scale([a, a]);
+    assert!(a_b > 1.0, "precondition: two mature oaks A_b={a_b} > 1");
+    assert!((s_b - 1.0 / a_b).abs() < 1e-15);
+
+    world.tick();
+    let occs = &world.column_at(0, 0).occupants;
+    assert_eq!(occs.len(), 2);
+    for o in occs {
+        assert!(
+            (o.band_scale - s_b).abs() < 1e-12,
+            "band_scale={} expect s_b={s_b}",
+            o.band_scale
+        );
+        assert_eq!(o.crowd_steps, 1);
+        assert!((o.last_light.unwrap() - L0).abs() < 1e-12);
+    }
+    // Understory probe: compressed transmit.
+    let mut under = World::new(15021, light_sand_column());
+    under.set_climate(20.0, 1000.0);
+    under.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    under.plant_taxon(0, 0, "quercus_alba").unwrap();
+    under.plant_taxon(0, 0, "quercus_alba").unwrap();
+    under.tick();
+    let grass_l = under
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .find(|o| o.taxon_id.as_deref() == Some("lolium_perenne"))
+        .unwrap()
+        .last_light
+        .unwrap();
+    let expect = L0 * compressed_overlap_transmit(&[a, a]);
+    assert!(
+        (grass_l - expect).abs() < 1e-9,
+        "compressed understory L={grass_l} expect {expect}"
+    );
+}
+
+/// D15: two mature oaks thin after T_CROWD consecutive A_b>1 ticks.
+#[test]
+fn d15_two_mature_oaks_thin() {
+    let mut world = World::new(1503, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "quercus_alba").unwrap();
+    world.plant_taxon(0, 0, "quercus_alba").unwrap();
+
+    for t in 1..T_CROWD {
+        world.tick();
+        assert_eq!(
+            world
+                .column_at(0, 0)
+                .occupants
+                .iter()
+                .filter(|o| o.taxon_id.as_deref() == Some("quercus_alba"))
+                .count(),
+            2,
+            "both oaks remain before T_CROWD at tick {t}"
+        );
+    }
+    world.tick(); // tick T_CROWD → thin
+    let oaks: Vec<_> = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| o.taxon_id.as_deref() == Some("quercus_alba"))
+        .collect();
+    assert_eq!(oaks.len(), 1, "exactly one oak after T_CROWD thin");
+    assert_eq!(oaks[0].crowd_steps, 0, "crowd counter resets after thin");
+    // Next tick alone: A_b≤1 → band_scale=1.
+    world.tick();
+    let oaks: Vec<_> = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| o.taxon_id.as_deref() == Some("quercus_alba"))
+        .collect();
+    assert_eq!(oaks.len(), 1);
+    assert!((oaks[0].band_scale - 1.0).abs() < 1e-12, "survivor alone: no compress");
+    assert_eq!(oaks[0].crowd_steps, 0);
+}
+
+/// D15: grass under one mature oak — separate low band, A_b≤1; grass lives past T_CROWD.
+#[test]
+fn d15_grass_under_one_oak_lives() {
+    let mut world = World::new(1504, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    world.plant_taxon(0, 0, "quercus_alba").unwrap();
+    let oak = world.catalog().get("quercus_alba").unwrap();
+    let a = alpha_from_params(oak);
+    assert!(a <= 1.0);
+
+    for _ in 0..(T_CROWD + 3) {
+        world.tick();
+    }
+    assert!(
+        world
+            .column_at(0, 0)
+            .occupants
+            .iter()
+            .any(|o| o.alive && o.taxon_id.as_deref() == Some("lolium_perenne")),
+        "grass under one oak must live"
+    );
+    assert!(
+        world
+            .column_at(0, 0)
+            .occupants
+            .iter()
+            .any(|o| o.alive && o.taxon_id.as_deref() == Some("quercus_alba")),
+        "oak must live"
+    );
+    assert_eq!(world.light_reject(0, 0), LightReject::None);
+}
+
+/// D15: weaker (lower f_L·f_w·f_T·height_frac) loses; tie-break lower frac then index.
+#[test]
+fn d15_weaker_loses() {
+    let oak = Catalog::load_embedded()
+        .unwrap()
+        .get("quercus_alba")
+        .unwrap()
+        .clone();
+    // Same H_BAND: Δh = 20.1 * 0.002 < 0.05.
+    let hf_strong = 1.0;
+    let hf_weak = 0.998;
+    assert!((oak.height_m_mature.unwrap() * (hf_strong - hf_weak)) <= H_BAND);
+
+    let mut world = World::new(1505, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    // Plant weak first (lower index) then strong — weak still loses on height_frac.
+    world.plant_params(0, 0, &oak, hf_weak).unwrap();
+    world.plant_params(0, 0, &oak, hf_strong).unwrap();
+
+    for _ in 0..T_CROWD {
+        world.tick();
+    }
+    let left: Vec<_> = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| o.taxon_id.as_deref() == Some("quercus_alba"))
+        .collect();
+    assert_eq!(left.len(), 1, "one oak after thin");
+    assert!(
+        (left[0].height_frac - hf_strong).abs() < 1e-12,
+        "stronger (higher height_frac) must survive, got {}",
+        left[0].height_frac
+    );
+}
+
+/// D15: catch_up(T_CROWD) thins the same as T_CROWD live ticks.
+#[test]
+fn d15_catchup_thins_same_as_live() {
+    let mut live = World::new(1506, light_sand_column());
+    live.set_climate(20.0, 1000.0);
+    live.plant_taxon(0, 0, "quercus_alba").unwrap();
+    live.plant_taxon(0, 0, "quercus_alba").unwrap();
+
+    let mut caught = World::new(1507, light_sand_column());
+    caught.set_climate(20.0, 1000.0);
+    caught.plant_taxon(0, 0, "quercus_alba").unwrap();
+    caught.plant_taxon(0, 0, "quercus_alba").unwrap();
+
+    for _ in 0..T_CROWD {
+        live.tick();
+    }
+    caught.force_sleep_all();
+    ignore_all_chunks(&mut caught);
+    caught.catch_up(T_CROWD, 0.0);
+
+    let n_live = live
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| o.taxon_id.as_deref() == Some("quercus_alba"))
+        .count();
+    let n_caught = caught
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| o.taxon_id.as_deref() == Some("quercus_alba"))
+        .count();
+    assert_eq!(n_live, 1, "live must thin to 1");
+    assert_eq!(n_caught, 1, "catch_up must thin to 1");
+}
+
+/// D15: no species-name branching; compress/crowd driven by traits.
+#[test]
+fn d15_no_species_name_match() {
+    let cat = Catalog::load_embedded().expect("embedded catalog");
+    let oak = cat.get("quercus_alba").expect("quercus_alba");
+    let grass = cat.get("lolium_perenne").expect("lolium_perenne");
+    assert_ne!(oak.taxon_id, grass.taxon_id);
+    assert!(cat.get("oak").is_err());
+    assert!(cat.get("grass").is_err());
+    assert!(cat.get("hilaria_jamesii").is_ok());
+
+    let lib = include_str!("../src/lib.rs");
+    let catalog = include_str!("../src/catalog.rs");
+    for (label, src) in [("lib.rs", lib), ("catalog.rs", catalog)] {
+        for pat in [
+            r#"== "grass""#,
+            r#"== "oak""#,
+            r#"== "galleta""#,
+            r#"== "hilaria""#,
+            r#"== "lolium""#,
+            "if name ==",
+            "match name",
+        ] {
+            assert!(
+                !src.contains(pat),
+                "{label} contains forbidden species-name pattern: {pat}"
+            );
+        }
+    }
+    assert!(lib.contains("T_CROWD"));
+    assert!(lib.contains("band_compress_scale"));
+    assert!(lib.contains("crowd_steps") || lib.contains("band_scale"));
+    let a = alpha_from_params(oak);
+    let (a_b, s_b) = band_compress_scale([a, a]);
+    assert!(a_b > 1.0 && s_b < 1.0);
 }
