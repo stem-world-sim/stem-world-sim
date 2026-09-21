@@ -14,11 +14,12 @@
 //! Lake snap: 4-connected components with h > V_REST and intra |ΔH| ≤ H_REST snap to
 //! mean H* with Σh conserved; mark snapped cells at_rest. S04 sleep kept.
 //! ET: pond first (E_OPEN) else top-layer soil (E_SOIL, may go below θ_fc); skip ≤ V_REST.
-//! S = clamp(sum alive shade, 0, 1); E_eff = E * (1 - S). PlantStub shade default 0.25.
+//! S = clamp(sum alive alphas, 0, 1); E_eff = E * (1 - S). PlantStub shade field 0.25; ET uses alpha_for.
 //! Occupants: per-cell list ≤ MAX_OCCUPANTS; PlantStub uptake by root mask; wilt at T_WILT.
 //! Catalog: typed OccupantParams from embedded kernel_catalog.csv; root_mask by depth/form.
 //! S12/S12.1: world climate (T_air_c, rain_year_mm); live plant/tick use T only;
 //! catch_up may still apply rain_year vs EcoCrop. Hydro: waterlog/submerge from drain_ok+height.
+//! S13: height-sorted light L0=1; alpha from SLA/form; dark kill T_DARK; ET uses same alpha.
 //! catch_up(K, rain): optional source dump; then K blocks of (≤N_ET hydro, 1 unit sink).
 //! catch_up_chunk: same calendar on one chunk + 1-cell halo; other chunks unchanged.
 //! Unique-min-H chute revoked. Capillary stays.
@@ -81,6 +82,12 @@ pub const T_WL_D: u32 = 3;
 
 /// Consecutive live ticks submerged (h_surf >= height) before remove. S12.1.
 pub const T_SUB: u32 = 7;
+
+/// Consecutive live ticks below L_min before light-dark remove. S13.
+pub const T_DARK: u32 = 7;
+
+/// Incident light at canopy top (dimensionless). S13.
+pub const L0: f64 = 1.0;
 
 /// Soil texture: porosity, field capacity, infiltrate and drain rate limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,6 +152,10 @@ pub struct Occupant {
     pub waterlog_steps: u32,
     /// Consecutive live ticks with h_surf >= effective height. S12.1.
     pub submerge_steps: u32,
+    /// Consecutive live ticks with received light < L_min. S13.
+    pub dark_steps: u32,
+    /// Last incoming light (before own alpha) from the light pass. S13.
+    pub last_light: Option<f64>,
 }
 
 impl Occupant {
@@ -160,6 +171,8 @@ impl Occupant {
             taxon_id: None,
             waterlog_steps: 0,
             submerge_steps: 0,
+            dark_steps: 0,
+            last_light: None,
         }
     }
 
@@ -175,6 +188,8 @@ impl Occupant {
             taxon_id: None,
             waterlog_steps: 0,
             submerge_steps: 0,
+            dark_steps: 0,
+            last_light: None,
         }
     }
 }
@@ -201,6 +216,14 @@ pub enum HydroReject {
     None,
     Waterlog,
     Submerged,
+}
+
+/// S13 light reject reason (height-layered dark). Independent of climate/hydro reject.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LightReject {
+    #[default]
+    None,
+    Dark,
 }
 
 /// Error from [`World::plant_taxon`].
@@ -284,6 +307,57 @@ fn waterlog_limit(drain_ok: Option<&str>) -> u32 {
 
 fn drain_ok_has_w(drain_ok: Option<&str>) -> bool {
     drain_ok.map(|s| s.contains('W')).unwrap_or(false)
+}
+
+/// Canopy alpha from SLA or form defaults. S13.
+pub fn alpha_from_params(params: &OccupantParams) -> f64 {
+    if let Some(s) = params.sla_m2_kg {
+        (0.55 - 0.01 * (s - 20.0)).clamp(0.15, 0.85)
+    } else {
+        match params.form {
+            Form::Herb => 0.25,
+            Form::Shrub => 0.45,
+            Form::Tree => 0.60,
+        }
+    }
+}
+
+/// Minimum received light by form. S13.
+pub fn l_min_for_form(form: Form) -> f64 {
+    match form {
+        Form::Herb => 0.25,
+        Form::Shrub => 0.15,
+        Form::Tree => 0.08,
+    }
+}
+
+/// Alpha for an alive occupant; PlantStub without taxon_id → herb 0.25. Dead → 0. S13.
+pub fn alpha_for_occupant(catalog: &Catalog, occ: &Occupant) -> f64 {
+    if !occ.alive {
+        return 0.0;
+    }
+    match occ.taxon_id.as_deref() {
+        Some(tid) => match catalog.get(tid) {
+            Ok(p) => alpha_from_params(p),
+            Err(_) => 0.25,
+        },
+        None => 0.25,
+    }
+}
+
+fn light_traits_for_occupant(catalog: &Catalog, occ: &Occupant) -> (f64, f64, f64) {
+    // (height_m, alpha, l_min)
+    match occ.taxon_id.as_deref() {
+        Some(tid) => match catalog.get(tid) {
+            Ok(p) => (
+                effective_height_m(p),
+                alpha_from_params(p),
+                l_min_for_form(p.form),
+            ),
+            Err(_) => (0.4, 0.25, 0.25),
+        },
+        None => (0.4, 0.25, 0.25),
+    }
 }
 
 /// Historical S09 busy signal. S09.1: [`World::ignore_chunk`] always succeeds (never Err).
@@ -707,6 +781,8 @@ pub struct World {
     climate_reject: Vec<ClimateReject>,
     /// Last hydro reject reason per cell. S12.1.
     hydro_reject: Vec<HydroReject>,
+    /// Last light reject reason per cell. S13.
+    light_reject: Vec<LightReject>,
 }
 
 impl World {
@@ -736,6 +812,7 @@ impl World {
             catalog: Catalog::load_embedded().expect("embedded kernel catalog"),
             climate_reject: vec![ClimateReject::None],
             hydro_reject: vec![HydroReject::None],
+            light_reject: vec![LightReject::None],
         }
     }
 
@@ -772,6 +849,7 @@ impl World {
             catalog: Catalog::load_embedded().expect("embedded kernel catalog"),
             climate_reject: vec![ClimateReject::None; n],
             hydro_reject: vec![HydroReject::None; n],
+            light_reject: vec![LightReject::None; n],
         }
     }
 
@@ -1225,6 +1303,7 @@ impl World {
         col.occupants.push(occ);
         self.climate_reject[i] = ClimateReject::None;
         self.hydro_reject[i] = HydroReject::None;
+        self.light_reject[i] = LightReject::None;
         self.wake_idx(i);
         Ok(())
     }
@@ -1271,6 +1350,11 @@ impl World {
     /// Last hydro reject reason for cell (x,y). S12.1.
     pub fn hydro_reject(&self, x: usize, y: usize) -> HydroReject {
         self.hydro_reject[self.idx(x, y)]
+    }
+
+    /// Last light reject reason for cell (x,y). S13.
+    pub fn light_reject(&self, x: usize, y: usize) -> LightReject {
+        self.light_reject[self.idx(x, y)]
     }
 
     /// Replace the world's catalog (tests / custom packs). S12.
@@ -1461,6 +1545,67 @@ impl World {
         }
     }
 
+    /// Height-layered light filter on live visit set. S13.
+    fn apply_light_filter_ids(&mut self, ids: &[usize]) {
+        for &i in ids {
+            self.apply_light_filter_at(i);
+        }
+    }
+
+    fn apply_light_filter_at(&mut self, i: usize) {
+        let occ_len = self.columns[i].occupants.len();
+        if occ_len == 0 {
+            return;
+        }
+
+        // Traits snapshot: (oi, height, alpha, l_min) for alive occupants.
+        let mut rows: Vec<(usize, f64, f64, f64)> = Vec::new();
+        for oi in 0..occ_len {
+            if !self.columns[i].occupants[oi].alive {
+                continue;
+            }
+            let (h, a, lmin) =
+                light_traits_for_occupant(&self.catalog, &self.columns[i].occupants[oi]);
+            rows.push((oi, h, a, lmin));
+        }
+        // Tallest first; stable on equal height (insert order).
+        rows.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut l = L0;
+        let mut kills: Vec<usize> = Vec::new();
+        for &(oi, _h, alpha, l_min) in &rows {
+            let received = l;
+            self.columns[i].occupants[oi].last_light = Some(received);
+            if received < l_min {
+                self.columns[i].occupants[oi].dark_steps =
+                    self.columns[i].occupants[oi].dark_steps.saturating_add(1);
+            } else {
+                self.columns[i].occupants[oi].dark_steps = 0;
+            }
+            if self.columns[i].occupants[oi].dark_steps >= T_DARK {
+                kills.push(oi);
+            }
+            l *= 1.0 - alpha;
+        }
+
+        if kills.is_empty() {
+            let had_alive = self.columns[i].occupants.iter().any(|o| o.alive);
+            if had_alive {
+                self.light_reject[i] = LightReject::None;
+            }
+            return;
+        }
+
+        self.light_reject[i] = LightReject::Dark;
+        kills.sort_unstable();
+        kills.dedup();
+        for oi in kills.into_iter().rev() {
+            self.columns[i].occupants.remove(oi);
+        }
+    }
+
     /// Infiltrate every column (rate-limited); no runoff/drain; advances clock.
     pub fn tick_infiltration(&mut self) {
         self.infiltrate_all();
@@ -1512,11 +1657,12 @@ impl World {
                 self.prune_awake();
             }
         }
-        // S12.1: live climate = T only; hydro waterlog/submerge on visit set.
+        // S12.1/S13: live climate = T only; hydro + height-layered light on visit set.
         let climate_ids = self.visit_indices();
         if !climate_ids.is_empty() {
             self.apply_climate_filter_ids(&climate_ids, false);
             self.apply_hydro_filter_ids(&climate_ids);
+            self.apply_light_filter_ids(&climate_ids);
         }
     }
 
@@ -1778,13 +1924,12 @@ impl World {
         for &i in ids {
             let (take, from_pond) = {
                 let col = &self.columns[i];
-                let sum_shade: f64 = col
+                let sum_alpha: f64 = col
                     .occupants
                     .iter()
-                    .filter(|o| o.alive)
-                    .map(|o| o.shade)
+                    .map(|o| alpha_for_occupant(&self.catalog, o))
                     .sum();
-                let shade_factor = 1.0 - sum_shade.clamp(0.0, 1.0);
+                let shade_factor = 1.0 - sum_alpha.clamp(0.0, 1.0);
                 if col.surface_water_m > 0.0 {
                     let e_eff = E_OPEN * shade_factor;
                     (col.surface_water_m.min(e_eff), true)
@@ -2714,8 +2859,8 @@ impl World {
         }
     }
 
-    /// S05/S07 batched evaporation: one ET-step (E*1). Pond first if h>0, else top soil.
-    /// S = clamp(sum alive shade, 0, 1); E_eff = E * (1 - S). Dead/wilted shade = 0.
+    /// S05/S07/S13 batched evaporation: one ET-step (E*1). Pond first if h>0, else top soil.
+    /// S = clamp(sum alive alphas, 0, 1); E_eff = E * (1 - S). Dead/wilted alpha = 0.
     /// Skip take ≤ V_REST. Wakes cells that lose > V_REST via `busy`.
     fn et_pass(&mut self, busy: &mut [bool], active: Option<&[bool]>) {
         let n = self.columns.len();
@@ -2727,13 +2872,12 @@ impl World {
             }
             let (take, from_pond) = {
                 let col = &self.columns[i];
-                let sum_shade: f64 = col
+                let sum_alpha: f64 = col
                     .occupants
                     .iter()
-                    .filter(|o| o.alive)
-                    .map(|o| o.shade)
+                    .map(|o| alpha_for_occupant(&self.catalog, o))
                     .sum();
-                let shade_factor = 1.0 - sum_shade.clamp(0.0, 1.0);
+                let shade_factor = 1.0 - sum_alpha.clamp(0.0, 1.0);
                 if col.surface_water_m > 0.0 {
                     let e_eff = E_OPEN * shade_factor;
                     (col.surface_water_m.min(e_eff), true)
