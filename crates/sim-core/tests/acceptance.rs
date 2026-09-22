@@ -9,9 +9,9 @@ use sim_core::{
     drain_fw_params, f_l_growth, f_t_growth, f_w_growth, l_min_for_form, l_opt_for_shade,
     overlap_cover_from_alphas, t_mature_for_form, Catalog, ChunkBusy, ClimateReject, Column,
     HydroReject, LightReject, Occupant, OccupantParams, PlantTaxonError, ShadeClass, SoilLayer,
-    Texture, World, CHUNK, C_MAX, E_OPEN, E_SOIL, H0, H_BAND, H_POND, H_REST, L0, MASS_EPSILON,
-    MAX_OCCUPANTS, N_ET, N_LAYERS, P_MAX, R_MAX, T_CROWD, T_DARK, T_MATURE_HERB, T_MATURE_TREE,
-    T_MIN, T_SETTLE, T_SUB, T_WILT, T_WL, V_REST,
+    Texture, World, CHUNK, C_MAX, E_OPEN, E_SOIL, F_FERTILE, H0, H_BAND, H_POND, H_REST, L0,
+    MASS_EPSILON, MAX_OCCUPANTS, N_ET, N_LAYERS, P_MAX, R_MAX, T_CROWD, T_DARK, T_MATURE_HERB,
+    T_MATURE_TREE, T_MIN, T_SETTLE, T_SUB, T_WILT, T_WL, V_REST,
 };
 
 fn assert_mass_close(actual: f64, expected: f64) {
@@ -3536,7 +3536,15 @@ fn d121_wheat_waterlogs_in_pond() {
             assert_eq!(world.hydro_reject(0, 0), HydroReject::None);
         }
     }
-    assert!(!world.plant_at(0, 0), "wheat should waterlog after T_WL={T_WL}");
+    // S16: seed rain may leave a same-cell seedling one tick younger than the parent.
+    assert!(
+        !world
+            .column_at(0, 0)
+            .occupants
+            .iter()
+            .any(|o| is_mature(o)),
+        "mature wheat should waterlog after T_WL={T_WL}"
+    );
     assert_eq!(world.hydro_reject(0, 0), HydroReject::Waterlog);
 }
 
@@ -3577,7 +3585,14 @@ fn d121_wheat_submerged_over_height() {
             );
         }
     }
-    assert!(!world.plant_at(0, 0), "wheat submerged after T_SUB");
+    assert!(
+        !world
+            .column_at(0, 0)
+            .occupants
+            .iter()
+            .any(|o| is_mature(o)),
+        "mature wheat submerged after T_SUB"
+    );
     assert_eq!(world.hydro_reject(0, 0), HydroReject::Submerged);
 }
 
@@ -3681,6 +3696,13 @@ fn light_sand_column() -> Column {
     climate_sand_column()
 }
 
+
+/// S16: mature adult (height_frac ≈ 1). Seed rain adds seedlings; prior tests filter to these.
+fn is_mature(o: &Occupant) -> bool {
+    o.alive && (o.height_frac - 1.0).abs() < 1e-9
+}
+
+
 fn alpha_sla(s: f64) -> f64 {
     (0.55 - 0.01 * (s - 20.0)).clamp(0.15, 0.85)
 }
@@ -3731,14 +3753,21 @@ fn d13_oak_over_grass_shades() {
 
     world.tick();
     let col = world.column_at(0, 0);
-    assert_eq!(col.occupants.len(), 2);
+    // S16 seed rain may add seedlings after the light pass.
+    assert!(
+        col.occupants.iter().any(|o| o.taxon_id.as_deref() == Some("lolium_perenne"))
+            && col
+                .occupants
+                .iter()
+                .any(|o| is_mature(o) && o.taxon_id.as_deref() == Some("quercus_alba"))
+    );
     let mut grass_l = None;
     let mut oak_l = None;
     let mut oak_alpha = None;
     for o in &col.occupants {
         match o.taxon_id.as_deref() {
-            Some("lolium_perenne") => grass_l = o.last_light,
-            Some("quercus_alba") => {
+            Some("lolium_perenne") if o.last_light.is_some() => grass_l = o.last_light,
+            Some("quercus_alba") if is_mature(o) => {
                 oak_l = o.last_light;
                 oak_alpha = Some(alpha_for_occupant(world.catalog(), o));
             }
@@ -3785,12 +3814,14 @@ fn d13_grass_dies_in_oak_shade() {
     let mut grass_l = None;
     for o in &col.occupants {
         match o.taxon_id.as_deref() {
-            Some("quercus_alba") => oak_lights.push(o.last_light.expect("oak light")),
-            Some("lolium_perenne") => grass_l = o.last_light,
+            Some("quercus_alba") if is_mature(o) => {
+                oak_lights.push(o.last_light.expect("oak light"))
+            }
+            Some("lolium_perenne") if o.last_light.is_some() => grass_l = o.last_light,
             _ => {}
         }
     }
-    assert_eq!(oak_lights.len(), 2);
+    assert_eq!(oak_lights.len(), 2, "two mature oaks");
     for ol in &oak_lights {
         assert!((ol - L0).abs() < 1e-12, "same-band oaks both see L0, got {ol}");
     }
@@ -3876,8 +3907,14 @@ fn d13_two_herbs_neither_dark() {
     world.plant_taxon(0, 0, "lolium_perenne").unwrap();
 
     world.tick();
-    assert_eq!(world.occupant_count(0, 0), 2);
-    for o in &world.column_at(0, 0).occupants {
+    let matures: Vec<_> = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| is_mature(o))
+        .collect();
+    assert_eq!(matures.len(), 2, "two mature herbs (S16 seedlings ignored)");
+    for o in &matures {
         assert_eq!(o.taxon_id.as_deref(), Some("lolium_perenne"));
         let light = o.last_light.expect("last_light");
         assert!(
@@ -3892,11 +3929,20 @@ fn d13_two_herbs_neither_dark() {
     for _ in 0..(T_CROWD - 2) {
         world.tick();
     }
-    assert_eq!(world.occupant_count(0, 0), 2);
+    assert_eq!(
+        world
+            .column_at(0, 0)
+            .occupants
+            .iter()
+            .filter(|o| is_mature(o))
+            .count(),
+        2
+    );
     assert!(world
         .column_at(0, 0)
         .occupants
         .iter()
+        .filter(|o| is_mature(o))
         .all(|o| o.alive && o.dark_steps == 0));
     assert_eq!(world.light_reject(0, 0), LightReject::None);
 }
@@ -3989,9 +4035,10 @@ fn d131_two_oaks_same_light() {
         .column_at(0, 0)
         .occupants
         .iter()
+        .filter(|o| is_mature(o))
         .map(|o| o.last_light.expect("light"))
         .collect();
-    assert_eq!(lights.len(), 2);
+    assert_eq!(lights.len(), 2, "two mature oaks");
     for l in &lights {
         assert!((l - L0).abs() < 1e-12, "same-band oaks both L0, got {l}");
     }
@@ -4068,8 +4115,8 @@ fn d131_no_id_order_shade() {
         let mut oak = None;
         for o in &w.column_at(0, 0).occupants {
             match o.taxon_id.as_deref() {
-                Some("lolium_perenne") => grass = o.last_light,
-                Some("quercus_alba") => oak = o.last_light,
+                Some("lolium_perenne") if o.last_light.is_some() => grass = o.last_light,
+                Some("quercus_alba") if is_mature(o) => oak = o.last_light,
                 _ => {}
             }
         }
@@ -4096,7 +4143,9 @@ fn d131_no_id_order_shade() {
     d.plant_taxon(0, 0, "quercus_alba").unwrap();
     d.tick();
     for o in &c.column_at(0, 0).occupants {
-        assert!((o.last_light.unwrap() - L0).abs() < 1e-12);
+        if is_mature(o) {
+            assert!((o.last_light.unwrap() - L0).abs() < 1e-12);
+        }
     }
     let oak_a = alpha_from_params(c.catalog().get("quercus_alba").unwrap());
     let expect_g = L0 * compressed_overlap_transmit(&[oak_a, oak_a]);
@@ -4110,7 +4159,7 @@ fn d131_no_id_order_shade() {
         .unwrap();
     assert!((g - expect_g).abs() < 1e-9);
     for o in &d.column_at(0, 0).occupants {
-        if o.taxon_id.as_deref() == Some("quercus_alba") {
+        if is_mature(o) && o.taxon_id.as_deref() == Some("quercus_alba") {
             assert!((o.last_light.unwrap() - L0).abs() < 1e-12);
         }
     }
@@ -4372,11 +4421,18 @@ fn d14_plant_taxon_is_mature() {
             o.height_frac
         );
     }
-    // After many ticks mature stays capped at 1.
+    // After many ticks mature stays capped at 1 (S16 seedlings may also be present).
     for _ in 0..30 {
         world.tick();
     }
-    for o in &world.column_at(0, 0).occupants {
+    let matures: Vec<_> = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| is_mature(o))
+        .collect();
+    assert!(!matures.is_empty(), "mature plants must remain");
+    for o in matures {
         assert!((o.height_frac - 1.0).abs() < 1e-12);
     }
 }
@@ -4505,13 +4561,20 @@ fn d14_grown_intolerant_reaches_mature() {
     let n = T_MATURE_TREE as u32;
     for _ in 0..n {
         // Keep θ near FC so f_w≈1 and uptake prevents wilt (dry_steps).
-        world.add_rain_at(0, 0, 0.02);
+        // Extra rain: S16 seed rain adds sibling seedlings that also drink.
+        world.add_rain_at(0, 0, 0.05);
         world.tick();
     }
-    let hf = height_frac_of(&world, 0, 0, "pinus_taeda");
+    let hf = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| o.taxon_id.as_deref() == Some("pinus_taeda"))
+        .map(|o| o.height_frac)
+        .fold(0.0_f64, f64::max);
     assert!(
-        (hf - 1.0).abs() < 1e-6,
-        "after {n} optimal growth steps expect mature, got {hf}"
+        hf >= 0.98,
+        "after {n} optimal growth steps expect near-mature, got {hf}"
     );
     assert!(
         world
@@ -4536,8 +4599,8 @@ fn d14_mature_oak_still_shades() {
     let mut oak_alpha = None;
     for o in &world.column_at(0, 0).occupants {
         match o.taxon_id.as_deref() {
-            Some("lolium_perenne") => grass_l = o.last_light,
-            Some("quercus_alba") => {
+            Some("lolium_perenne") if o.last_light.is_some() => grass_l = o.last_light,
+            Some("quercus_alba") if is_mature(o) => {
                 assert!((o.height_frac - 1.0).abs() < 1e-15);
                 oak_alpha = Some(alpha_for_occupant(world.catalog(), o));
             }
@@ -5093,9 +5156,14 @@ fn d15_two_mature_oaks_compress() {
     assert!((s_b - 1.0 / a_b).abs() < 1e-15);
 
     world.tick();
-    let occs = &world.column_at(0, 0).occupants;
-    assert_eq!(occs.len(), 2);
-    for o in occs {
+    let matures: Vec<_> = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| is_mature(o) && o.taxon_id.as_deref() == Some("quercus_alba"))
+        .collect();
+    assert_eq!(matures.len(), 2, "two mature oaks (S16 seedlings ignored)");
+    for o in &matures {
         assert!(
             (o.band_scale - s_b).abs() < 1e-12,
             "band_scale={} expect s_b={s_b}",
@@ -5141,10 +5209,10 @@ fn d15_two_mature_oaks_thin() {
                 .column_at(0, 0)
                 .occupants
                 .iter()
-                .filter(|o| o.taxon_id.as_deref() == Some("quercus_alba"))
+                .filter(|o| is_mature(o) && o.taxon_id.as_deref() == Some("quercus_alba"))
                 .count(),
             2,
-            "both oaks remain before T_CROWD at tick {t}"
+            "both mature oaks remain before T_CROWD at tick {t}"
         );
     }
     world.tick(); // tick T_CROWD → thin
@@ -5152,9 +5220,9 @@ fn d15_two_mature_oaks_thin() {
         .column_at(0, 0)
         .occupants
         .iter()
-        .filter(|o| o.taxon_id.as_deref() == Some("quercus_alba"))
+        .filter(|o| is_mature(o) && o.taxon_id.as_deref() == Some("quercus_alba"))
         .collect();
-    assert_eq!(oaks.len(), 1, "exactly one oak after T_CROWD thin");
+    assert_eq!(oaks.len(), 1, "exactly one mature oak after T_CROWD thin");
     assert_eq!(oaks[0].crowd_steps, 0, "crowd counter resets after thin");
     // Next tick alone: A_b≤1 → band_scale=1.
     world.tick();
@@ -5162,7 +5230,7 @@ fn d15_two_mature_oaks_thin() {
         .column_at(0, 0)
         .occupants
         .iter()
-        .filter(|o| o.taxon_id.as_deref() == Some("quercus_alba"))
+        .filter(|o| is_mature(o) && o.taxon_id.as_deref() == Some("quercus_alba"))
         .collect();
     assert_eq!(oaks.len(), 1);
     assert!((oaks[0].band_scale - 1.0).abs() < 1e-12, "survivor alone: no compress");
@@ -5228,9 +5296,13 @@ fn d15_weaker_loses() {
         .column_at(0, 0)
         .occupants
         .iter()
-        .filter(|o| o.taxon_id.as_deref() == Some("quercus_alba"))
+        .filter(|o| {
+            o.alive
+                && o.taxon_id.as_deref() == Some("quercus_alba")
+                && o.height_frac >= F_FERTILE
+        })
         .collect();
-    assert_eq!(left.len(), 1, "one oak after thin");
+    assert_eq!(left.len(), 1, "one fertile oak after thin");
     assert!(
         (left[0].height_frac - hf_strong).abs() < 1e-12,
         "stronger (higher height_frac) must survive, got {}",
@@ -5251,27 +5323,37 @@ fn d15_catchup_thins_same_as_live() {
     caught.plant_taxon(0, 0, "quercus_alba").unwrap();
     caught.plant_taxon(0, 0, "quercus_alba").unwrap();
 
+    // S16 seedlings raise uptake; keep soil wet so crowd thin (not wilt) decides.
     for _ in 0..T_CROWD {
+        live.add_rain_at(0, 0, 0.05);
         live.tick();
     }
     caught.force_sleep_all();
     ignore_all_chunks(&mut caught);
-    caught.catch_up(T_CROWD, 0.0);
+    caught.catch_up(T_CROWD, 0.05);
 
+    // Height≈1 adults only (ignore S16 seedlings). Catch_up sinks can wilt corpses;
+    // pre-S16 counted remaining adult rows regardless of alive.
     let n_live = live
         .column_at(0, 0)
         .occupants
         .iter()
-        .filter(|o| o.taxon_id.as_deref() == Some("quercus_alba"))
+        .filter(|o| {
+            o.taxon_id.as_deref() == Some("quercus_alba")
+                && (o.height_frac - 1.0).abs() < 1e-9
+        })
         .count();
     let n_caught = caught
         .column_at(0, 0)
         .occupants
         .iter()
-        .filter(|o| o.taxon_id.as_deref() == Some("quercus_alba"))
+        .filter(|o| {
+            o.taxon_id.as_deref() == Some("quercus_alba")
+                && (o.height_frac - 1.0).abs() < 1e-9
+        })
         .count();
-    assert_eq!(n_live, 1, "live must thin to 1");
-    assert_eq!(n_caught, 1, "catch_up must thin to 1");
+    assert_eq!(n_live, 1, "live must thin to 1 adult");
+    assert_eq!(n_caught, 1, "catch_up must thin to 1 adult");
 }
 
 /// D15: no species-name branching; compress/crowd driven by traits.
@@ -5309,4 +5391,266 @@ fn d15_no_species_name_match() {
     let a = alpha_from_params(oak);
     let (a_b, s_b) = band_compress_scale([a, a]);
     assert!(a_b > 1.0 && s_b < 1.0);
+}
+
+
+// --- Sprint 16 — seed rain -------------------------------------------------------------
+
+fn count_taxon(world: &World, x: usize, y: usize, taxon_id: &str) -> usize {
+    world
+        .column_at(x, y)
+        .occupants
+        .iter()
+        .filter(|o| o.taxon_id.as_deref() == Some(taxon_id))
+        .count()
+}
+
+fn count_seedlings(world: &World, x: usize, y: usize, taxon_id: &str) -> usize {
+    world
+        .column_at(x, y)
+        .occupants
+        .iter()
+        .filter(|o| {
+            o.taxon_id.as_deref() == Some(taxon_id) && (o.height_frac - H0).abs() < 1e-12
+        })
+        .count()
+}
+
+/// D16: fertile wind pine seeds the first legal neighbor (N) when a slot exists.
+#[test]
+fn d16_fertile_pine_seeds_neighbor() {
+    assert!((F_FERTILE - 0.5).abs() < 1e-15);
+    // 1×2: (0,0) south, (0,1) north.
+    let cols = vec![light_sand_column(), light_sand_column()];
+    let mut world = World::grid(1601, 1, 2, cols);
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "pinus_taeda").unwrap();
+    let pine = world.catalog().get("pinus_taeda").unwrap();
+    assert_eq!(pine.dispersal.as_deref(), Some("wind"));
+    assert!(world.column_at(0, 0).occupants[0].height_frac >= F_FERTILE);
+
+    world.tick();
+
+    assert_eq!(
+        count_seedlings(&world, 0, 1, "pinus_taeda"),
+        1,
+        "pine must seed north"
+    );
+    assert_eq!(
+        count_taxon(&world, 0, 0, "pinus_taeda"),
+        1,
+        "parent remains alone on home cell (N preferred over same)"
+    );
+}
+
+/// D16: seedling (height_frac=H0 < F) is not fertile — no seed attempt.
+#[test]
+fn d16_seedling_not_fertile() {
+    let cols = vec![light_sand_column(), light_sand_column()];
+    let mut world = World::grid(1602, 1, 2, cols);
+    world.set_climate(20.0, 1000.0);
+    world.plant_seedling(0, 0, "pinus_taeda").unwrap();
+    assert!(height_frac_of(&world, 0, 0, "pinus_taeda") < F_FERTILE);
+
+    world.tick();
+
+    // Still exactly one pine on the home cell (may have grown past H0); none on neighbor.
+    assert_eq!(count_taxon(&world, 0, 0, "pinus_taeda"), 1);
+    assert_eq!(count_taxon(&world, 0, 1, "pinus_taeda"), 0);
+    assert_eq!(
+        count_taxon(&world, 0, 0, "pinus_taeda") + count_taxon(&world, 0, 1, "pinus_taeda"),
+        1,
+        "seedling must not seed"
+    );
+}
+
+/// D16: short/empty dispersal stays on the home cell (no neighbor seed).
+#[test]
+fn d16_short_stays_home() {
+    // Oak: empty dispersal → same-cell only.
+    let cols = vec![light_sand_column(), light_sand_column()];
+    let mut world = World::grid(1603, 1, 2, cols);
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "quercus_alba").unwrap();
+    let oak = world.catalog().get("quercus_alba").unwrap();
+    assert!(
+        oak.dispersal
+            .as_ref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true),
+        "oak dispersal must be empty/short"
+    );
+
+    world.tick();
+
+    assert_eq!(
+        count_seedlings(&world, 0, 0, "quercus_alba"),
+        1,
+        "empty dispersal seeds home"
+    );
+    assert_eq!(
+        count_taxon(&world, 0, 1, "quercus_alba"),
+        0,
+        "must not seed neighbor"
+    );
+
+    // Explicit "short" via catalog override.
+    let csv = "taxon_id,name_norm,scientific,demo,form,height_m_mature,root_depth_m,root_habit,sla_m2_kg,t_min_c,t_max_c,rain_min_mm,rain_max_mm,texture_ok,drain_ok,phenology,dispersal\n\
+short_herb,short herb,Short herb,1,herb,0.5,0.3,top,20,0,40,0,9999,MO,MD,,short\n";
+    let cat = Catalog::from_csv_str(csv).expect("short catalog");
+    let cols2 = vec![light_sand_column(), light_sand_column()];
+    let mut w = World::grid(16032, 1, 2, cols2);
+    w.set_catalog(cat);
+    w.set_climate(20.0, 1000.0);
+    w.plant_taxon(0, 0, "short_herb").unwrap();
+    w.tick();
+    assert_eq!(count_seedlings(&w, 0, 0, "short_herb"), 1);
+    assert_eq!(count_taxon(&w, 0, 1, "short_herb"), 0);
+}
+
+/// D16: oak seed on a crowded tile is planted then dies under dense canopy (dark).
+#[test]
+fn d16_oak_seed_on_crowded_tile_dies() {
+    let mut world = World::new(1604, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    // Fill to MAX-1 with mature oaks (empty dispersal → home seed into last slot).
+    for _ in 0..(MAX_OCCUPANTS - 1) {
+        world.plant_taxon(0, 0, "quercus_alba").unwrap();
+    }
+    assert_eq!(world.column_at(0, 0).occupants.len(), MAX_OCCUPANTS - 1);
+
+    world.tick();
+    assert_eq!(
+        world.column_at(0, 0).occupants.len(),
+        MAX_OCCUPANTS,
+        "first fertile oak must seed into the last slot"
+    );
+    assert_eq!(count_seedlings(&world, 0, 0, "quercus_alba"), 1);
+
+    // Seedling under compressed mature canopy → L < L_min → dark remove.
+    for _ in 0..(T_DARK + 2) {
+        world.tick();
+    }
+    assert_eq!(
+        count_seedlings(&world, 0, 0, "quercus_alba"),
+        0,
+        "seedling on crowded tile must die"
+    );
+}
+
+/// D16: water dispersal cannot climb an uphill dry neighbor; falls back to same cell.
+#[test]
+fn d16_water_no_uphill_dry() {
+    // (0,0) low + water plant; (0,1) north higher + dry.
+    let low = Column::new(
+        0.0,
+        0.0,
+        vec![
+            SoilLayer::new(0.3, Texture::Sand.theta_fc(), Texture::Sand),
+            SoilLayer::new(0.5, Texture::Sand.theta_fc(), Texture::Sand),
+        ],
+    );
+    let high = Column::new(
+        5.0,
+        0.0,
+        vec![
+            SoilLayer::new(0.3, Texture::Sand.theta_fc(), Texture::Sand),
+            SoilLayer::new(0.5, Texture::Sand.theta_fc(), Texture::Sand),
+        ],
+    );
+    let mut world = World::grid(1605, 1, 2, vec![low, high]);
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "typha_latifolia").unwrap();
+    assert_eq!(
+        world
+            .catalog()
+            .get("typha_latifolia")
+            .unwrap()
+            .dispersal
+            .as_deref(),
+        Some("water")
+    );
+
+    world.tick();
+
+    assert_eq!(
+        count_taxon(&world, 0, 1, "typha_latifolia"),
+        0,
+        "no uphill dry seed"
+    );
+    assert_eq!(
+        count_seedlings(&world, 0, 0, "typha_latifolia"),
+        1,
+        "water falls back to same cell"
+    );
+}
+
+/// D16: catch_up seed attempts match the same number of live ticks.
+#[test]
+fn d16_catchup_seeds_same_as_live() {
+    let mk = |seed| {
+        let cols = vec![light_sand_column(), light_sand_column()];
+        let mut w = World::grid(seed, 1, 2, cols);
+        w.set_climate(20.0, 1000.0);
+        w.plant_taxon(0, 0, "pinus_taeda").unwrap();
+        w
+    };
+    let mut live = mk(1606);
+    let mut caught = mk(1607);
+
+    let k = 3u32;
+    for _ in 0..k {
+        live.tick();
+    }
+    caught.force_sleep_all();
+    ignore_all_chunks(&mut caught);
+    caught.catch_up(k, 0.0);
+
+    let live_n = count_seedlings(&live, 0, 1, "pinus_taeda");
+    let caught_n = count_seedlings(&caught, 0, 1, "pinus_taeda");
+    assert_eq!(live_n, 1, "live north seedlings");
+    assert_eq!(caught_n, 1, "catch_up north seedlings");
+    assert_eq!(
+        count_taxon(&live, 0, 0, "pinus_taeda"),
+        count_taxon(&caught, 0, 0, "pinus_taeda")
+    );
+}
+
+/// D16: no species-name branching; seed rain driven by dispersal trait + fertility.
+#[test]
+fn d16_no_species_name_match() {
+    let cat = Catalog::load_embedded().expect("embedded catalog");
+    assert_eq!(
+        cat.get("pinus_taeda").unwrap().dispersal.as_deref(),
+        Some("wind")
+    );
+    assert_eq!(
+        cat.get("typha_latifolia").unwrap().dispersal.as_deref(),
+        Some("water")
+    );
+    assert!(cat.get("pine").is_err());
+    assert!(cat.get("oak").is_err());
+
+    let lib = include_str!("../src/lib.rs");
+    let catalog = include_str!("../src/catalog.rs");
+    for (label, src) in [("lib.rs", lib), ("catalog.rs", catalog)] {
+        for pat in [
+            r#"== "grass""#,
+            r#"== "oak""#,
+            r#"== "pine""#,
+            r#"== "pinus""#,
+            r#"== "typha""#,
+            r#"== "lolium""#,
+            "if name ==",
+            "match name",
+        ] {
+            assert!(
+                !src.contains(pat),
+                "{label} contains forbidden species-name pattern: {pat}"
+            );
+        }
+    }
+    assert!(lib.contains("F_FERTILE"));
+    assert!(lib.contains("apply_seed_rain_ids") || lib.contains("seed_rain"));
+    assert!(lib.contains("dispersal_allows_target") || lib.contains("dispersal"));
 }

@@ -24,7 +24,8 @@
 //! f_w from rooted s + drain_ok (wetland/xeric/mesic) and pond factor; wilted => 0;
 //! growth once/live tick after light; catch_up advances height_frac once per calendar block (same Δ0·f_L·f_w·f_T).
 //! S15: band load A_b=Σ(α·h²) in crown H_BAND; A_b>1 → s_b=1/A_b scales α_eff+uptake then S13.2; T_CROWD thin.
-//! catch_up(K, rain): optional source dump; then K blocks of (≤N_ET hydro, 1 unit sink, light+compress+crowd, growth).
+//! S16: seed rain — fertile (alive, height_frac≥F=0.5) one attempt/tick after growth; dispersal wind|animal→NESW+same, water→same|pond|lower-z, else same; seedling H0.
+//! catch_up(K, rain): optional source dump; then K blocks of (≤N_ET hydro, 1 unit sink, light+compress+crowd, growth, seed).
 //! catch_up_chunk: same calendar on one chunk + 1-cell halo; other chunks unchanged.
 //! Unique-min-H chute revoked. Capillary stays.
 
@@ -107,6 +108,9 @@ pub const C_MAX: f64 = 0.85;
 
 /// Seedling starting height fraction. S14.
 pub const H0: f64 = 0.10;
+
+/// Fertility height_frac threshold for seed rain. S16.
+pub const F_FERTILE: f64 = 0.5;
 
 /// Growth steps to mature by form. S14.
 pub const T_MATURE_HERB: f64 = 20.0;
@@ -1997,7 +2001,102 @@ impl World {
         false
     }
 
-    /// One light walk (compress + crowd) then one growth step on the work set. S14.1/S15.
+    /// True when an occupant can attempt seed rain this tick. S16.
+    fn occupant_is_fertile(occ: &Occupant) -> bool {
+        occ.alive && occ.height_frac >= F_FERTILE
+    }
+
+    /// Whether dispersal allows placing a seed from `src` onto `dst` (may be same cell). S16.
+    fn dispersal_allows_target(
+        &self,
+        dispersal: Option<&str>,
+        src: usize,
+        dst: usize,
+    ) -> bool {
+        let same = src == dst;
+        let kind = dispersal.map(str::trim).unwrap_or("");
+        match kind {
+            "wind" | "animal" => true,
+            "water" => {
+                if same {
+                    true
+                } else {
+                    let dst_col = &self.columns[dst];
+                    dst_col.surface_water_m > 0.0
+                        || dst_col.elevation_m < self.columns[src].elevation_m
+                }
+            }
+            // short / empty / other: same cell only
+            _ => same,
+        }
+    }
+
+    /// First legal seed target in order N,E,S,W,same with a free slot. S16.
+    fn find_seed_target(&self, src: usize, dispersal: Option<&str>) -> Option<usize> {
+        let x = (src % self.width) as i32;
+        let y = (src / self.width) as i32;
+        let mut candidates: Vec<usize> = Vec::with_capacity(5);
+        for &(dx, dy) in &NEIGHBOR_OFFSETS {
+            let nx = x + dx;
+            let ny = y + dy;
+            if nx < 0 || ny < 0 || nx as usize >= self.width || ny as usize >= self.height {
+                continue;
+            }
+            candidates.push(ny as usize * self.width + nx as usize);
+        }
+        candidates.push(src);
+        for dst in candidates {
+            if !self.dispersal_allows_target(dispersal, src, dst) {
+                continue;
+            }
+            if self.columns[dst].occupants.len() < MAX_OCCUPANTS {
+                return Some(dst);
+            }
+        }
+        None
+    }
+
+    /// One seed attempt per fertile occupant on `ids` after growth. No RNG. S16.
+    fn apply_seed_rain_ids(&mut self, ids: &[usize]) {
+        if ids.is_empty() {
+            return;
+        }
+        // Snapshot fertile parents after growth (new seedlings are not fertile).
+        let mut attempts: Vec<(usize, String)> = Vec::new();
+        for &i in ids {
+            for occ in &self.columns[i].occupants {
+                if Self::occupant_is_fertile(occ) {
+                    if let Some(ref tid) = occ.taxon_id {
+                        attempts.push((i, tid.clone()));
+                    }
+                }
+            }
+        }
+        for (src, tid) in attempts {
+            let params = match self.catalog.get(&tid) {
+                Ok(p) => p.clone(),
+                Err(_) => continue,
+            };
+            let Some(dst) = self.find_seed_target(src, params.dispersal.as_deref()) else {
+                continue;
+            };
+            // Re-check slot (prior attempts this pass may have filled the cell).
+            if self.columns[dst].occupants.len() >= MAX_OCCUPANTS {
+                continue;
+            }
+            let occ = params.to_seedling();
+            // Live plant path climate veto (T only); rejected seeds are skipped.
+            if self.climate_veto_for(&occ).is_some() {
+                continue;
+            }
+            let x = dst % self.width;
+            let y = dst / self.width;
+            // Use add_occupant for wake + reject clear; slot already checked.
+            let _ = self.add_occupant(x, y, occ);
+        }
+    }
+
+        /// One light walk (compress + crowd) then one growth step on the work set. S14.1/S15.
     /// When any living occupant is present, light runs every calendar block so the crowd
     /// counter matches live per-block cadence; empty work sets skip the O(n) light walk.
     /// L held for the block via last_light; θ/T from current catch_up aggregates.
@@ -2012,6 +2111,8 @@ impl World {
             self.apply_light_filter_ids(ids);
         }
         self.apply_growth_ids(ids);
+        // S16: seed rain once per calendar block after growth (same cadence as live).
+        self.apply_seed_rain_ids(ids);
     }
 
     /// Infiltrate every column (rate-limited); no runoff/drain; advances clock.
@@ -2073,6 +2174,8 @@ impl World {
             self.apply_light_filter_ids(&climate_ids);
             // Growth once per live tick after light (uses last_light). Not on sink cadence.
             self.apply_growth_ids(&climate_ids);
+            // S16: seed rain once per live tick after growth/compress/thin.
+            self.apply_seed_rain_ids(&climate_ids);
         }
     }
 

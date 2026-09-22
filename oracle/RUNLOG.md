@@ -1,14 +1,15 @@
 # Oracle RUNLOG
 
 ```
-sprint: S15
+sprint: S16
 result: green
-branch: feat/s15-band-crowd
+branch: feat/s16-seed-rain
 date: 2026-09-21 (PT)
 epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15; H_REST=0.02 m; V_REST=1e-4 m
-constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25; T_SETTLE=64; CHUNK=8; H_POND=0.02; T_WL=7; T_WL_D=3; T_SUB=7; T_DARK=7; T_CROWD=7; L0=1; H_BAND=0.05; T_MIN=0.05; C_MAX=0.85; H0=0.10; T_MATURE herb/shrub/tree=20/80/200; L_opt I|empty=1.00 M=0.60 T=0.35; theta_pwp=0.5*theta_fc
+constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25; T_SETTLE=64; CHUNK=8; H_POND=0.02; T_WL=7; T_WL_D=3; T_SUB=7; T_DARK=7; T_CROWD=7; L0=1; H_BAND=0.05; T_MIN=0.05; C_MAX=0.85; H0=0.10; F_FERTILE=0.5; T_MATURE herb/shrub/tree=20/80/200; L_opt I|empty=1.00 M=0.60 T=0.35; theta_pwp=0.5*theta_fc
 growth_cadence: once per live tick on visit set, after light filter (uses last_light); catch_up/catch_up_chunk once per calendar block after hydro before sinks (light+compress+crowd when any alive; hold last_light; same Δ0·f_L·f_w·f_T; f_w drain-shaped; wilted f_w=0)
-invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9 + D91 + D10 + D11 + D12 + D121 + D13 + D131 + D132 + D14 + D141 + D142 + D15
+seed_rain: after growth each live tick / catch_up block; fertile=alive∧height_frac≥F_FERTILE; one attempt/fertile; targets N,E,S,W,same first under MAX_OCCUPANTS; dispersal wind|animal→neighbors+same, water→same|pond(h_surf>0)|lower elevation_m, short|empty|other→same; seedling H0; no RNG
+invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9 + D91 + D10 + D11 + D12 + D121 + D13 + D131 + D132 + D14 + D141 + D142 + D15 + D16
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -157,5 +158,12 @@ tests:
   - d15_weaker_loses
   - d15_catchup_thins_same_as_live
   - d15_no_species_name_match
-notes: S15 band compress+thin. Crown-band load A_b=Σ(α·height_frac²); A_b>1 → s_b=1/A_b scales α_eff (then S13.2 product/caps) and uptake; T_CROWD=7 consecutive A_b>1 → remove lowest f_L·f_w·f_T·height_frac (tie lower frac, then index); reset counter on A_b≤1 or after thin. Catch_up applies compress+crowd per calendar block when any alive. Rider: d11_catalog_loads_demo_ten requires 11 demo=1 incl. hilaria_jamesii. Prior d13/d131/d132 light expects updated for compress. No litter/N; no species if; docs/ untouched. cargo test --workspace: 147 acceptance + 4 unit green. Cargo.lock left untracked.
+  - d16_fertile_pine_seeds_neighbor
+  - d16_seedling_not_fertile
+  - d16_short_stays_home
+  - d16_oak_seed_on_crowded_tile_dies
+  - d16_water_no_uphill_dry
+  - d16_catchup_seeds_same_as_live
+  - d16_no_species_name_match
+notes: S16 seed rain. Fertile adults (alive, height_frac≥0.5) attempt one seedling/tick after growth; target order N,E,S,W,same; dispersal from catalog (wind|animal→neighbors+same, water→same|pond|downslope, else same); seedling at H0 then normal S12–S15 filters on later ticks. Catch_up same once per calendar block. Prior occupancy/light/hydro asserts updated to filter mature adults or tolerate seedlings. Rider: d11_catalog_loads_demo_ten requires 11 demo=1 incl. hilaria_jamesii. No litter/N; no species if; docs/ untouched. cargo test --workspace: 154 acceptance + 4 unit green. Cargo.lock left untracked.
 ```
