@@ -1,15 +1,16 @@
 # Oracle RUNLOG
 
 ```
-sprint: S16
+sprint: S16.2
 result: green
-branch: feat/s16-seed-rain
-date: 2026-09-21 (PT)
+branch: feat/s16.2-canopy-bucket
+date: 2026-10-06 (PT)
 epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15; H_REST=0.02 m; V_REST=1e-4 m
 constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25; T_SETTLE=64; CHUNK=8; H_POND=0.02; T_WL=7; T_WL_D=3; T_SUB=7; T_DARK=7; T_CROWD=7; L0=1; H_BAND=0.05; T_MIN=0.05; C_MAX=0.85; H0=0.10; F_FERTILE=0.5; T_MATURE herb/shrub/tree=20/80/200; L_opt I|empty=1.00 M=0.60 T=0.35; theta_pwp=0.5*theta_fc
 growth_cadence: once per live tick on visit set, after light filter (uses last_light); catch_up/catch_up_chunk once per calendar block after hydro before sinks (light+compress+crowd when any alive; hold last_light; same Δ0·f_L·f_w·f_T; f_w drain-shaped; wilted f_w=0)
 seed_rain: after growth each live tick / catch_up block; fertile=alive∧height_frac≥F_FERTILE; one attempt/fertile; targets N,E,S,W,same first under MAX_OCCUPANTS; dispersal wind|animal→neighbors+same, water→same|pond(h_surf>0)|lower elevation_m, short|empty|other→same; seedling H0; no RNG
-invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9 + D91 + D10 + D11 + D12 + D121 + D13 + D131 + D132 + D14 + D141 + D142 + D15 + D16
+canopy_bucket: form∈{tree,shrub} share one per-tile A_canopy=Σ(α·height_frac²); A_canopy>1 → s=1/A_canopy on α_eff+uptake for those members; T_CROWD=7 consecutive → drop weakest (lowest f_L·f_w·f_T·height_frac; tie lower frac then lower index); reset when A_canopy≤1. Herbs stay on H_BAND bands (herb-only A_b) and are not in the canopy sum/thin. Light still walks H_BAND bands top-down; each member casts compressed α (canopy s or herb s_b) for S13.2 transmission. Catch_up uses same bucket. Seed pulse unchanged (S16 once/tick). No RNG; no English-name branch.
+invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9 + D91 + D10 + D11 + D12 + D121 + D13 + D131 + D132 + D14 + D141 + D142 + D15 + D16 + D162
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -165,5 +166,11 @@ tests:
   - d16_water_no_uphill_dry
   - d16_catchup_seeds_same_as_live
   - d16_no_species_name_match
-notes: S16 seed rain. Fertile adults (alive, height_frac≥0.5) attempt one seedling/tick after growth; target order N,E,S,W,same; dispersal from catalog (wind|animal→neighbors+same, water→same|pond|downslope, else same); seedling at H0 then normal S12–S15 filters on later ticks. Catch_up same once per calendar block. Prior occupancy/light/hydro asserts updated to filter mature adults or tolerate seedlings. Rider: d11_catalog_loads_demo_ten requires 11 demo=1 incl. hilaria_jamesii. No litter/N; no species if; docs/ untouched. cargo test --workspace: 154 acceptance + 4 unit green. Cargo.lock left untracked.
+  - d162_two_mature_pines_thin
+  - d162_pine_one_tick_apart_still_thins
+  - d162_seedling_under_pine_lives
+  - d162_herb_not_in_canopy
+  - d162_catchup_thins_same_as_live
+  - d162_no_species_name_match
+notes: S16.2 tree/shrub canopy bucket. Problem: H_BAND=0.05 split crowns so pines ~6 cm apart never shared a band (A_b≤1, S15 thin never fired). Rule: herbs unchanged on 5 cm bands; tree+shrub on a tile share one canopy bucket for compress+thin; light layering still height-order/H_BAND with each member's compressed α. Amended d15_two_mature_oaks_thin / d15_weaker_loses / d15_catchup_thins_same_as_live minimally: fill free slots with herbs so S16 home-seedlings (now in the canopy bucket) cannot absorb the thin — contract (one mature survivor) unchanged; tests not renamed/deleted. Seed pulse unchanged. cargo test --workspace green (see CI). Cargo.lock left untracked. docs/ untouched.
 ```

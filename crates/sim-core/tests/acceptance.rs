@@ -5,13 +5,13 @@
 //! Grid mass: sum of column M.
 
 use sim_core::{
-    alpha_for_occupant, alpha_from_params, band_compress_scale, cover_transmission, delta0_for_form,
-    drain_fw_params, f_l_growth, f_t_growth, f_w_growth, l_min_for_form, l_opt_for_shade,
-    overlap_cover_from_alphas, t_mature_for_form, Catalog, ChunkBusy, ClimateReject, Column,
-    HydroReject, LightReject, Occupant, OccupantParams, PlantTaxonError, ShadeClass, SoilLayer,
-    Texture, World, CHUNK, C_MAX, E_OPEN, E_SOIL, F_FERTILE, H0, H_BAND, H_POND, H_REST, L0,
-    MASS_EPSILON, MAX_OCCUPANTS, N_ET, N_LAYERS, P_MAX, R_MAX, T_CROWD, T_DARK, T_MATURE_HERB,
-    T_MATURE_TREE, T_MIN, T_SETTLE, T_SUB, T_WILT, T_WL, V_REST,
+    alpha_for_occupant, alpha_from_params, band_compress_scale, canopy_compress_scale,
+    cover_transmission, delta0_for_form, drain_fw_params, f_l_growth, f_t_growth, f_w_growth,
+    is_canopy_form, l_min_for_form, l_opt_for_shade, overlap_cover_from_alphas, t_mature_for_form,
+    Catalog, ChunkBusy, ClimateReject, Column, HydroReject, LightReject, Occupant, OccupantParams,
+    PlantTaxonError, ShadeClass, SoilLayer, Texture, World, CHUNK, C_MAX, E_OPEN, E_SOIL, F_FERTILE,
+    H0, H_BAND, H_POND, H_REST, L0, MASS_EPSILON, MAX_OCCUPANTS, N_ET, N_LAYERS, P_MAX, R_MAX,
+    T_CROWD, T_DARK, T_MATURE_HERB, T_MATURE_TREE, T_MIN, T_SETTLE, T_SUB, T_WILT, T_WL, V_REST,
 };
 
 fn assert_mass_close(actual: f64, expected: f64) {
@@ -5201,6 +5201,8 @@ fn d15_two_mature_oaks_thin() {
     world.set_climate(20.0, 1000.0);
     world.plant_taxon(0, 0, "quercus_alba").unwrap();
     world.plant_taxon(0, 0, "quercus_alba").unwrap();
+    // S16.2: fill leftover slots with herbs so home-seedlings cannot absorb canopy thin.
+    fill_slots_with_herb(&mut world, 0, 0);
 
     for t in 1..T_CROWD {
         world.tick();
@@ -5288,6 +5290,8 @@ fn d15_weaker_loses() {
     // Plant weak first (lower index) then strong — weak still loses on height_frac.
     world.plant_params(0, 0, &oak, hf_weak).unwrap();
     world.plant_params(0, 0, &oak, hf_strong).unwrap();
+    // S16.2: block seed rain into canopy bucket (herbs fill free slots).
+    fill_slots_with_herb(&mut world, 0, 0);
 
     for _ in 0..T_CROWD {
         world.tick();
@@ -5317,11 +5321,13 @@ fn d15_catchup_thins_same_as_live() {
     live.set_climate(20.0, 1000.0);
     live.plant_taxon(0, 0, "quercus_alba").unwrap();
     live.plant_taxon(0, 0, "quercus_alba").unwrap();
+    fill_slots_with_herb(&mut live, 0, 0);
 
     let mut caught = World::new(1507, light_sand_column());
     caught.set_climate(20.0, 1000.0);
     caught.plant_taxon(0, 0, "quercus_alba").unwrap();
     caught.plant_taxon(0, 0, "quercus_alba").unwrap();
+    fill_slots_with_herb(&mut caught, 0, 0);
 
     // S16 seedlings raise uptake; keep soil wet so crowd thin (not wilt) decides.
     for _ in 0..T_CROWD {
@@ -5414,6 +5420,13 @@ fn count_seedlings(world: &World, x: usize, y: usize, taxon_id: &str) -> usize {
             o.taxon_id.as_deref() == Some(taxon_id) && (o.height_frac - H0).abs() < 1e-12
         })
         .count()
+}
+
+/// Fill remaining slots with herbs so seed rain cannot plant into the canopy bucket (S16.2).
+fn fill_slots_with_herb(world: &mut World, x: usize, y: usize) {
+    while world.column_at(x, y).occupants.len() < MAX_OCCUPANTS {
+        world.plant_taxon(x, y, "lolium_perenne").unwrap();
+    }
 }
 
 /// D16: fertile wind pine seeds the first legal neighbor (N) when a slot exists.
@@ -5653,4 +5666,261 @@ fn d16_no_species_name_match() {
     assert!(lib.contains("F_FERTILE"));
     assert!(lib.contains("apply_seed_rain_ids") || lib.contains("seed_rain"));
     assert!(lib.contains("dispersal_allows_target") || lib.contains("dispersal"));
+}
+
+
+// --- Sprint 16.2 — tree/shrub canopy bucket --------------------------------------------
+
+/// D162: two mature pines (same height) A_canopy>1 thin after T_CROWD.
+#[test]
+fn d162_two_mature_pines_thin() {
+    assert_eq!(T_CROWD, 7);
+    let mut world = World::new(1621, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "pinus_taeda").unwrap();
+    world.plant_taxon(0, 0, "pinus_taeda").unwrap();
+    fill_slots_with_herb(&mut world, 0, 0);
+    let pine = world.catalog().get("pinus_taeda").unwrap();
+    let a = alpha_from_params(pine);
+    let (a_c, s_c) = canopy_compress_scale([a, a]);
+    assert!(a_c > 1.0, "precondition: two mature pines A_canopy={a_c} > 1");
+    assert!((s_c - 1.0 / a_c).abs() < 1e-15);
+    assert!(is_canopy_form(pine.form));
+
+    for t in 1..T_CROWD {
+        world.tick();
+        assert_eq!(
+            world
+                .column_at(0, 0)
+                .occupants
+                .iter()
+                .filter(|o| is_mature(o) && o.taxon_id.as_deref() == Some("pinus_taeda"))
+                .count(),
+            2,
+            "both mature pines remain before T_CROWD at tick {t}"
+        );
+    }
+    world.tick();
+    let pines: Vec<_> = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| is_mature(o) && o.taxon_id.as_deref() == Some("pinus_taeda"))
+        .collect();
+    assert_eq!(pines.len(), 1, "exactly one mature pine after T_CROWD thin");
+    assert_eq!(pines[0].crowd_steps, 0);
+    world.tick();
+    let pines: Vec<_> = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| is_mature(o) && o.taxon_id.as_deref() == Some("pinus_taeda"))
+        .collect();
+    assert_eq!(pines.len(), 1);
+    assert!((pines[0].band_scale - 1.0).abs() < 1e-12);
+    assert_eq!(pines[0].crowd_steps, 0);
+}
+
+/// D162: pines one growth-tick apart (Δh ≈ 6 cm > H_BAND) still share canopy bucket and thin.
+#[test]
+fn d162_pine_one_tick_apart_still_thins() {
+    let pine = Catalog::load_embedded()
+        .unwrap()
+        .get("pinus_taeda")
+        .unwrap()
+        .clone();
+    let h_mat = pine.height_m_mature.unwrap();
+    let d0 = delta0_for_form(pine.form);
+    let hf_tall = 1.0;
+    let hf_short = 1.0 - d0;
+    let dh = h_mat * (hf_tall - hf_short);
+    assert!(
+        dh > H_BAND,
+        "precondition: one-tick pine gap dh={dh} must exceed H_BAND={H_BAND}"
+    );
+    let a = alpha_from_params(&pine);
+    let a_tall = a * hf_tall * hf_tall;
+    let a_short = a * hf_short * hf_short;
+    let (a_c, _) = canopy_compress_scale([a_tall, a_short]);
+    assert!(a_c > 1.0, "precondition: A_canopy={a_c} > 1 across bands");
+
+    let mut world = World::new(1622, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    // Shorter (weaker on height_frac) first — lower index; still loses.
+    world.plant_params(0, 0, &pine, hf_short).unwrap();
+    world.plant_params(0, 0, &pine, hf_tall).unwrap();
+    fill_slots_with_herb(&mut world, 0, 0);
+
+    for _ in 0..T_CROWD {
+        world.tick();
+    }
+    let left: Vec<_> = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| {
+            o.alive
+                && o.taxon_id.as_deref() == Some("pinus_taeda")
+                && o.height_frac >= F_FERTILE
+        })
+        .collect();
+    assert_eq!(left.len(), 1, "canopy thin must fire despite H_BAND split");
+    // Survivor is the taller one (growth may bump both slightly; still ≥ planted tall).
+    assert!(
+        left[0].height_frac + 1e-12 >= hf_tall,
+        "taller pine must survive, got {}",
+        left[0].height_frac
+    );
+}
+
+/// D162: seedling under one mature pine — A_canopy≤1; seedling lives past T_CROWD.
+#[test]
+fn d162_seedling_under_pine_lives() {
+    let mut world = World::new(1623, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "pinus_taeda").unwrap();
+    world.plant_seedling(0, 0, "pinus_taeda").unwrap();
+    let pine = world.catalog().get("pinus_taeda").unwrap();
+    let a = alpha_from_params(pine);
+    let a_c = a * 1.0 + a * H0 * H0;
+    assert!(a_c <= 1.0, "precondition: mature+seedling A_canopy={a_c} ≤ 1");
+
+    for _ in 0..(T_CROWD + 3) {
+        world.tick();
+    }
+    let adults = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| is_mature(o) && o.taxon_id.as_deref() == Some("pinus_taeda"))
+        .count();
+    let seedlings = count_seedlings(&world, 0, 0, "pinus_taeda");
+    // Seedling may have grown past H0; require at least one non-mature living pine + adult.
+    let living: Vec<_> = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| o.alive && o.taxon_id.as_deref() == Some("pinus_taeda"))
+        .collect();
+    assert!(adults >= 1, "mature pine must live");
+    assert!(
+        living.len() >= 2,
+        "seedling under pine must live (living={})",
+        living.len()
+    );
+    let _ = seedlings;
+}
+
+/// D162: herb not in canopy sum and not removed by canopy thin of two pines.
+#[test]
+fn d162_herb_not_in_canopy() {
+    let mut world = World::new(1624, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    world.plant_taxon(0, 0, "pinus_taeda").unwrap();
+    world.plant_taxon(0, 0, "pinus_taeda").unwrap();
+    fill_slots_with_herb(&mut world, 0, 0);
+    let pine = world.catalog().get("pinus_taeda").unwrap();
+    let grass = world.catalog().get("lolium_perenne").unwrap();
+    assert!(is_canopy_form(pine.form));
+    assert!(!is_canopy_form(grass.form));
+    let a = alpha_from_params(pine);
+    let (a_c, _) = canopy_compress_scale([a, a]);
+    assert!(a_c > 1.0);
+
+    for _ in 0..T_CROWD {
+        world.tick();
+    }
+    assert!(
+        world
+            .column_at(0, 0)
+            .occupants
+            .iter()
+            .any(|o| o.alive && o.taxon_id.as_deref() == Some("lolium_perenne")),
+        "herb must not be removed by canopy thin"
+    );
+    let mature_pines = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| is_mature(o) && o.taxon_id.as_deref() == Some("pinus_taeda"))
+        .count();
+    assert_eq!(mature_pines, 1, "canopy still thins one pine");
+}
+
+/// D162: catch_up(T_CROWD) thins the same canopy as T_CROWD live ticks.
+#[test]
+fn d162_catchup_thins_same_as_live() {
+    let mk = |seed| {
+        let mut w = World::new(seed, light_sand_column());
+        w.set_climate(20.0, 1000.0);
+        w.plant_taxon(0, 0, "pinus_taeda").unwrap();
+        w.plant_taxon(0, 0, "pinus_taeda").unwrap();
+        fill_slots_with_herb(&mut w, 0, 0);
+        w
+    };
+    let mut live = mk(1625);
+    let mut caught = mk(1626);
+
+    for _ in 0..T_CROWD {
+        live.add_rain_at(0, 0, 0.05);
+        live.tick();
+    }
+    caught.force_sleep_all();
+    ignore_all_chunks(&mut caught);
+    caught.catch_up(T_CROWD, 0.05);
+
+    let n_live = live
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| {
+            o.taxon_id.as_deref() == Some("pinus_taeda") && (o.height_frac - 1.0).abs() < 1e-9
+        })
+        .count();
+    let n_caught = caught
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| {
+            o.taxon_id.as_deref() == Some("pinus_taeda") && (o.height_frac - 1.0).abs() < 1e-9
+        })
+        .count();
+    assert_eq!(n_live, 1, "live must thin to 1 adult pine");
+    assert_eq!(n_caught, 1, "catch_up must thin to 1 adult pine");
+}
+
+/// D162: no species-name branching; canopy bucket driven by form trait.
+#[test]
+fn d162_no_species_name_match() {
+    let cat = Catalog::load_embedded().expect("embedded catalog");
+    let pine = cat.get("pinus_taeda").expect("pinus_taeda");
+    let oak = cat.get("quercus_alba").expect("quercus_alba");
+    let grass = cat.get("lolium_perenne").expect("lolium_perenne");
+    assert!(is_canopy_form(pine.form));
+    assert!(is_canopy_form(oak.form));
+    assert!(!is_canopy_form(grass.form));
+    assert!(cat.get("pine").is_err());
+    assert!(cat.get("oak").is_err());
+
+    let lib = include_str!("../src/lib.rs");
+    let catalog = include_str!("../src/catalog.rs");
+    for (label, src) in [("lib.rs", lib), ("catalog.rs", catalog)] {
+        for pat in [
+            r#"== "grass""#,
+            r#"== "oak""#,
+            r#"== "pine""#,
+            r#"== "pinus""#,
+            r#"== "lolium""#,
+            "if name ==",
+            "match name",
+        ] {
+            assert!(
+                !src.contains(pat),
+                "{label} contains forbidden species-name pattern: {pat}"
+            );
+        }
+    }
+    assert!(lib.contains("is_canopy_form") || lib.contains("canopy_compress_scale"));
+    assert!(lib.contains("A_canopy") || lib.contains("s_canopy") || lib.contains("canopy"));
 }
