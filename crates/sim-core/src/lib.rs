@@ -24,6 +24,9 @@
 //! f_w from rooted s + drain_ok (wetland/xeric/mesic) and pond factor; wilted => 0;
 //! growth once/live tick after light; catch_up advances height_frac once per calendar block (same Δ0·f_L·f_w·f_T).
 //! S15: band load A_b=Σ(α·h²) in crown H_BAND; A_b>1 → s_b=1/A_b scales α_eff+uptake then S13.2; T_CROWD thin.
+//! S16.2: tree/shrub canopy bucket — A_canopy=Σ(α·h²) over living form∈{tree,shrub} on the tile;
+//! A_canopy>1 → s=1/A_canopy on their α_eff+uptake; T_CROWD thin weakest in bucket. Herbs keep H_BAND bands
+//! (herb-only A_b). Light still walks H_BAND bands top-down using each member's compressed α.
 //! S16: seed rain — fertile (alive, height_frac≥F=0.5) one attempt/tick after growth; dispersal wind|animal→NESW+same, water→same|pond|lower-z, else same; seedling H0.
 //! catch_up(K, rain): optional source dump; then K blocks of (≤N_ET hydro, 1 unit sink, light+compress+crowd, growth, seed).
 //! catch_up_chunk: same calendar on one chunk + 1-cell halo; other chunks unchanged.
@@ -91,7 +94,8 @@ pub const T_SUB: u32 = 7;
 /// Consecutive live ticks below L_min before light-dark remove. S13.
 pub const T_DARK: u32 = 7;
 
-/// Consecutive overcrowded (A_b>1) ticks before thinning weakest in band. S15.
+/// Consecutive overcrowded ticks (herb band A_b>1, or tree/shrub A_canopy>1) before thinning
+/// the weakest in that bucket. S15/S16.2.
 pub const T_CROWD: u32 = 7;
 
 /// Incident light at canopy top (dimensionless). S13.
@@ -195,9 +199,9 @@ pub struct Occupant {
     pub shade_class: ShadeClass,
     /// Catalog `drain_ok` snapshotted at plant time (f_w shape + hydro). S14.2.
     pub drain_ok: Option<String>,
-    /// Consecutive ticks this crown-band had A_b>1. S15.
+    /// Consecutive ticks this crowd bucket (herb band or canopy) had load>1. S15/S16.2.
     pub crowd_steps: u32,
-    /// Band compress scale s_b (1 if A_b≤1); scales uptake. S15.
+    /// Crowd compress scale s (1 if load≤1); scales uptake. Herb band or canopy. S15/S16.2.
     pub band_scale: f64,
 }
 
@@ -523,6 +527,20 @@ where
     }
 }
 
+/// True when a form joins the per-tile tree/shrub canopy crowd bucket (S16.2).
+/// Herbs stay on H_BAND crowd bands.
+pub fn is_canopy_form(form: Form) -> bool {
+    matches!(form, Form::Tree | Form::Shrub)
+}
+
+/// Canopy load A_canopy = Σ α_eff and compress scale s = 1/A_canopy if A_canopy>1 else 1. S16.2.
+pub fn canopy_compress_scale<I>(alphas: I) -> (f64, f64)
+where
+    I: IntoIterator<Item = f64>,
+{
+    band_compress_scale(alphas)
+}
+
 /// Alpha for an alive occupant; PlantStub without taxon_id → herb 0.25. Dead → 0.
 /// Uses alpha_eff (height_frac²). S13/S14.
 pub fn alpha_for_occupant(catalog: &Catalog, occ: &Occupant) -> f64 {
@@ -556,21 +574,22 @@ pub fn cover_transmission(c: f64) -> f64 {
     (1.0 - c).max(T_MIN)
 }
 
-fn light_traits_for_occupant(catalog: &Catalog, occ: &Occupant) -> (f64, f64, f64) {
-    // (height_m * height_frac, alpha_eff, l_min)
-    let (h_mat, alpha, l_min) = match occ.taxon_id.as_deref() {
+fn light_traits_for_occupant(catalog: &Catalog, occ: &Occupant) -> (f64, f64, f64, bool) {
+    // (height_m * height_frac, alpha_eff, l_min, canopy member)
+    let (h_mat, alpha, l_min, canopy) = match occ.taxon_id.as_deref() {
         Some(tid) => match catalog.get(tid) {
             Ok(p) => (
                 effective_height_m(p),
                 alpha_from_params(p),
                 l_min_for_form(p.form),
+                is_canopy_form(p.form),
             ),
-            Err(_) => (0.4, 0.25, 0.25),
+            Err(_) => (0.4, 0.25, 0.25, false),
         },
-        None => (0.4, 0.25, 0.25),
+        None => (0.4, 0.25, 0.25, false),
     };
     let hf = occ.height_frac.clamp(0.0, 1.0);
-    (h_mat * hf, alpha_eff(alpha, hf), l_min)
+    (h_mat * hf, alpha_eff(alpha, hf), l_min, canopy)
 }
 
 /// Historical S09 busy signal. S09.1: [`World::ignore_chunk`] always succeeds (never Err).
@@ -1803,44 +1822,57 @@ impl World {
             return;
         }
 
-        // Traits snapshot: (oi, height, alpha_eff, l_min) for alive occupants.
-        let mut rows: Vec<(usize, f64, f64, f64)> = Vec::new();
+        // Traits snapshot: (oi, height, alpha_eff, l_min, canopy) for alive occupants.
+        let mut rows: Vec<(usize, f64, f64, f64, bool)> = Vec::new();
         for oi in 0..occ_len {
             if !self.columns[i].occupants[oi].alive {
                 continue;
             }
-            let (h, a, lmin) =
+            let (h, a, lmin, canopy) =
                 light_traits_for_occupant(&self.catalog, &self.columns[i].occupants[oi]);
-            rows.push((oi, h, a, lmin));
+            rows.push((oi, h, a, lmin, canopy));
         }
         // Tallest first; stable on equal height (insert order).
         rows.sort_by(|a, b| {
             b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
         });
 
+        // S16.2 canopy bucket: every living tree/shrub on the tile, regardless of height band.
+        let (_a_canopy, s_canopy) =
+            canopy_compress_scale(rows.iter().filter(|r| r.4).map(|r| r.2));
+
         let mut l = L0;
         let mut dark_kills: Vec<usize> = Vec::new();
         let mut crowd_kills: Vec<usize> = Vec::new();
+        // Received L per canopy member (oi, L) for the canopy thin after the light walk.
+        let mut canopy_received: Vec<(usize, f64)> = Vec::new();
         let mut idx = 0;
         while idx < rows.len() {
-            // Band: consecutive (sorted) occupants within H_BAND of the tallest member.
+            // Light band: consecutive (sorted) occupants within H_BAND of the tallest member.
             let band_top_h = rows[idx].1;
             let mut end = idx;
             while end + 1 < rows.len() && band_top_h - rows[end + 1].1 <= H_BAND {
                 end += 1;
             }
 
-            // Band load A_b = Σ α_eff (crown band only). Compress before S13.2. S15.
-            let raw_alphas: Vec<f64> = rows[idx..=end].iter().map(|r| r.2).collect();
-            let (_a_b, s_b) = band_compress_scale(raw_alphas.iter().copied());
-            let compressed: Vec<f64> = raw_alphas.iter().map(|a| a * s_b).collect();
+            // Herb crowd band load A_b = Σ α_eff over herb members only (S15; tree/shrub are
+            // in the canopy bucket instead). Compress before S13.2.
+            let (_a_b, s_b) =
+                band_compress_scale(rows[idx..=end].iter().filter(|r| !r.4).map(|r| r.2));
+            // Each member's compressed α uses its own crowd bucket scale.
+            let compressed: Vec<f64> = rows[idx..=end]
+                .iter()
+                .map(|r| r.2 * if r.4 { s_canopy } else { s_b })
+                .collect();
 
-            // All members of the band receive the same incoming L (S13.1 H_BAND).
+            // All members of the light band receive the same incoming L (S13.1 H_BAND).
             let received = l;
-            for (slot, &(oi, _h, _alpha, l_min)) in rows[idx..=end].iter().enumerate() {
-                let _ = slot;
+            for &(oi, _h, _alpha, l_min, canopy) in &rows[idx..=end] {
                 self.columns[i].occupants[oi].last_light = Some(received);
-                self.columns[i].occupants[oi].band_scale = s_b;
+                self.columns[i].occupants[oi].band_scale = if canopy { s_canopy } else { s_b };
+                if canopy {
+                    canopy_received.push((oi, received));
+                }
                 if received < l_min {
                     self.columns[i].occupants[oi].dark_steps =
                         self.columns[i].occupants[oi].dark_steps.saturating_add(1);
@@ -1852,50 +1884,14 @@ impl World {
                 }
             }
 
-            // Crowd counter / thin (A_b>1 ⇔ s_b < 1). S15.
-            if s_b < 1.0 {
-                for &(oi, _, _, _) in &rows[idx..=end] {
-                    self.columns[i].occupants[oi].crowd_steps =
-                        self.columns[i].occupants[oi].crowd_steps.saturating_add(1);
-                }
-                let overcrowded = rows[idx..=end]
-                    .iter()
-                    .any(|&(oi, _, _, _)| self.columns[i].occupants[oi].crowd_steps >= T_CROWD);
-                if overcrowded {
-                    // Weakest: lowest f_L·f_w·f_T·height_frac; tie lower frac, then lower index.
-                    let t_air = self.t_air_c;
-                    let mut best: Option<(f64, f64, usize)> = None;
-                    for &(oi, _, _, _) in &rows[idx..=end] {
-                        if dark_kills.contains(&oi) {
-                            continue;
-                        }
-                        let fit = self.crowd_fitness_at(i, oi, received, t_air);
-                        let hf = self.columns[i].occupants[oi].height_frac;
-                        let key = (fit, hf, oi);
-                        match best {
-                            None => best = Some(key),
-                            Some(cur) => {
-                                let worse = key.0 < cur.0
-                                    || (key.0 == cur.0 && key.1 < cur.1)
-                                    || (key.0 == cur.0 && key.1 == cur.1 && key.2 < cur.2);
-                                if worse {
-                                    best = Some(key);
-                                }
-                            }
-                        }
-                    }
-                    if let Some((_, _, oi)) = best {
-                        crowd_kills.push(oi);
-                    }
-                    // Reset band counters after a thin so the next streak starts fresh.
-                    for &(oi, _, _, _) in &rows[idx..=end] {
-                        self.columns[i].occupants[oi].crowd_steps = 0;
-                    }
-                }
-            } else {
-                for &(oi, _, _, _) in &rows[idx..=end] {
-                    self.columns[i].occupants[oi].crowd_steps = 0;
-                }
+            // Herb crowd counter / thin (A_b>1 ⇔ s_b < 1). S15.
+            let herb_members: Vec<(usize, f64)> = rows[idx..=end]
+                .iter()
+                .filter(|r| !r.4)
+                .map(|r| (r.0, received))
+                .collect();
+            if let Some(oi) = self.crowd_bucket_step(i, &herb_members, s_b, &dark_kills) {
+                crowd_kills.push(oi);
             }
 
             // Overlap cover transmission AFTER compress: C=min(C_MAX,1-Π(1-α')); T=max(T_MIN,1-C).
@@ -1903,6 +1899,11 @@ impl World {
             let t = cover_transmission(c);
             l *= t;
             idx = end + 1;
+        }
+
+        // Tree/shrub canopy crowd counter / thin (A_canopy>1 ⇔ s_canopy < 1). S16.2.
+        if let Some(oi) = self.crowd_bucket_step(i, &canopy_received, s_canopy, &dark_kills) {
+            crowd_kills.push(oi);
         }
 
         let mut kills = dark_kills;
@@ -1932,6 +1933,63 @@ impl World {
                 self.columns[i].occupants.remove(oi);
             }
         }
+    }
+
+    /// One crowd step for a bucket (herb band or tree/shrub canopy). `members` = (oi, received L).
+    /// s < 1 (load>1): bump counters; at T_CROWD return the weakest (lowest f_L·f_w·f_T·height_frac;
+    /// tie lower frac, then lower index) and reset the bucket. s = 1: reset counters. S15/S16.2.
+    fn crowd_bucket_step(
+        &mut self,
+        i: usize,
+        members: &[(usize, f64)],
+        s: f64,
+        dark_kills: &[usize],
+    ) -> Option<usize> {
+        if members.is_empty() {
+            return None;
+        }
+        if s >= 1.0 {
+            for &(oi, _) in members {
+                self.columns[i].occupants[oi].crowd_steps = 0;
+            }
+            return None;
+        }
+        for &(oi, _) in members {
+            self.columns[i].occupants[oi].crowd_steps =
+                self.columns[i].occupants[oi].crowd_steps.saturating_add(1);
+        }
+        let overcrowded = members
+            .iter()
+            .any(|&(oi, _)| self.columns[i].occupants[oi].crowd_steps >= T_CROWD);
+        if !overcrowded {
+            return None;
+        }
+        let t_air = self.t_air_c;
+        let mut best: Option<(f64, f64, usize)> = None;
+        for &(oi, received) in members {
+            if dark_kills.contains(&oi) {
+                continue;
+            }
+            let fit = self.crowd_fitness_at(i, oi, received, t_air);
+            let hf = self.columns[i].occupants[oi].height_frac;
+            let key = (fit, hf, oi);
+            match best {
+                None => best = Some(key),
+                Some(cur) => {
+                    let worse = key.0 < cur.0
+                        || (key.0 == cur.0 && key.1 < cur.1)
+                        || (key.0 == cur.0 && key.1 == cur.1 && key.2 < cur.2);
+                    if worse {
+                        best = Some(key);
+                    }
+                }
+            }
+        }
+        // Reset bucket counters after a thin so the next streak starts fresh.
+        for &(oi, _) in members {
+            self.columns[i].occupants[oi].crowd_steps = 0;
+        }
+        best.map(|(_, _, oi)| oi)
     }
 
     /// Fitness score for crowd thin: f_L · f_w · f_T · height_frac. S15.
