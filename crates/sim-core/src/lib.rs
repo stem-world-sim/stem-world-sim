@@ -26,7 +26,8 @@
 //! S15: band load A_b=Σ(α·h²) in crown H_BAND; A_b>1 → s_b=1/A_b scales α_eff+uptake then S13.2; T_CROWD thin.
 //! S16.2: tree/shrub canopy bucket — A_canopy=Σ(α·h²) over living form∈{tree,shrub} on the tile;
 //! A_canopy>1 → s=1/A_canopy on their α_eff+uptake; T_CROWD thin weakest in bucket. Herbs keep H_BAND bands
-//! (herb-only A_b). Light still walks H_BAND bands top-down using each member's compressed α.
+//! (herb-only A_b). S16.3: the bucket is split into height layers (|Δh| ≤ max(1 m, 0.25·max h),
+//! transitive); each layer has its own A_L, s_L and crowd thin. Light still walks H_BAND bands top-down using each member's compressed α.
 //! S16: seed rain — fertile (alive, height_frac≥F=0.5) one attempt/tick after growth; dispersal wind|animal→NESW+same, water→same|pond|lower-z, else same; seedling H0.
 //! catch_up(K, rain): optional source dump; then K blocks of (≤N_ET hydro, 1 unit sink, light+compress+crowd, growth, seed).
 //! catch_up_chunk: same calendar on one chunk + 1-cell halo; other chunks unchanged.
@@ -531,6 +532,62 @@ where
 /// Herbs stay on H_BAND crowd bands.
 pub fn is_canopy_form(form: Form) -> bool {
     matches!(form, Form::Tree | Form::Shrub)
+}
+
+/// Minimum woody canopy-layer gap (metres). S16.3.
+pub const LAYER_GAP_MIN_M: f64 = 1.0;
+/// Relative woody canopy-layer gap: share when |Δh| ≤ max(1 m, 0.25·max(h)). S16.3.
+pub const LAYER_GAP_FRAC: f64 = 0.25;
+
+/// True when two woody crown heights (metres) are in the same canopy layer. S16.3.
+pub fn same_canopy_layer(h_i: f64, h_j: f64) -> bool {
+    (h_i - h_j).abs() <= LAYER_GAP_MIN_M.max(LAYER_GAP_FRAC * h_i.max(h_j))
+}
+
+/// Transitive canopy-layer ids for woody heights (index-aligned; ids are dense from 0,
+/// assigned in input order). Deterministic union over all pairs. S16.3.
+pub fn canopy_layers(heights: &[f64]) -> Vec<usize> {
+    let n = heights.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(p: &mut Vec<usize>, x: usize) -> usize {
+        let mut r = x;
+        while p[r] != r {
+            r = p[r];
+        }
+        let mut c = x;
+        while p[c] != r {
+            let nx = p[c];
+            p[c] = r;
+            c = nx;
+        }
+        r
+    }
+    for a in 0..n {
+        for b in (a + 1)..n {
+            if same_canopy_layer(heights[a], heights[b]) {
+                let ra = find(&mut parent, a);
+                let rb = find(&mut parent, b);
+                if ra != rb {
+                    parent[ra.max(rb)] = ra.min(rb);
+                }
+            }
+        }
+    }
+    let mut ids = vec![usize::MAX; n];
+    let mut map: Vec<(usize, usize)> = Vec::new();
+    for k in 0..n {
+        let r = find(&mut parent, k);
+        let id = match map.iter().find(|m| m.0 == r) {
+            Some(m) => m.1,
+            None => {
+                let id = map.len();
+                map.push((r, id));
+                id
+            }
+        };
+        ids[k] = id;
+    }
+    ids
 }
 
 /// Canopy load A_canopy = Σ α_eff and compress scale s = 1/A_canopy if A_canopy>1 else 1. S16.2.
@@ -1837,15 +1894,33 @@ impl World {
             b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // S16.2 canopy bucket: every living tree/shrub on the tile, regardless of height band.
-        let (_a_canopy, s_canopy) =
-            canopy_compress_scale(rows.iter().filter(|r| r.4).map(|r| r.2));
+        // S16.3 canopy layers: woody rows grouped by height layer; each layer has its own
+        // A_L = Σ α_eff and s_L = 1/A_L when A_L > 1. Herbs are not in any layer.
+        let woody: Vec<usize> = (0..rows.len()).filter(|&k| rows[k].4).collect();
+        let woody_h: Vec<f64> = woody.iter().map(|&k| rows[k].1).collect();
+        let layer_of = canopy_layers(&woody_h);
+        let n_layers = layer_of.iter().map(|&x| x + 1).max().unwrap_or(0);
+        let mut layer_scale = vec![1.0_f64; n_layers];
+        for (lid, sc) in layer_scale.iter_mut().enumerate() {
+            let (_a_layer, s_layer) = canopy_compress_scale(
+                woody.iter().zip(&layer_of).filter(|(_, &l)| l == lid).map(|(&k, _)| rows[k].2),
+            );
+            *sc = s_layer;
+        }
+        // Per-row layer id (usize::MAX for herbs) and s_canopy for woody rows.
+        let mut row_layer = vec![usize::MAX; rows.len()];
+        for (w, &k) in woody.iter().enumerate() {
+            row_layer[k] = layer_of[w];
+        }
+        let s_canopy_of = |k: usize| -> f64 {
+            if row_layer[k] == usize::MAX { 1.0 } else { layer_scale[row_layer[k]] }
+        };
 
         let mut l = L0;
         let mut dark_kills: Vec<usize> = Vec::new();
         let mut crowd_kills: Vec<usize> = Vec::new();
         // Received L per canopy member (oi, L) for the canopy thin after the light walk.
-        let mut canopy_received: Vec<(usize, f64)> = Vec::new();
+        let mut canopy_received: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n_layers];
         let mut idx = 0;
         while idx < rows.len() {
             // Light band: consecutive (sorted) occupants within H_BAND of the tallest member.
@@ -1860,18 +1935,19 @@ impl World {
             let (_a_b, s_b) =
                 band_compress_scale(rows[idx..=end].iter().filter(|r| !r.4).map(|r| r.2));
             // Each member's compressed α uses its own crowd bucket scale.
-            let compressed: Vec<f64> = rows[idx..=end]
-                .iter()
-                .map(|r| r.2 * if r.4 { s_canopy } else { s_b })
+            let compressed: Vec<f64> = (idx..=end)
+                .map(|k| rows[k].2 * if rows[k].4 { s_canopy_of(k) } else { s_b })
                 .collect();
 
             // All members of the light band receive the same incoming L (S13.1 H_BAND).
             let received = l;
-            for &(oi, _h, _alpha, l_min, canopy) in &rows[idx..=end] {
+            for k in idx..=end {
+                let (oi, _h, _alpha, l_min, canopy) = rows[k];
                 self.columns[i].occupants[oi].last_light = Some(received);
-                self.columns[i].occupants[oi].band_scale = if canopy { s_canopy } else { s_b };
+                self.columns[i].occupants[oi].band_scale =
+                    if canopy { s_canopy_of(k) } else { s_b };
                 if canopy {
-                    canopy_received.push((oi, received));
+                    canopy_received[row_layer[k]].push((oi, received));
                 }
                 if received < l_min {
                     self.columns[i].occupants[oi].dark_steps =
@@ -1901,9 +1977,11 @@ impl World {
             idx = end + 1;
         }
 
-        // Tree/shrub canopy crowd counter / thin (A_canopy>1 ⇔ s_canopy < 1). S16.2.
-        if let Some(oi) = self.crowd_bucket_step(i, &canopy_received, s_canopy, &dark_kills) {
-            crowd_kills.push(oi);
+        // Tree/shrub canopy-layer crowd counter / thin (A_L>1 ⇔ s_L < 1). S16.2/S16.3.
+        for (lid, members) in canopy_received.iter().enumerate() {
+            if let Some(oi) = self.crowd_bucket_step(i, members, layer_scale[lid], &dark_kills) {
+                crowd_kills.push(oi);
+            }
         }
 
         let mut kills = dark_kills;

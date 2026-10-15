@@ -7,11 +7,11 @@
 use sim_core::{
     alpha_for_occupant, alpha_from_params, band_compress_scale, canopy_compress_scale,
     cover_transmission, delta0_for_form, drain_fw_params, f_l_growth, f_t_growth, f_w_growth,
-    is_canopy_form, l_min_for_form, l_opt_for_shade, overlap_cover_from_alphas, t_mature_for_form,
+    is_canopy_form, canopy_layers, same_canopy_layer, l_min_for_form, l_opt_for_shade, overlap_cover_from_alphas, t_mature_for_form,
     Catalog, ChunkBusy, ClimateReject, Column, HydroReject, LightReject, Occupant, OccupantParams,
     PlantTaxonError, ShadeClass, SoilLayer, Texture, World, CHUNK, C_MAX, E_OPEN, E_SOIL, F_FERTILE,
     H0, H_BAND, H_POND, H_REST, L0, MASS_EPSILON, MAX_OCCUPANTS, N_ET, N_LAYERS, P_MAX, R_MAX,
-    T_CROWD, T_DARK, T_MATURE_HERB, T_MATURE_TREE, T_MIN, T_SETTLE, T_SUB, T_WILT, T_WL, V_REST,
+    T_CROWD, T_DARK, T_MATURE_HERB, T_MATURE_TREE, T_MIN, T_SETTLE, T_SUB, T_WILT, T_WL, V_REST, LAYER_GAP_FRAC, LAYER_GAP_MIN_M,
 };
 
 fn assert_mass_close(actual: f64, expected: f64) {
@@ -5923,4 +5923,223 @@ fn d162_no_species_name_match() {
     }
     assert!(lib.contains("is_canopy_form") || lib.contains("canopy_compress_scale"));
     assert!(lib.contains("A_canopy") || lib.contains("s_canopy") || lib.contains("canopy"));
+}
+
+
+// --- Sprint 16.3 — canopy layers by height ----------------------------------------------
+
+fn pine_params() -> OccupantParams {
+    Catalog::load_embedded()
+        .unwrap()
+        .get("pinus_taeda")
+        .unwrap()
+        .clone()
+}
+
+fn living_pines(world: &World) -> Vec<Occupant> {
+    world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| o.alive && o.taxon_id.as_deref() == Some("pinus_taeda"))
+        .cloned()
+        .collect()
+}
+
+/// D163: two mature pines share the top layer (A_L>1) and thin to one at T_CROWD.
+#[test]
+fn d163_two_mature_pines_thin() {
+    assert_eq!(T_CROWD, 7);
+    assert!((LAYER_GAP_MIN_M - 1.0).abs() < 1e-15);
+    assert!((LAYER_GAP_FRAC - 0.25).abs() < 1e-15);
+    let pine = pine_params();
+    let h = pine.height_m_mature.unwrap();
+    assert_eq!(canopy_layers(&[h, h]), vec![0, 0]);
+    let mut world = World::new(1631, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_params(0, 0, &pine, 1.0).unwrap();
+    world.plant_params(0, 0, &pine, 1.0).unwrap();
+    fill_slots_with_herb(&mut world, 0, 0);
+    for t in 1..T_CROWD {
+        world.tick();
+        let n = living_pines(&world).iter().filter(|o| is_mature(o)).count();
+        assert_eq!(n, 2, "both mature pines remain at tick {t}");
+    }
+    world.tick();
+    let n = living_pines(&world).iter().filter(|o| is_mature(o)).count();
+    assert_eq!(n, 1, "top layer thins to one mature pine at T_CROWD");
+}
+
+/// D163: 13.1 m and 8.6 m pines are in different layers; the midstory pine is not
+/// compressed by, counted in, or removed by the dominant-layer thin.
+#[test]
+fn d163_midstory_not_in_dominant_layer() {
+    assert!(!same_canopy_layer(13.1, 8.6), "gap 4.5 m > threshold 3.3 m");
+    let pine = pine_params();
+    let h = pine.height_m_mature.unwrap();
+    assert!((h - 13.1).abs() < 1e-9);
+    let hf_mid = 8.6 / h;
+    let ids = canopy_layers(&[h, h, h * hf_mid]);
+    assert_eq!(ids[0], ids[1]);
+    assert_ne!(ids[0], ids[2]);
+
+    let mut world = World::new(1632, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_params(0, 0, &pine, hf_mid).unwrap();
+    world.plant_params(0, 0, &pine, 1.0).unwrap();
+    world.plant_params(0, 0, &pine, 1.0).unwrap();
+    fill_slots_with_herb(&mut world, 0, 0);
+    world.tick();
+    let pines = living_pines(&world);
+    let mid = pines.iter().find(|o| o.height_frac < 0.9).expect("midstory pine");
+    assert!((mid.band_scale - 1.0).abs() < 1e-12, "midstory s must be 1");
+    for p in pines.iter().filter(|o| is_mature(o)) {
+        assert!(p.band_scale < 1.0, "dominant layer compressed");
+    }
+    for _ in 1..T_CROWD {
+        world.tick();
+    }
+    let pines = living_pines(&world);
+    assert_eq!(pines.iter().filter(|o| is_mature(o)).count(), 1);
+    assert!(
+        pines.iter().any(|o| o.height_frac < 0.9),
+        "midstory pine must survive the dominant-layer thin"
+    );
+}
+
+/// D163: a seedling under mature pines does not join the mature layer.
+#[test]
+fn d163_seedling_not_in_mature_layer() {
+    let pine = pine_params();
+    let h = pine.height_m_mature.unwrap();
+    assert!(!same_canopy_layer(h, h * H0));
+    let ids = canopy_layers(&[h, h, h * H0]);
+    assert_ne!(ids[0], ids[2]);
+
+    let mut world = World::new(1633, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_params(0, 0, &pine, H0).unwrap();
+    world.plant_params(0, 0, &pine, 1.0).unwrap();
+    world.plant_params(0, 0, &pine, 1.0).unwrap();
+    fill_slots_with_herb(&mut world, 0, 0);
+    world.tick();
+    let seed = living_pines(&world)
+        .into_iter()
+        .find(|o| o.height_frac < 0.5)
+        .expect("seedling");
+    assert!((seed.band_scale - 1.0).abs() < 1e-12);
+    for _ in 1..T_CROWD {
+        world.tick();
+    }
+    let pines = living_pines(&world);
+    assert_eq!(pines.iter().filter(|o| is_mature(o)).count(), 1);
+    assert!(
+        pines.iter().any(|o| o.height_frac < 0.5),
+        "seedling must not be thinned by the mature layer"
+    );
+}
+
+/// D163: near heights (13.1 m vs 13.0 m) still share a layer and thin.
+#[test]
+fn d163_near_heights_still_share() {
+    assert!(same_canopy_layer(13.1, 13.0));
+    let pine = pine_params();
+    let h = pine.height_m_mature.unwrap();
+    let hf_short = 13.0 / h;
+    assert!(h * (1.0 - hf_short) > H_BAND, "split across 5 cm bands");
+    let mut world = World::new(1634, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_params(0, 0, &pine, hf_short).unwrap();
+    world.plant_params(0, 0, &pine, 1.0).unwrap();
+    fill_slots_with_herb(&mut world, 0, 0);
+    for _ in 0..T_CROWD {
+        world.tick();
+    }
+    let left: Vec<_> = living_pines(&world)
+        .into_iter()
+        .filter(|o| o.height_frac >= F_FERTILE)
+        .collect();
+    assert_eq!(left.len(), 1, "near-height pines share a layer and thin");
+    assert!(left[0].height_frac + 1e-12 >= 1.0, "taller pine survives");
+}
+
+/// D163: herbs are in no woody layer and are not removed by a layer thin.
+#[test]
+fn d163_herb_not_in_layer() {
+    let pine = pine_params();
+    let mut world = World::new(1635, light_sand_column());
+    world.set_climate(20.0, 1000.0);
+    world.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    world.plant_params(0, 0, &pine, 1.0).unwrap();
+    world.plant_params(0, 0, &pine, 1.0).unwrap();
+    fill_slots_with_herb(&mut world, 0, 0);
+    assert!(!is_canopy_form(world.catalog().get("lolium_perenne").unwrap().form));
+    for _ in 0..T_CROWD {
+        world.tick();
+    }
+    assert!(world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .any(|o| o.alive && o.taxon_id.as_deref() == Some("lolium_perenne")));
+    assert_eq!(living_pines(&world).iter().filter(|o| is_mature(o)).count(), 1);
+}
+
+/// D163: catch_up uses the same layers as live ticks (dominant thins, midstory lives).
+#[test]
+fn d163_catchup_layers_same_as_live() {
+    let pine = pine_params();
+    let hf_mid = 8.6 / pine.height_m_mature.unwrap();
+    let mk = |seed| {
+        let mut w = World::new(seed, light_sand_column());
+        w.set_climate(20.0, 1000.0);
+        w.plant_params(0, 0, &pine, hf_mid).unwrap();
+        w.plant_params(0, 0, &pine, 1.0).unwrap();
+        w.plant_params(0, 0, &pine, 1.0).unwrap();
+        fill_slots_with_herb(&mut w, 0, 0);
+        w
+    };
+    let mut live = mk(1636);
+    let mut caught = mk(1637);
+    for _ in 0..T_CROWD {
+        live.add_rain_at(0, 0, 0.05);
+        live.tick();
+    }
+    caught.force_sleep_all();
+    ignore_all_chunks(&mut caught);
+    caught.catch_up(T_CROWD, 0.05);
+    for (label, w) in [("live", &live), ("catch_up", &caught)] {
+        let pines = living_pines(w);
+        assert_eq!(
+            pines.iter().filter(|o| (o.height_frac - 1.0).abs() < 1e-9).count(),
+            1,
+            "{label}: dominant layer thins to one"
+        );
+        assert!(pines.iter().any(|o| o.height_frac < 0.9), "{label}: midstory lives");
+    }
+}
+
+/// D163: layers come from height + form traits only; no species-name branch.
+#[test]
+fn d163_no_species_name_match() {
+    let cat = Catalog::load_embedded().expect("embedded catalog");
+    assert!(is_canopy_form(cat.get("pinus_taeda").unwrap().form));
+    assert!(is_canopy_form(cat.get("quercus_alba").unwrap().form));
+    assert!(cat.get("pine").is_err());
+    let lib = include_str!("../src/lib.rs");
+    let catalog = include_str!("../src/catalog.rs");
+    for (label, src) in [("lib.rs", lib), ("catalog.rs", catalog)] {
+        for pat in [
+            r#"== "grass""#,
+            r#"== "oak""#,
+            r#"== "pine""#,
+            r#"== "pinus""#,
+            r#"== "lolium""#,
+            "if name ==",
+            "match name",
+        ] {
+            assert!(!src.contains(pat), "{label} contains forbidden pattern: {pat}");
+        }
+    }
+    assert!(lib.contains("canopy_layers") && lib.contains("same_canopy_layer"));
 }

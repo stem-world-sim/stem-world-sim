@@ -1,16 +1,17 @@
 # Oracle RUNLOG
 
 ```
-sprint: S16.2
+sprint: S16.3
 result: green
-branch: feat/s16.2-canopy-bucket
-date: 2026-10-06 (PT)
+branch: feat/s16.3-canopy-layers
+date: 2026-10-14 (PT)
 epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15; H_REST=0.02 m; V_REST=1e-4 m
-constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25; T_SETTLE=64; CHUNK=8; H_POND=0.02; T_WL=7; T_WL_D=3; T_SUB=7; T_DARK=7; T_CROWD=7; L0=1; H_BAND=0.05; T_MIN=0.05; C_MAX=0.85; H0=0.10; F_FERTILE=0.5; T_MATURE herb/shrub/tree=20/80/200; L_opt I|empty=1.00 M=0.60 T=0.35; theta_pwp=0.5*theta_fc
+constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25; T_SETTLE=64; CHUNK=8; H_POND=0.02; T_WL=7; T_WL_D=3; T_SUB=7; T_DARK=7; T_CROWD=7; L0=1; H_BAND=0.05; T_MIN=0.05; C_MAX=0.85; LAYER_GAP_MIN_M=1.0; LAYER_GAP_FRAC=0.25; H0=0.10; F_FERTILE=0.5; T_MATURE herb/shrub/tree=20/80/200; L_opt I|empty=1.00 M=0.60 T=0.35; theta_pwp=0.5*theta_fc
 growth_cadence: once per live tick on visit set, after light filter (uses last_light); catch_up/catch_up_chunk once per calendar block after hydro before sinks (light+compress+crowd when any alive; hold last_light; same Δ0·f_L·f_w·f_T; f_w drain-shaped; wilted f_w=0)
 seed_rain: after growth each live tick / catch_up block; fertile=alive∧height_frac≥F_FERTILE; one attempt/fertile; targets N,E,S,W,same first under MAX_OCCUPANTS; dispersal wind|animal→neighbors+same, water→same|pond(h_surf>0)|lower elevation_m, short|empty|other→same; seedling H0; no RNG
 canopy_bucket: form∈{tree,shrub} share one per-tile A_canopy=Σ(α·height_frac²); A_canopy>1 → s=1/A_canopy on α_eff+uptake for those members; T_CROWD=7 consecutive → drop weakest (lowest f_L·f_w·f_T·height_frac; tie lower frac then lower index); reset when A_canopy≤1. Herbs stay on H_BAND bands (herb-only A_b) and are not in the canopy sum/thin. Light still walks H_BAND bands top-down; each member casts compressed α (canopy s or herb s_b) for S13.2 transmission. Catch_up uses same bucket. Seed pulse unchanged (S16 once/tick). No RNG; no English-name branch.
-invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9 + D91 + D10 + D11 + D12 + D121 + D13 + D131 + D132 + D14 + D141 + D142 + D15 + D16 + D162
+canopy_layers: S16.3 splits the woody bucket into height layers: two living tree/shrub occupants share a layer when |h_i-h_j| ≤ max(1 m, 0.25·max(h_i,h_j)), transitive (union over all pairs). Each layer has own A_L=Σα·height_frac², s_L=1/A_L if >1, crowd counter and T_CROWD thin of weakest in that layer. Lower-layer stems are not summed or removed by an upper layer. Herbs unchanged. Light walk unchanged. Catch_up uses same apply_light_filter_at path.
+invariants encoded: I1, I2, I3(+et_lost+extract_lost), I4, I5, I6 + D0 + D1 + D3 + D31 + D32 + D33 + D331 + D4 + D41 + D5 + D6 + D7 + D8 + D9 + D91 + D10 + D11 + D12 + D121 + D13 + D131 + D132 + D14 + D141 + D142 + D15 + D16 + D162 + D163
 tests:
   - i1_moisture_and_surface_nonnegative
   - i2_isolated_column_mass_conserved
@@ -172,5 +173,12 @@ tests:
   - d162_herb_not_in_canopy
   - d162_catchup_thins_same_as_live
   - d162_no_species_name_match
-notes: S16.2 tree/shrub canopy bucket. Problem: H_BAND=0.05 split crowns so pines ~6 cm apart never shared a band (A_b≤1, S15 thin never fired). Rule: herbs unchanged on 5 cm bands; tree+shrub on a tile share one canopy bucket for compress+thin; light layering still height-order/H_BAND with each member's compressed α. Amended d15_two_mature_oaks_thin / d15_weaker_loses / d15_catchup_thins_same_as_live minimally: fill free slots with herbs so S16 home-seedlings (now in the canopy bucket) cannot absorb the thin — contract (one mature survivor) unchanged; tests not renamed/deleted. Seed pulse unchanged. cargo test --workspace green (see CI). Cargo.lock left untracked. docs/ untouched.
+  - d163_two_mature_pines_thin
+  - d163_midstory_not_in_dominant_layer
+  - d163_seedling_not_in_mature_layer
+  - d163_near_heights_still_share
+  - d163_herb_not_in_layer
+  - d163_catchup_layers_same_as_live
+  - d163_no_species_name_match
+notes: S16.3 canopy layers by height. S16.2 put a 13.1 m and an 8.6 m pine in one bucket (lateral crowding on a vertical stack); now only crowns in the same layer compete. 13.1 vs 13.0 share; 13.1 vs 8.6 do not (gap 4.5 > 3.3); seedling under mature pine not in mature layer. No prior test needed amending (S16.2 tests use equal or one-tick-apart heights, which share a layer). Result 167 acceptance + 4 unit green. Seed pulse unchanged. No RNG, no English-name branch. Cargo.lock untracked. docs/ untouched.
 ```
