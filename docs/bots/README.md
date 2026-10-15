@@ -1,10 +1,9 @@
-# Grok Bot import pack
+# Role files
 
-This Project chat cannot publish an official https://x.ai/bot/... template. That link is created only inside the Grok Bot app: create a Bot, then Share as template.
+Index only. Paths and steps are in the role file, not here.
 
-What this folder is: paste-ready profiles.
-
-| File | Bot |
+| File | Role |
 |---|---|
+| `SPEC.md` | This chat |
 | `ORACLE.md` | Kernel smith |
-| `CRITIC.md` | Optional later. Scores demos. Does not write crates. |
+| `CRITIC.md` | Scores the living critic |
