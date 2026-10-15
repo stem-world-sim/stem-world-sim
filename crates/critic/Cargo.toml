@@ -1,0 +1,21 @@
+[package]
+name = "critic"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "critic"
+path = "src/lib.rs"
+
+[[bin]]
+name = "critic"
+path = "src/main.rs"
+
+[dependencies]
+sim_core = { path = "../sim-core" }
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement"] }
+log = "0.4"

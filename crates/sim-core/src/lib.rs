@@ -649,6 +649,93 @@ fn light_traits_for_occupant(catalog: &Catalog, occ: &Occupant) -> (f64, f64, f6
     (h_mat * hf, alpha_eff(alpha, hf), l_min, canopy)
 }
 
+/// Crowd bucket kind for [`TileOccupantView`]. S17.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerKind {
+    /// Tree/shrub canopy layer (S16.3 height layers).
+    Woody,
+    /// Herb crowd band (S15 H_BAND bands).
+    Herb,
+}
+
+/// Read-only view of one living occupant from [`World::query_tile`]. S17.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TileOccupantView {
+    /// Index into the tile's occupant list.
+    pub slot: usize,
+    pub taxon: Option<String>,
+    /// Crown height in metres (mature height · height_frac).
+    pub height_m: f64,
+    pub height_frac: f64,
+    /// Woody: canopy layer id (dense from 0). Herb: herb band id (dense from 0).
+    pub layer_id: usize,
+    pub layer_kind: LayerKind,
+    /// Crowd load of this occupant's bucket: A = Σ α·height_frac² over the bucket.
+    pub a: f64,
+    /// Consecutive ticks this occupant's bucket has had A > 1 (thin at T_CROWD).
+    pub over: u32,
+    /// Last incoming light from the kernel light pass (None before the first pass).
+    pub light: Option<f64>,
+    pub alive: bool,
+}
+
+/// Snapshot of one tile from [`World::query_tile`]. S17.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TileView {
+    pub living: usize,
+    pub cap: usize,
+    pub occupants: Vec<TileOccupantView>,
+}
+
+/// Crowd layout of living occupants with the same sort, H_BAND herb bands and
+/// canopy_layers grouping the light filter uses. Returns per row
+/// (occupant index, height, alpha_eff, kind, layer id, bucket load A). S17.
+fn crowd_layout(catalog: &Catalog, occs: &[Occupant]) -> Vec<(usize, f64, f64, LayerKind, usize, f64)> {
+    let mut rows: Vec<(usize, f64, f64, bool)> = Vec::new();
+    for (oi, o) in occs.iter().enumerate() {
+        if !o.alive {
+            continue;
+        }
+        let (h, a, _lmin, canopy) = light_traits_for_occupant(catalog, o);
+        rows.push((oi, h, a, canopy));
+    }
+    rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let woody: Vec<usize> = (0..rows.len()).filter(|&k| rows[k].3).collect();
+    let woody_h: Vec<f64> = woody.iter().map(|&k| rows[k].1).collect();
+    let layer_of = canopy_layers(&woody_h);
+    let n_layers = layer_of.iter().map(|&x| x + 1).max().unwrap_or(0);
+    let mut layer_load = vec![0.0_f64; n_layers];
+    for (w, &k) in woody.iter().enumerate() {
+        layer_load[layer_of[w]] += rows[k].2;
+    }
+    let mut out: Vec<(usize, f64, f64, LayerKind, usize, f64)> = Vec::new();
+    for (w, &k) in woody.iter().enumerate() {
+        let r = rows[k];
+        out.push((r.0, r.1, r.2, LayerKind::Woody, layer_of[w], layer_load[layer_of[w]]));
+    }
+    let mut band_id = 0usize;
+    let mut idx = 0;
+    while idx < rows.len() {
+        let top = rows[idx].1;
+        let mut end = idx;
+        while end + 1 < rows.len() && top - rows[end + 1].1 <= H_BAND {
+            end += 1;
+        }
+        let herbs: Vec<usize> = (idx..=end).filter(|&k| !rows[k].3).collect();
+        if !herbs.is_empty() {
+            let load: f64 = herbs.iter().map(|&k| rows[k].2).sum();
+            for &k in &herbs {
+                let r = rows[k];
+                out.push((r.0, r.1, r.2, LayerKind::Herb, band_id, load));
+            }
+            band_id += 1;
+        }
+        idx = end + 1;
+    }
+    out.sort_by_key(|r| r.0);
+    out
+}
+
 /// Historical S09 busy signal. S09.1: [`World::ignore_chunk`] always succeeds (never Err).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkBusy;
@@ -1705,6 +1792,31 @@ impl World {
         }
         self.add_occupant(x, y, occ)
             .map_err(|_| PlantTaxonError::OccupantsFull)
+    }
+
+    /// Read-only crowd/light view of tile (x,y): living count, cap and per living occupant
+    /// its layer, bucket load A, crowd counter and last light. Same grouping as the kernel. S17.
+    pub fn query_tile(&self, x: usize, y: usize) -> TileView {
+        let occs = &self.columns[self.idx(x, y)].occupants;
+        let occupants: Vec<TileOccupantView> = crowd_layout(&self.catalog, occs)
+            .into_iter()
+            .map(|(oi, h, _a_eff, kind, lid, load)| {
+                let o = &occs[oi];
+                TileOccupantView {
+                    slot: oi,
+                    taxon: o.taxon_id.clone(),
+                    height_m: h,
+                    height_frac: o.height_frac,
+                    layer_id: lid,
+                    layer_kind: kind,
+                    a: load,
+                    over: o.crowd_steps,
+                    light: o.last_light,
+                    alive: o.alive,
+                }
+            })
+            .collect();
+        TileView { living: occupants.len(), cap: MAX_OCCUPANTS, occupants }
     }
 
     /// Live plant path: T_air vs t_min/t_max only (rain_year is not a live kill). S12.1.
