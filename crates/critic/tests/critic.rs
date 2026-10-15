@@ -145,3 +145,39 @@ fn d17_no_species_name_match() {
     }
     assert!(core.contains("pub fn query_tile"));
 }
+
+/// D17.1: pine at ~8.6 m and pine at 13.1 m (mature) via the height control; layer ids differ.
+#[test]
+fn d171_plant_height_midstory() {
+    use critic::HeightChoice;
+    let mut c = Critic::new();
+    assert!((c.mature_height(PINE).unwrap() - 13.1).abs() < 1e-6);
+    c.plant_choice(PINE, HeightChoice::Mature).unwrap();
+    c.plant_choice(PINE, HeightChoice::Metres(8.6)).unwrap();
+    let pines: Vec<_> = c.query_tile().occupants.into_iter().filter(|o| o.taxon.as_deref() == Some(PINE)).collect();
+    assert_eq!(pines.len(), 2);
+    let mut hs: Vec<f64> = pines.iter().map(|o| o.height_m).collect();
+    hs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert!((hs[0] - 8.6).abs() < 1e-6 && (hs[1] - 13.1).abs() < 1e-6);
+    assert_ne!(pines[0].layer_id, pines[1].layer_id);
+}
+
+/// D17.1: seedling pine (0.10 × mature) under a mature pine stays, in a different layer.
+#[test]
+fn d171_plant_seedling() {
+    use critic::{HeightChoice, SEEDLING_FRAC};
+    let mut c = Critic::new();
+    c.plant_choice(PINE, HeightChoice::Mature).unwrap();
+    c.plant_choice(PINE, HeightChoice::Seedling).unwrap();
+    let seed = |c: &Critic| {
+        c.query_tile().occupants.into_iter().find(|o| o.alive && o.taxon.as_deref() == Some(PINE) && o.height_frac < 0.5)
+    };
+    let s = seed(&c).expect("seedling planted");
+    assert!((s.height_frac - SEEDLING_FRAC).abs() < 1e-9);
+    let m = mature(&c, PINE);
+    assert_eq!(m.len(), 1);
+    assert_ne!(s.layer_id, m[0].layer_id);
+    c.tick_n(T_CROWD);
+    assert!(seed(&c).is_some(), "seedling stays after T_CROWD");
+    assert_eq!(mature(&c, PINE).len(), 1);
+}

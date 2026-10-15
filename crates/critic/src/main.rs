@@ -1,34 +1,50 @@
 //! S17 critic window (egui). Formats text only; every number comes from `Critic::query_tile`.
 
-use critic::{Critic, LayerKind};
+use critic::{Critic, HeightChoice, LayerKind};
 use eframe::egui;
 
 struct App {
     critic: Critic,
     k: u32,
     playing: bool,
+    height: HeightChoice,
+    metres: f64,
     status: String,
 }
 
 impl Default for App {
     fn default() -> Self {
-        Self { critic: Critic::new(), k: 7, playing: false, status: String::new() }
+        Self { critic: Critic::new(), k: 7, playing: false, height: HeightChoice::Mature, metres: 5.0, status: String::new() }
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.playing {
-            self.critic.tick();
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            // Play: advance K ticks, then wait before the next burst.
+            self.critic.tick_n(self.k);
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("stem-world-sim critic — one tile");
-            ui.label("Plant (mature):");
+            ui.horizontal(|ui| {
+                ui.label("Height:");
+                ui.radio_value(&mut self.height, HeightChoice::Seedling, "seedling (0.10×)");
+                ui.radio_value(&mut self.height, HeightChoice::Half, "half");
+                ui.radio_value(&mut self.height, HeightChoice::Mature, "mature");
+                let is_m = matches!(self.height, HeightChoice::Metres(_));
+                if ui.radio(is_m, "metres").clicked() || is_m {
+                    self.height = HeightChoice::Metres(self.metres);
+                }
+                if ui.add(egui::DragValue::new(&mut self.metres).range(0.01..=100.0).speed(0.1).suffix(" m")).changed() {
+                    self.height = HeightChoice::Metres(self.metres);
+                }
+            });
+            ui.label("Plant:");
             ui.horizontal_wrapped(|ui| {
                 for (id, name) in self.critic.demo_taxa() {
                     if ui.button(&name).on_hover_text(&id).clicked() {
-                        self.status = match self.critic.plant(&id) {
+                        self.status = match self.critic.plant_choice(&id, self.height) {
                             Ok(()) => format!("planted {id}"),
                             Err(e) => format!("{id}: {e:?}"),
                         };
