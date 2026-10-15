@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sim-core"]
+members = ["crates/sim-core", "crates/critic"]
 
 # S10 flyover budgets are wall-clock; keep `cargo test` optimized enough to be meaningful.
 [profile.test]
