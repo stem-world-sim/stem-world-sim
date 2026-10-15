@@ -1,13 +1,7 @@
-# SPEC – Named invariants and demo predicates
+# SPEC
 
-**Version:** 0.8
-**Date:** 2026-09-08
-**Status:** Fast-clock input. Oracle implements what is named here.
+Active sprint: `docs/sprints/CURRENT.md`.
 
-## Active slice
+Named test contracts: `docs/spec/ACCEPTANCE.md`.
 
-Sprint 3.3 — `docs/sprints/CURRENT.md`.
-
-Pond: every lower-H 4-neighbor, weights ∝ ΔH, each edge ≤ R_max = 0.15 and ≤ 0.5 ΔH. Unique-min-H chute revoked. Soil drain unchanged from S03.2.
-
-I1–I6 unchanged.
+Do not restate the active sprint here.
