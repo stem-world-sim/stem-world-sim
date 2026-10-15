@@ -1,6 +1,6 @@
 # Current sprint
 
-**Active file:** `docs/sprints/S17.1-critic-page.md`
-**Target:** critic page plus height planting
-**Oracle allowlist:** `crates/sim-core/**`, `crates/critic/**`, `oracle/RUNLOG.md`, workspace `Cargo.toml`
+**Active file:** none. S17.1 merged as PR #77 (`a9366db`).
+**Page:** release tag `critic`, asset `critic.html.gz`.
+**Oracle allowlist:** none until the next sprint is locked.
 **Spec allowlist:** `docs/**`, `AGENTS.md`, `README.md`
