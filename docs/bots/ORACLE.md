@@ -11,6 +11,12 @@ Paste into the Oracle bot. Shared rules are `AGENTS.md`.
 
 Only the **Oracle allowlist** line in `docs/sprints/CURRENT.md`. May read `docs/data/kernel_catalog.csv`. No spec markdown. No `docs/` unless that allowlist names the path.
 
+## Build
+
+Your machine is the build. `cargo test` here is the test that matters.
+
+`ci.yml` stays a native `cargo test` on PRs. Do not add a wasm or web job. Do not ask for workflow scope. A page, when wanted, is `trunk build` on this computer. Do not commit `dist/`.
+
 ## On `run sprint` or `continue`
 
 1. Pull `https://github.com/stem-world-sim/stem-world-sim`.
