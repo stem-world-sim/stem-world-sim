@@ -10,7 +10,9 @@ HTML demos reimplemented physics and drifted. The critic must call the kernel. T
 
 ## Deliver
 
-New crate `critic` in the workspace. It depends on `sim-core` only. No physics in the UI.
+New crate `critic` in the workspace. It depends on `sim-core` only. No physics in the UI. This crate is the living critic. Later sprints add to it. Do not copy a new demo folder per sprint.
+
+Do not write `docs/`. The old `docs/demo/*.html` sketches stay where they are. They are not the critic.
 
 Stable API the UI and the tests both call:
 
@@ -23,7 +25,7 @@ Stable API the UI and the tests both call:
 Targets:
 
 - Native: `cargo run -p critic` builds.
-- Wasm: a wasm build of the same UI, loadable as a page. Put the built page where a phone can open it (`docs/demo/critic/` is fine). Document the one command that rebuilds it.
+- Wasm: same UI. Build output stays inside `crates/critic/` (for example `crates/critic/dist/`). One living copy, overwritten on rebuild, never copied into `docs/`. Document the one command that rebuilds it. Do not commit a wasm blob per sprint.
 
 The UI may format text. It must not decide who shares a layer, who thins, or what light is. Those come from the query.
 
@@ -40,8 +42,8 @@ Tests call the same API the UI calls:
 
 ## Non-goals
 
-Seed storm, seasons, lifespan, raising MAX_OCCUPANTS, neighbor canopy, a renderer, Bevy, a grid larger than one tile.
+Seed storm, seasons, lifespan, raising MAX_OCCUPANTS, neighbor canopy, a renderer, Bevy, a grid larger than one tile, a new docs/demo page.
 
 ## Deliverables
 
-`critic` crate + wasm page + tests + RUNLOG. No hand-written second physics. Docs only if the wasm page must live under `docs/demo/` — that path is allowed for the built page, not for a JS port of the rules.
+`crates/critic` + tests + RUNLOG. No hand-written second physics. No writes under `docs/`.
