@@ -16,6 +16,19 @@ fn critic_column() -> Column {
     Column::new(0.0, 0.0, vec![SoilLayer::new(0.3, fc, tex), SoilLayer::new(0.5, fc, tex)])
 }
 
+/// Seedling preset: 0.10 × mature height.
+pub const SEEDLING_FRAC: f64 = 0.10;
+
+/// S17.1 plant height control. Mature is the default.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum HeightChoice {
+    Seedling,
+    Half,
+    #[default]
+    Mature,
+    Metres(f64),
+}
+
 /// One tile (1×1 world) driven only through the sim-core API.
 pub struct Critic {
     world: World,
@@ -47,6 +60,30 @@ impl Critic {
         };
         let h_mat = params.height_m_mature.unwrap_or(height_m.max(1e-9));
         self.world.plant_params(0, 0, &params, height_m / h_mat)
+    }
+
+    /// Mature crown height (m) of a catalog taxon, if the catalog has one.
+    pub fn mature_height(&self, taxon: &str) -> Option<f64> {
+        self.world.catalog().get(taxon).ok().and_then(|p| p.height_m_mature)
+    }
+
+    /// Plant a catalog taxon at a fraction of its mature height (S17.1 height control).
+    pub fn plant_frac(&mut self, taxon: &str, frac: f64) -> Result<(), PlantTaxonError> {
+        let params = match self.world.catalog().get(taxon) {
+            Ok(p) => p.clone(),
+            Err(_) => return Err(PlantTaxonError::UnknownTaxon),
+        };
+        self.world.plant_params(0, 0, &params, frac)
+    }
+
+    /// Plant at the UI's chosen height.
+    pub fn plant_choice(&mut self, taxon: &str, h: HeightChoice) -> Result<(), PlantTaxonError> {
+        match h {
+            HeightChoice::Mature => self.plant(taxon),
+            HeightChoice::Half => self.plant_frac(taxon, 0.5),
+            HeightChoice::Seedling => self.plant_frac(taxon, SEEDLING_FRAC),
+            HeightChoice::Metres(m) => self.plant_height(taxon, m),
+        }
     }
 
     pub fn tick(&mut self) {

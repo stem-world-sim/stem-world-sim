@@ -1,10 +1,10 @@
 # Oracle RUNLOG
 
 ```
-sprint: S17
+sprint: S17.1
 result: green
-branch: feat/s17-critic
-date: 2026-10-14 (PT)
+branch: feat/s17.1-critic-page
+date: 2026-10-15 (PT)
 epsilon: 1e-9 relative on f64 water mass; R_MAX=0.15; H_REST=0.02 m; V_REST=1e-4 m
 constants: E_OPEN=0.02; E_SOIL=0.005; N_ET=10; MAX_OCCUPANTS=8; N_LAYERS=2; P_MAX=0.01; T_WILT=3; PlantStub.shade=0.25; T_SETTLE=64; CHUNK=8; H_POND=0.02; T_WL=7; T_WL_D=3; T_SUB=7; T_DARK=7; T_CROWD=7; L0=1; H_BAND=0.05; T_MIN=0.05; C_MAX=0.85; LAYER_GAP_MIN_M=1.0; LAYER_GAP_FRAC=0.25; H0=0.10; F_FERTILE=0.5; T_MATURE herb/shrub/tree=20/80/200; L_opt I|empty=1.00 M=0.60 T=0.35; theta_pwp=0.5*theta_fc
 growth_cadence: once per live tick on visit set, after light filter (uses last_light); catch_up/catch_up_chunk once per calendar block after hydro before sinks (light+compress+crowd when any alive; hold last_light; same Δ0·f_L·f_w·f_T; f_w drain-shaped; wilted f_w=0)
@@ -186,4 +186,8 @@ tests:
   - d17_herb_band_thins
   - d17_query_matches_kernel
   - d17_no_species_name_match
+  - d171_plant_height_midstory
+  - d171_plant_seedling
 notes: S17 critic on sim-core, one tile, native + wasm. The UI formats query_tile output only; it does not decide layers, thinning or light. No prior test amended. Result 167 acceptance + 4 unit + 5 critic green. Seed pulse, MAX_OCCUPANTS, layer rule, herb bands unchanged. No RNG, no English-name branch. Cargo.lock untracked. docs/ untouched.
+notes S17.1: critic plant height control (seedling 0.10×mature, half, mature default, metres field) via Critic::plant_choice → sim-core plant_taxon/plant_params; Play advances K (same as Tick×N) per burst then waits 500 ms; Pause stops; Reset clears tile. No physics in UI. Page: trunk build --release; docs/tools/pack_critic.py run as-is but glue exports `__wbg_init as default` (no `init`), so a patched copy outside the repo (/tmp/pack_critic.py) strips the export line, aliases init, calls init({module_or_path: bytes}); critic.html.gz uploaded to release tag `critic`, not on main; dist/ not committed. Result 167 acceptance + 4 unit + 7 critic green. docs/ untouched.
+```
