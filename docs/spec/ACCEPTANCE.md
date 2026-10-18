@@ -150,6 +150,22 @@ Always-on I1 I2 I5 I6 still required.
 
 ---
 
+## Sprint 18 — telemetry, clock, continuous rain
+
+| Rust test name | Fail if |
+|---|---|
+| `d18_root_depth_queryable` | query_tile does not return root_depth_m or max_layer for a living oak |
+| `d18_oak_root_grows_to_next_layer` | seedling oak cannot reach layer 1 after growing to height that catalog root_depth implies |
+| `d18_continuous_rain_applied_each_tick` | set rain_per_tick_m > 0, tick, soil/surface mass does not increase by that amount |
+| `d18_tick_dt_scales_growth_and_et` | doubling tick_dt doubles height gain and ET over same number of ticks (within tolerance) |
+| `d18_mass_conserved_under_scaled_dt` | mass not conserved when dt ≠ 1 (prior implicit unit) |
+| `d18_default_dt_matches_prior_behavior` | with default dt, a known prior growth/ET script produces the same state as before S18 |
+| `d18_catchup_root_and_rain` | catch_up does not advance root depth or apply continuous rain equivalently to live ticks |
+
+Always-on I1 I2 I5 I6 still required. No species name match.
+
+---
+
 ## After a sprint ships
 
 Do not delete tests. Later sprints only **add** rows to this file (spec chat) and add functions (oracle).
