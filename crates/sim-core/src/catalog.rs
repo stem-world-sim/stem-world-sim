@@ -76,6 +76,8 @@ pub struct OccupantParams {
     pub taxon_id: String,
     pub name_norm: String,
     pub scientific: Option<String>,
+    /// Optional catalog `common_name` column (S17.2). Missing → None.
+    pub common_name: Option<String>,
     pub demo: bool,
     pub form: Form,
     pub height_m_mature: Option<f64>,
@@ -97,6 +99,15 @@ pub struct OccupantParams {
 }
 
 impl OccupantParams {
+    /// S17.2 label: `Common (Scientific)`; scientific only when no common name.
+    pub fn display_name(&self) -> String {
+        let sci = self.scientific.clone().unwrap_or_else(|| self.name_norm.clone());
+        match &self.common_name {
+            Some(c) => format!("{c} ({sci})"),
+            None => sci,
+        }
+    }
+
     /// Mature PlantStub: height_frac=1, catalog shade class. Uptake P_MAX; ET field shade 0.25.
     pub fn to_plant_stub(&self) -> Occupant {
         let mut occ = Occupant::plant_stub_with_root(self.root_mask);
@@ -190,6 +201,8 @@ impl Catalog {
         let i_disp = idx("dispersal")?;
         // Optional: missing header → all Empty (demo CSV has no shade yet).
         let i_shade = cols.iter().position(|c| c.as_str() == "shade");
+        // S17.2: optional common_name column.
+        let i_common = cols.iter().position(|c| c.as_str() == "common_name");
 
         let mut by_id = HashMap::new();
         for (lineno, line) in lines.enumerate() {
@@ -215,6 +228,7 @@ impl Catalog {
                 taxon_id: taxon_id.clone(),
                 name_norm: get(i_name).trim().to_string(),
                 scientific: opt_string(get(i_sci)),
+                common_name: i_common.and_then(|i| opt_string(get(i))),
                 demo: parse_demo(get(i_demo))?,
                 form,
                 height_m_mature: parse_opt_f64(get(i_height))?,

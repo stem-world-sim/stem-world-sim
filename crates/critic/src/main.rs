@@ -1,6 +1,7 @@
-//! S17 critic window (egui). Formats text only; every number comes from `Critic::query_tile`.
+//! S17/S17.2 critic window (egui). Narrow widths stack and wrap. Formats text only; every number comes from `Critic::query_tile`.
 
-use critic::{Critic, HeightChoice, LayerKind};
+use critic::{reason, Critic, HeightChoice, LayerKind, RAIN_STEP_M};
+use sim_core::STRESS_THRESHOLDS;
 use eframe::egui;
 
 struct App {
@@ -10,11 +11,83 @@ struct App {
     height: HeightChoice,
     metres: f64,
     status: String,
+    show_key: bool,
 }
 
 impl Default for App {
     fn default() -> Self {
-        Self { critic: Critic::new(), k: 7, playing: false, height: HeightChoice::Mature, metres: 5.0, status: String::new() }
+        Self { critic: Critic::new(), k: 7, playing: false, height: HeightChoice::Mature, metres: 5.0, status: String::new(), show_key: false }
+    }
+}
+
+/// Width (points) below which the page uses the stacked phone layout.
+const NARROW_W: f32 = 600.0;
+
+const KEY: &[(&str, &str)] = &[
+    ("living/cap", "living plants on the tile / most the tile can hold"),
+    ("pond", "standing water on the surface (m)"),
+    ("θ", "soil water content of a layer (m³/m³)"),
+    ("θ_fc", "field capacity: θ the layer holds after draining"),
+    ("height_m", "crown height in metres"),
+    ("h_frac", "height as a fraction of mature height (≥0.5 sets seed)"),
+    ("layer", "woody = tree/shrub canopy layer, herb = 5 cm herb band; id from tallest"),
+    ("A", "crowd load of the layer: sum of α·h_frac²; above 1 is overcrowded"),
+    ("over", "ticks in a row the layer has had A > 1"),
+    ("light", "light reaching the plant (1 = full sun)"),
+];
+
+impl App {
+    fn controls(&mut self, ui: &mut egui::Ui, narrow: bool) {
+        let height_row = |ui: &mut egui::Ui, s: &mut Self| {
+            ui.label("Height:");
+            ui.radio_value(&mut s.height, HeightChoice::Seedling, "seedling (0.10×)");
+            ui.radio_value(&mut s.height, HeightChoice::Half, "half");
+            ui.radio_value(&mut s.height, HeightChoice::Mature, "mature");
+            let is_m = matches!(s.height, HeightChoice::Metres(_));
+            if ui.radio(is_m, "metres").clicked() || is_m {
+                s.height = HeightChoice::Metres(s.metres);
+            }
+            if ui.add(egui::DragValue::new(&mut s.metres).range(0.01..=100.0).speed(0.1).suffix(" m")).changed() {
+                s.height = HeightChoice::Metres(s.metres);
+            }
+        };
+        ui.horizontal_wrapped(|ui| height_row(ui, self));
+        ui.label("Plant:");
+        ui.horizontal_wrapped(|ui| {
+            for (id, name) in self.critic.demo_taxa() {
+                let b = egui::Button::new(&name);
+                let b = if narrow { b.min_size(egui::vec2(ui.available_width().min(260.0), 40.0)) } else { b };
+                if ui.add(b).on_hover_text(&id).clicked() {
+                    self.status = match self.critic.plant_choice(&id, self.height) {
+                        Ok(()) => format!("planted {name}"),
+                        Err(e) => format!("{name}: {e:?}"),
+                    };
+                }
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Tick").clicked() {
+                self.critic.tick();
+            }
+            ui.add(egui::DragValue::new(&mut self.k).range(1..=1000).prefix("K="));
+            if ui.button(format!("Tick×{}", self.k)).clicked() {
+                self.critic.tick_n(self.k);
+            }
+            let label = if self.playing { "Pause" } else { "Play" };
+            if ui.button(label).clicked() {
+                self.playing = !self.playing;
+            }
+            if ui.button(format!("Rain {:.0} mm", RAIN_STEP_M * 1000.0)).clicked() {
+                self.critic.rain(RAIN_STEP_M);
+            }
+            if ui.button("Reset").clicked() {
+                self.critic.reset();
+                self.playing = false;
+            }
+            if ui.button(if self.show_key { "Hide key" } else { "Key" }).clicked() {
+                self.show_key = !self.show_key;
+            }
+        });
     }
 }
 
@@ -25,58 +98,47 @@ impl eframe::App for App {
             self.critic.tick_n(self.k);
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
+        let narrow = ctx.screen_rect().width() < NARROW_W;
+        ctx.style_mut(|s| {
+            s.spacing.interact_size.y = if narrow { 36.0 } else { 20.0 };
+            s.spacing.button_padding = if narrow { egui::vec2(10.0, 8.0) } else { egui::vec2(4.0, 1.0) };
+        });
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("stem-world-sim critic — one tile");
-            ui.horizontal(|ui| {
-                ui.label("Height:");
-                ui.radio_value(&mut self.height, HeightChoice::Seedling, "seedling (0.10×)");
-                ui.radio_value(&mut self.height, HeightChoice::Half, "half");
-                ui.radio_value(&mut self.height, HeightChoice::Mature, "mature");
-                let is_m = matches!(self.height, HeightChoice::Metres(_));
-                if ui.radio(is_m, "metres").clicked() || is_m {
-                    self.height = HeightChoice::Metres(self.metres);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.heading("stem-world-sim critic — one tile");
+                self.controls(ui, narrow);
+                ui.label(&self.status);
+                if self.show_key {
+                    ui.group(|ui| {
+                        ui.strong("Key");
+                        for (k, v) in KEY {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.strong(*k);
+                                ui.label(*v);
+                            });
+                        }
+                        ui.strong("Stress counters (count up each bad step; plant dies or is thinned at the threshold)");
+                        for (counter, name, v) in STRESS_THRESHOLDS {
+                            ui.label(format!("{counter} n/{v}: steps toward {name}={v}"));
+                        }
+                        ui.label("dry: no water taken; dark: below minimum light; waterlogged: saturated soil; submerged: under pond; crowded: layer A > 1, weakest thinned");
+                    });
                 }
-                if ui.add(egui::DragValue::new(&mut self.metres).range(0.01..=100.0).speed(0.1).suffix(" m")).changed() {
-                    self.height = HeightChoice::Metres(self.metres);
-                }
-            });
-            ui.label("Plant:");
-            ui.horizontal_wrapped(|ui| {
-                for (id, name) in self.critic.demo_taxa() {
-                    if ui.button(&name).on_hover_text(&id).clicked() {
-                        self.status = match self.critic.plant_choice(&id, self.height) {
-                            Ok(()) => format!("planted {id}"),
-                            Err(e) => format!("{id}: {e:?}"),
-                        };
+                let q = self.critic.query_tile();
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("tick {}", q.tick));
+                    ui.label(format!("living {}/{}", q.living, q.cap));
+                    ui.label(format!("pond {:.4} m", q.pond_m));
+                    for (i, (th, fc)) in q.layers.iter().enumerate() {
+                        ui.label(format!("layer{i} θ {th:.3} / θ_fc {fc:.3}"));
                     }
+                });
+                ui.label("Events:");
+                for e in self.critic.events().iter().rev() {
+                    ui.small(e);
                 }
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Tick").clicked() {
-                    self.critic.tick();
-                }
-                ui.add(egui::DragValue::new(&mut self.k).range(1..=1000).prefix("K="));
-                if ui.button(format!("Tick×{}", self.k)).clicked() {
-                    self.critic.tick_n(self.k);
-                }
-                let label = if self.playing { "Pause" } else { "Play" };
-                if ui.button(label).clicked() {
-                    self.playing = !self.playing;
-                }
-                if ui.button("Reset").clicked() {
-                    self.critic.reset();
-                    self.playing = false;
-                }
-            });
-            ui.label(&self.status);
-            let q = self.critic.query_tile();
-            ui.separator();
-            ui.label(format!("tick {}   living {}/{}", self.critic.tick_count(), q.living, q.cap));
-            egui::Grid::new("layers").striped(true).show(ui, |ui| {
-                for h in ["slot", "taxon", "height_m", "h_frac", "layer", "A", "over", "light", "alive"] {
-                    ui.strong(h);
-                }
-                ui.end_row();
+                ui.separator();
                 let mut rows = q.occupants.clone();
                 rows.sort_by(|a, b| b.height_m.partial_cmp(&a.height_m).unwrap_or(std::cmp::Ordering::Equal));
                 for o in rows {
@@ -84,16 +146,30 @@ impl eframe::App for App {
                         LayerKind::Woody => "woody",
                         LayerKind::Herb => "herb",
                     };
-                    ui.label(o.slot.to_string());
-                    ui.label(o.taxon.clone().unwrap_or_else(|| "-".into()));
-                    ui.label(format!("{:.2}", o.height_m));
-                    ui.label(format!("{:.3}", o.height_frac));
-                    ui.label(format!("{kind} {}", o.layer_id));
-                    ui.label(format!("{:.3}", o.a));
-                    ui.label(o.over.to_string());
-                    ui.label(o.light.map(|l| format!("{l:.3}")).unwrap_or_else(|| "-".into()));
-                    ui.label(o.alive.to_string());
-                    ui.end_row();
+                    let name = self.critic.label(o.taxon.as_deref().unwrap_or("-"));
+                    ui.group(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.strong(format!("#{} {name}", o.slot));
+                            ui.label(format!("— {}", reason(&o)));
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("height_m {:.2}", o.height_m));
+                            ui.label(format!("h_frac {:.3}", o.height_frac));
+                            ui.label(format!("layer {kind} {}", o.layer_id));
+                            ui.label(format!("A {:.3}", o.a));
+                            ui.label(format!("over {}", o.over));
+                            ui.label(format!("light {}", o.light.map(|l| format!("{l:.3}")).unwrap_or_else(|| "-".into())));
+                            ui.label(format!("alive {}", o.alive));
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            let th = STRESS_THRESHOLDS;
+                            ui.small(format!(
+                                "dry {}/{}  dark {}/{}  waterlogged {}/{}  submerged {}/{}  crowded {}/{}",
+                                o.dry_steps, th[0].2, o.dark_steps, th[1].2, o.waterlog_steps, th[2].2,
+                                o.submerge_steps, th[4].2, o.crowd_steps, th[5].2
+                            ));
+                        });
+                    });
                 }
             });
         });

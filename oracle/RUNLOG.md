@@ -191,3 +191,9 @@ tests:
 notes: S17 critic on sim-core, one tile, native + wasm. The UI formats query_tile output only; it does not decide layers, thinning or light. No prior test amended. Result 167 acceptance + 4 unit + 5 critic green. Seed pulse, MAX_OCCUPANTS, layer rule, herb bands unchanged. No RNG, no English-name branch. Cargo.lock untracked. docs/ untouched.
 notes S17.1: critic plant height control (seedling 0.10×mature, half, mature default, metres field) via Critic::plant_choice → sim-core plant_taxon/plant_params; Play advances K (same as Tick×N) per burst then waits 500 ms; Pause stops; Reset clears tile. No physics in UI. Page: trunk build --release; docs/tools/pack_critic.py run as-is but glue exports `__wbg_init as default` (no `init`), so a patched copy outside the repo (/tmp/pack_critic.py) strips the export line, aliases init, calls init({module_or_path: bytes}); critic.html.gz uploaded to release tag `critic`, not on main; dist/ not committed. Result 167 acceptance + 4 unit + 7 critic green. docs/ untouched.
 ```
+
+## S17.2 — critic can be read (2026-10-17 PT)
+tests added:
+  - d172_common_name_on_demo
+  - d172_taeda_fills_then_wilts
+notes S17.2: catalog parses optional `common_name` column (OccupantParams::common_name, display_name → `Common (Scientific)`, scientific only if missing). query_tile adds tick, pond_m, per-layer (θ, θ_fc), and per-plant dry/dark/waterlog/submerge/crowd steps; STRESS_THRESHOLDS exports T_WILT/T_DARK/T_WL/T_WL_D/T_SUB/T_CROWD for display. Critic: reason line per plant from counters, event log (seed placed / wilted / thinned / removed) by diffing query snapshots per tick, rain button via existing add_rain_at, Key panel one tap away, narrow (<600 pt) layout wraps and enlarges tap targets inside a vertical scroll. No physics, seed rain, cap, uptake or wilt change. No prior test amended. Result 168 acceptance + 4 unit + 8 critic green. Page rebuilt and critic.html.gz replaced on release `critic`. docs/ untouched.

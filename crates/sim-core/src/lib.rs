@@ -677,7 +677,25 @@ pub struct TileOccupantView {
     /// Last incoming light from the kernel light pass (None before the first pass).
     pub light: Option<f64>,
     pub alive: bool,
+    /// S17.2 stress counters (kernel state, read-only). Thresholds: T_WILT, T_DARK, T_WL, T_SUB, T_CROWD.
+    pub dry_steps: u32,
+    pub dark_steps: u32,
+    pub waterlog_steps: u32,
+    pub submerge_steps: u32,
+    pub crowd_steps: u32,
 }
+
+/// S17.2: kernel stress thresholds, by counter, for read-only display.
+/// Order: (counter, threshold name, value): dry→T_WILT, dark→T_DARK,
+/// waterlog→T_WL (T_WL_D for dry-adapted), submerge→T_SUB, crowd→T_CROWD.
+pub const STRESS_THRESHOLDS: [(&str, &str, u32); 6] = [
+    ("dry", "T_WILT", T_WILT),
+    ("dark", "T_DARK", T_DARK),
+    ("waterlogged", "T_WL", T_WL),
+    ("waterlogged (dry-adapted)", "T_WL_D", T_WL_D),
+    ("submerged", "T_SUB", T_SUB),
+    ("crowded", "T_CROWD", T_CROWD),
+];
 
 /// Snapshot of one tile from [`World::query_tile`]. S17.
 #[derive(Clone, Debug, PartialEq)]
@@ -685,6 +703,12 @@ pub struct TileView {
     pub living: usize,
     pub cap: usize,
     pub occupants: Vec<TileOccupantView>,
+    /// S17.2: kernel tick at query time.
+    pub tick: u64,
+    /// S17.2: ponded surface water (m).
+    pub pond_m: f64,
+    /// S17.2: per soil layer (θ, θ_fc), top first.
+    pub layers: Vec<(f64, f64)>,
 }
 
 /// Crowd layout of living occupants with the same sort, H_BAND herb bands and
@@ -1813,10 +1837,23 @@ impl World {
                     over: o.crowd_steps,
                     light: o.last_light,
                     alive: o.alive,
+                    dry_steps: o.dry_steps,
+                    dark_steps: o.dark_steps,
+                    waterlog_steps: o.waterlog_steps,
+                    submerge_steps: o.submerge_steps,
+                    crowd_steps: o.crowd_steps,
                 }
             })
             .collect();
-        TileView { living: occupants.len(), cap: MAX_OCCUPANTS, occupants }
+        let col = &self.columns[self.idx(x, y)];
+        TileView {
+            living: occupants.len(),
+            cap: MAX_OCCUPANTS,
+            occupants,
+            tick: self.tick_count(),
+            pond_m: col.surface_water_m,
+            layers: col.layers.iter().map(|l| (l.theta, l.theta_fc())).collect(),
+        }
     }
 
     /// Live plant path: T_air vs t_min/t_max only (rain_year is not a live kill). S12.1.
