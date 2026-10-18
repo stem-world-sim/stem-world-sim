@@ -1,6 +1,6 @@
 //! S17 critic acceptance: tests call the same API the UI calls.
 
-use critic::{Critic, LayerKind, TileOccupantView};
+use critic::{reason, Critic, LayerKind, TileOccupantView};
 use sim_core::{
     alpha_eff, alpha_from_params, canopy_layers, same_canopy_layer, Catalog, H_BAND, T_CROWD,
 };
@@ -180,4 +180,28 @@ fn d171_plant_seedling() {
     c.tick_n(T_CROWD);
     assert!(seed(&c).is_some(), "seedling stays after T_CROWD");
     assert_eq!(mature(&c, PINE).len(), 1);
+}
+
+#[test]
+fn d172_taeda_fills_then_wilts() {
+    let mut c = Critic::new();
+    c.plant("pinus_taeda").unwrap();
+    let mut peak = 0usize;
+    let mut fell = false;
+    let mut saw_dry = false;
+    for _ in 0..200 {
+        c.tick();
+        let q = c.query_tile();
+        saw_dry |= q.occupants.iter().any(|o| o.dry_steps > 0 || reason(o).starts_with("dry"));
+        peak = peak.max(q.living);
+        if peak == q.cap && q.living < peak {
+            fell = true;
+            break;
+        }
+    }
+    assert_eq!(peak, sim_core::MAX_OCCUPANTS, "tile reaches cap");
+    assert!(fell, "living count falls after cap");
+    let wilt_event = c.events().iter().any(|e| e.contains("wilted: soil dry"));
+    assert!(saw_dry || wilt_event, "query reports dry_steps or a wilt reason");
+    assert!(wilt_event, "events name the wilt: {:?}", c.events());
 }

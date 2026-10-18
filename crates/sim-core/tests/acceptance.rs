@@ -6143,3 +6143,16 @@ fn d163_no_species_name_match() {
     }
     assert!(lib.contains("canopy_layers") && lib.contains("same_canopy_layer"));
 }
+
+// ---- S17.2 critic readability ----
+
+#[test]
+fn d172_common_name_on_demo() {
+    let cat = Catalog::load_embedded().expect("embedded catalog");
+    for p in cat.iter().filter(|p| p.demo) {
+        assert!(p.common_name.is_some(), "{} lacks common_name", p.taxon_id);
+    }
+    let pine = cat.get("pinus_taeda").unwrap();
+    assert_eq!(pine.common_name.as_deref(), Some("Loblolly pine"));
+    assert_eq!(pine.display_name(), "Loblolly pine (Pinus taeda)");
+}
