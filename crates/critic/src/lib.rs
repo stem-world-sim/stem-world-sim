@@ -1,7 +1,7 @@
 //! S17 critic: a one-tile harness over sim-core. The UI and the tests call this API only.
 //! No physics here: layers, thinning and light all come from `World::query_tile`.
 
-pub use sim_core::{LayerKind, PlantTaxonError, TileOccupantView, TileView};
+pub use sim_core::{LayerKind, PlantTaxonError, TickUnit, TileOccupantView, TileView, DT_BASE_S};
 use sim_core::{Column, SoilLayer, Texture, World, STRESS_THRESHOLDS as TH};
 
 /// Kernel thresholds by index into `STRESS_THRESHOLDS`.
@@ -41,6 +41,7 @@ pub enum HeightChoice {
 pub struct Critic {
     world: World,
     events: Vec<String>,
+    tick_unit: TickUnit,
 }
 
 /// S17.2: how many recent events the critic keeps.
@@ -90,6 +91,21 @@ pub fn death_reason(o: &TileOccupantView) -> String {
     }
 }
 
+/// S18 elapsed simulated time in plain units.
+pub fn fmt_sim_time(s: f64) -> String {
+    let day = DT_BASE_S;
+    let year = 365.25 * day;
+    if s < 120.0 {
+        format!("{s:.0} s")
+    } else if s < 2.0 * day {
+        format!("{:.1} h", s / 3600.0)
+    } else if s < year {
+        format!("{:.1} days", s / day)
+    } else {
+        format!("{:.2} years", s / year)
+    }
+}
+
 impl Default for Critic {
     fn default() -> Self {
         Self::new()
@@ -100,7 +116,7 @@ impl Critic {
     pub fn new() -> Self {
         let mut world = World::new(CRITIC_SEED, critic_column());
         world.set_climate(CRITIC_T_AIR_C, CRITIC_RAIN_YEAR_MM);
-        Self { world, events: Vec::new() }
+        Self { world, events: Vec::new(), tick_unit: TickUnit::Day }
     }
 
     /// Plant a mature catalog taxon on the tile.
@@ -159,6 +175,25 @@ impl Critic {
     pub fn rain(&mut self, depth_m: f64) {
         self.world.add_rain_at(0, 0, depth_m);
         self.push_event(format!("rain {:.0} mm", depth_m * 1000.0));
+    }
+
+    /// S18 continuous rain: kernel adds this depth (m) on every tick.
+    pub fn set_rain_per_tick_m(&mut self, r: f64) {
+        self.world.set_rain_per_tick_m(r.max(0.0));
+    }
+
+    pub fn rain_per_tick_m(&self) -> f64 {
+        self.world.rain_per_tick_m()
+    }
+
+    /// S18 tick length preset; the kernel scales every rate by its dt.
+    pub fn set_tick_unit(&mut self, u: TickUnit) {
+        self.tick_unit = u;
+        self.world.set_tick_dt(u.dt());
+    }
+
+    pub fn tick_unit(&self) -> TickUnit {
+        self.tick_unit
     }
 
     /// Last few events, oldest first.
@@ -242,7 +277,11 @@ impl Critic {
         self.world.catalog().get(taxon).ok().and_then(|p| p.common_name.clone())
     }
 
+    /// Reset the tile; keeps the chosen tick length and continuous rain.
     pub fn reset(&mut self) {
+        let (u, r) = (self.tick_unit, self.rain_per_tick_m());
         *self = Self::new();
+        self.set_tick_unit(u);
+        self.set_rain_per_tick_m(r);
     }
 }

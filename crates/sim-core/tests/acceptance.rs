@@ -5619,10 +5619,12 @@ fn d16_catchup_seeds_same_as_live() {
     ignore_all_chunks(&mut caught);
     caught.catch_up(k, 0.0);
 
-    let live_n = count_seedlings(&live, 0, 1, "pinus_taeda");
-    let caught_n = count_seedlings(&caught, 0, 1, "pinus_taeda");
-    assert_eq!(live_n, 1, "live north seedlings");
-    assert_eq!(caught_n, 1, "catch_up north seedlings");
+    // S18 amend: seedlings now drink only the soil layers their roots reach, so a catch_up
+    // seedling can sit at H0 on a dry top layer; compare seed attempts (pines placed north).
+    let live_n = count_taxon(&live, 0, 1, "pinus_taeda");
+    let caught_n = count_taxon(&caught, 0, 1, "pinus_taeda");
+    assert_eq!(live_n, k as usize, "live north seedlings");
+    assert_eq!(caught_n, k as usize, "catch_up north seedlings");
     assert_eq!(
         count_taxon(&live, 0, 0, "pinus_taeda"),
         count_taxon(&caught, 0, 0, "pinus_taeda")
@@ -6155,4 +6157,230 @@ fn d172_common_name_on_demo() {
     let pine = cat.get("pinus_taeda").unwrap();
     assert_eq!(pine.common_name.as_deref(), Some("Loblolly pine"));
     assert_eq!(pine.display_name(), "Loblolly pine (Pinus taeda)");
+}
+
+// ---- S18 telemetry, clock, continuous rain ----
+
+/// S18 critic-style sand column: 0.3 m over 0.5 m, both at field capacity.
+fn s18_sand_column() -> Column {
+    let tex = Texture::Sand;
+    let fc = tex.theta_fc();
+    Column::new(0.0, 0.0, vec![SoilLayer::new(0.3, fc, tex), SoilLayer::new(0.5, fc, tex)])
+}
+
+fn s18_oak(world: &World) -> sim_core::TileOccupantView {
+    world
+        .query_tile(0, 0)
+        .occupants
+        .into_iter()
+        .find(|o| o.taxon.as_deref() == Some("quercus_alba"))
+        .expect("living oak")
+}
+
+fn s18_closed(world: &World, added: f64) {
+    assert_mass_close(world.grid_water_mass() + world.et_lost() + world.extract_lost(), added);
+}
+
+/// D18: query_tile reports current root depth and deepest reached layer for a living oak.
+#[test]
+fn d18_root_depth_queryable() {
+    let mut w = World::new(1801, s18_sand_column());
+    w.set_climate(20.0, 1000.0);
+    let depth = w.catalog().get("quercus_alba").unwrap().root_depth_m.unwrap();
+    w.plant_taxon(0, 0, "quercus_alba").unwrap();
+    let oak = s18_oak(&w);
+    assert_approx_eq(oak.root_depth_m.expect("root_depth_m"), depth, "mature oak root depth");
+    assert_eq!(oak.max_layer, Some(1), "mature oak reaches layer 1");
+
+    let mut s = World::new(1802, s18_sand_column());
+    s.set_climate(20.0, 1000.0);
+    s.plant_seedling(0, 0, "quercus_alba").unwrap();
+    let sd = s18_oak(&s);
+    assert_approx_eq(sd.root_depth_m.unwrap(), depth * H0, "seedling root = depth·H0");
+    assert_eq!(sd.max_layer, Some(0), "seedling oak only in the 0.3 m top layer");
+}
+
+/// D18: a seedling oak reaches layer 1 once depth·height_frac passes the layer-1 top (0.3 m).
+#[test]
+fn d18_oak_root_grows_to_next_layer() {
+    let mut w = World::new(1803, s18_sand_column());
+    w.set_climate(20.0, 1000.0);
+    w.set_rain_per_tick_m(0.002);
+    let depth = w.catalog().get("quercus_alba").unwrap().root_depth_m.unwrap();
+    w.plant_seedling(0, 0, "quercus_alba").unwrap();
+    let top1 = 0.3;
+    let occ = &w.column_at(0, 0).occupants[0];
+    assert_eq!(sim_core::root_access(w.column_at(0, 0), occ)[1], 0.0);
+    let mut reached = false;
+    for _ in 0..2000 {
+        w.tick();
+        let oak = s18_oak(&w);
+        assert!(oak.alive);
+        let r = oak.root_depth_m.unwrap();
+        assert_approx_eq(r, depth * oak.height_frac, "r = depth·height_frac");
+        if r > top1 {
+            assert_eq!(oak.max_layer, Some(1), "root past layer-1 top reaches layer 1");
+            let occ = &w.column_at(0, 0).occupants[oak.slot];
+            assert!(sim_core::root_access(w.column_at(0, 0), occ)[1] > 0.0, "uptake from layer 1");
+            reached = true;
+            break;
+        }
+        assert_eq!(oak.max_layer, Some(0), "layer 1 not reached while r ≤ 0.3 m");
+    }
+    assert!(reached, "seedling oak never grew roots into layer 1");
+}
+
+/// D18: rain_per_tick_m lands on the tile every live tick and is booked in rain_added_m.
+#[test]
+fn d18_continuous_rain_applied_each_tick() {
+    let r = 0.003;
+    let mut w = World::new(1804, s18_sand_column());
+    let m0 = w.water_mass();
+    w.set_rain_per_tick_m(r);
+    assert_eq!(w.rain_per_tick_m(), r);
+    w.tick();
+    assert_approx_eq(w.water_mass() - m0, r, "one tick adds r to surface+soil");
+    assert_approx_eq(w.rain_added_m(), r, "rain_added after 1 tick");
+    for n in 2..=25u32 {
+        w.tick();
+        assert_approx_eq(w.rain_added_m(), r * n as f64, "rain_added each tick");
+        s18_closed(&w, m0 + w.rain_added_m());
+    }
+    // Manual button path still works alongside.
+    w.add_rain(0.01);
+    s18_closed(&w, m0 + w.rain_added_m() + 0.01);
+}
+
+/// D18: doubling tick_dt doubles height gain and ET over the same number of ticks.
+#[test]
+fn d18_tick_dt_scales_growth_and_et() {
+    // Growth: 9 ticks (before the first sink step), soil at θ_fc, lone pine at h_frac 0.3.
+    let grow = |dt: f64| {
+        let mut w = World::new(1805, s18_sand_column());
+        w.set_climate(20.0, 1000.0);
+        w.set_tick_dt(dt);
+        let p = w.catalog().get("pinus_taeda").unwrap().clone();
+        w.plant_params(0, 0, &p, 0.3).unwrap();
+        for _ in 0..9 {
+            w.tick();
+        }
+        w.column_at(0, 0).occupants[0].height_frac - 0.3
+    };
+    let g1 = grow(1.0);
+    let g2 = grow(2.0);
+    assert!(g1 > 0.0);
+    assert!((g2 / g1 - 2.0).abs() < 1e-6, "height gain ratio {} (g1={g1}, g2={g2})", g2 / g1);
+
+    // ET: saturated clay under a 0.5 m pond, 2 sink steps.
+    let et = |dt: f64| {
+        let tex = Texture::Clay;
+        let col = Column::new(0.0, 0.5, vec![SoilLayer::new(0.3, tex.porosity(), tex), SoilLayer::new(0.5, tex.porosity(), tex)]);
+        let mut w = World::new(1806, col);
+        w.set_tick_dt(dt);
+        for _ in 0..2 * N_ET {
+            w.tick();
+        }
+        w.et_lost()
+    };
+    let e1 = et(1.0);
+    let e2 = et(2.0);
+    assert!(e1 > 0.0);
+    assert!((e2 / e1 - 2.0).abs() < 1e-6, "ET ratio {} (e1={e1}, e2={e2})", e2 / e1);
+}
+
+/// D18: closed-basin mass identity holds for dt ≠ 1 (live ticks, continuous rain, catch_up).
+#[test]
+fn d18_mass_conserved_under_scaled_dt() {
+    for dt in [0.25, 1.0 / 86_400.0, 3.7, 365.25 / 12.0, 365.25] {
+        let mk = |z: f64, tex: Texture| {
+            Column::new(z, 0.0, vec![SoilLayer::new(0.3, tex.theta_fc(), tex), SoilLayer::new(0.5, tex.theta_fc(), tex)])
+        };
+        let cols = vec![mk(0.2, Texture::Sand), mk(0.1, Texture::Loam), mk(0.0, Texture::Clay)];
+        let mut w = World::grid(1807, 3, 1, cols);
+        w.set_climate(20.0, 1000.0);
+        w.set_tick_dt(dt);
+        let p = w.catalog().get("pinus_taeda").unwrap().clone();
+        w.plant_params(0, 0, &p, 0.3).unwrap();
+        w.plant_seedling(1, 0, "quercus_alba").unwrap();
+        w.add_occupant(2, 0, Occupant::plant_stub()).unwrap();
+        let mut added = w.grid_water_mass();
+        w.add_rain_at(0, 0, 0.2);
+        added += 0.2;
+        w.set_rain_per_tick_m(0.004);
+        for _ in 0..60 {
+            w.tick();
+            s18_closed(&w, added + w.rain_added_m());
+        }
+        w.catch_up(2, 0.001);
+        added += 2.0 * 0.001 * 3.0;
+        s18_closed(&w, added + w.rain_added_m());
+        assert!(w.et_lost() > 0.0 || dt < 1e-3, "dt={dt}: ET ran");
+        assert_approx_eq(w.sim_time_s(), (60 + 2 * N_ET) as f64 * dt * 86_400.0, "sim time = ticks·dt");
+    }
+}
+
+/// D18: default dt = 1 reproduces a pre-S18 growth/ET/uptake script bit-for-bit (golden from main 77cd639).
+#[test]
+fn d18_default_dt_matches_prior_behavior() {
+    let tex = Texture::Loam;
+    let col = Column::new(0.0, 0.0, vec![SoilLayer::new(0.3, tex.theta_fc(), tex), SoilLayer::new(0.5, tex.theta_fc(), tex)]);
+    let mut w = World::new(18, col);
+    assert_eq!(w.tick_dt(), 1.0);
+    assert_eq!(w.rain_per_tick_m(), 0.0);
+    w.set_climate(20.0, 1000.0);
+    let p = w.catalog().get("pinus_taeda").unwrap().clone();
+    w.plant_params(0, 0, &p, 0.3).unwrap();
+    w.add_occupant(0, 0, Occupant::plant_stub()).unwrap();
+    w.add_rain(0.15);
+    for _ in 0..30 {
+        w.tick();
+    }
+    let c = w.column_at(0, 0);
+    assert!(c.occupants[0].alive);
+    assert_eq!(c.occupants[0].dry_steps, 0);
+    assert_approx_eq(c.occupants[0].height_frac, 4.075770307678128e-1, "pine h_frac");
+    assert_approx_eq(c.layers[0].theta, 8.278077739485262e-2, "θ0");
+    assert_approx_eq(c.layers[1].theta, 4.1e-1, "θ1");
+    assert_approx_eq(c.surface_water_m, 0.0, "pond");
+    assert_approx_eq(w.et_lost(), 1.0165766781544261e-2, "et_lost");
+    assert_approx_eq(w.extract_lost(), 9e-2, "extract_lost");
+    assert_eq!(w.tick_count(), 30);
+    assert_approx_eq(w.sim_time_s(), 30.0 * 86_400.0, "30 days");
+}
+
+/// D18: catch_up applies continuous rain for its K·N_ET ticks and uses the same root rule.
+#[test]
+fn d18_catchup_root_and_rain() {
+    let r = 0.002;
+    let k = 3u32;
+    let mk = |seed| {
+        let mut w = World::new(seed, s18_sand_column());
+        w.set_climate(20.0, 1000.0);
+        w.set_rain_per_tick_m(r);
+        w.plant_seedling(0, 0, "quercus_alba").unwrap();
+        w
+    };
+    let mut live = mk(1808);
+    let mut caught = mk(1809);
+    let m0 = live.grid_water_mass();
+    for _ in 0..k as u64 * N_ET {
+        live.tick();
+    }
+    caught.force_sleep_all();
+    ignore_all_chunks(&mut caught);
+    caught.catch_up(k, 0.0);
+
+    let depth = live.catalog().get("quercus_alba").unwrap().root_depth_m.unwrap();
+    for (label, w) in [("live", &live), ("catch_up", &caught)] {
+        assert_approx_eq(w.rain_added_m(), r * (k as u64 * N_ET) as f64, label);
+        s18_closed(w, m0 + w.rain_added_m());
+        assert_eq!(w.tick_count(), k as u64 * N_ET, "{label} calendar");
+        assert_approx_eq(w.sim_time_s(), (k as u64 * N_ET) as f64 * 86_400.0, label);
+        let oak = s18_oak(w);
+        let rd = oak.root_depth_m.unwrap();
+        assert_approx_eq(rd, depth * oak.height_frac, "same root rule");
+        assert!(rd > depth * H0, "{label}: root grew");
+        let want = if rd > 0.3 { 1 } else { 0 };
+        assert_eq!(oak.max_layer, Some(want), "{label} max_layer");
+    }
 }
