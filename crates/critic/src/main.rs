@@ -1,6 +1,6 @@
 //! S17/S17.2 critic window (egui). Narrow widths stack and wrap. Formats text only; every number comes from `Critic::query_tile`.
 
-use critic::{reason, Critic, HeightChoice, LayerKind, RAIN_STEP_M};
+use critic::{fmt_sim_time, reason, Critic, HeightChoice, LayerKind, TickUnit, RAIN_STEP_M};
 use sim_core::STRESS_THRESHOLDS;
 use eframe::egui;
 
@@ -12,11 +12,15 @@ struct App {
     metres: f64,
     status: String,
     show_key: bool,
+    /// S18 text size (egui zoom factor).
+    text_scale: f32,
+    /// S18 continuous rain, mm per tick (UI copy of the kernel setting).
+    rain_mm: f64,
 }
 
 impl Default for App {
     fn default() -> Self {
-        Self { critic: Critic::new(), k: 7, playing: false, height: HeightChoice::Mature, metres: 5.0, status: String::new(), show_key: false }
+        Self { critic: Critic::new(), k: 7, playing: false, height: HeightChoice::Mature, metres: 5.0, status: String::new(), show_key: false, text_scale: 1.0, rain_mm: 0.0 }
     }
 }
 
@@ -34,6 +38,9 @@ const KEY: &[(&str, &str)] = &[
     ("A", "crowd load of the layer: sum of α·h_frac²; above 1 is overcrowded"),
     ("over", "ticks in a row the layer has had A > 1"),
     ("light", "light reaching the plant (1 = full sun)"),
+    ("roots", "current root depth (catalog root depth × h_frac) and deepest soil layer reached"),
+    ("tick =", "length of one tick; every rate (growth, ET, infiltration, uptake) scales with it"),
+    ("rain/tick", "rain added automatically on every tick (mm)"),
 ];
 
 impl App {
@@ -51,6 +58,25 @@ impl App {
                 s.height = HeightChoice::Metres(s.metres);
             }
         };
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Text size:");
+            ui.add(egui::Slider::new(&mut self.text_scale, 0.75..=2.5).step_by(0.05).suffix("×"));
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Tick =");
+            let cur = self.critic.tick_unit();
+            for u in [TickUnit::Second, TickUnit::Day, TickUnit::Month, TickUnit::Year] {
+                if ui.radio(cur == u, u.label()).clicked() && cur != u {
+                    self.critic.set_tick_unit(u);
+                }
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Rain per tick:");
+            if ui.add(egui::DragValue::new(&mut self.rain_mm).range(0.0..=500.0).speed(0.1).suffix(" mm")).changed() {
+                self.critic.set_rain_per_tick_m(self.rain_mm / 1000.0);
+            }
+        });
         ui.horizontal_wrapped(|ui| height_row(ui, self));
         ui.label("Plant:");
         ui.horizontal_wrapped(|ui| {
@@ -98,6 +124,9 @@ impl eframe::App for App {
             self.critic.tick_n(self.k);
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
+        if (ctx.zoom_factor() - self.text_scale).abs() > 1e-3 {
+            ctx.set_zoom_factor(self.text_scale);
+        }
         let narrow = ctx.screen_rect().width() < NARROW_W;
         ctx.style_mut(|s| {
             s.spacing.interact_size.y = if narrow { 36.0 } else { 20.0 };
@@ -128,6 +157,9 @@ impl eframe::App for App {
                 ui.separator();
                 ui.horizontal_wrapped(|ui| {
                     ui.label(format!("tick {}", q.tick));
+                    ui.label(format!("time {}", fmt_sim_time(q.sim_time_s)));
+                    ui.label(format!("tick = {}", self.critic.tick_unit().label()));
+                    ui.label(format!("rain/tick {:.1} mm", q.rain_per_tick_m * 1000.0));
                     ui.label(format!("living {}/{}", q.living, q.cap));
                     ui.label(format!("pond {:.4} m", q.pond_m));
                     for (i, (th, fc)) in q.layers.iter().enumerate() {
@@ -160,6 +192,11 @@ impl eframe::App for App {
                             ui.label(format!("over {}", o.over));
                             ui.label(format!("light {}", o.light.map(|l| format!("{l:.3}")).unwrap_or_else(|| "-".into())));
                             ui.label(format!("alive {}", o.alive));
+                            ui.label(match (o.root_depth_m, o.max_layer) {
+                                (Some(r), Some(k)) => format!("roots {r:.2} m → layer{k}"),
+                                (None, Some(k)) => format!("roots → layer{k}"),
+                                _ => "roots -".into(),
+                            });
                         });
                         ui.horizontal_wrapped(|ui| {
                             let th = STRESS_THRESHOLDS;

@@ -32,6 +32,12 @@
 //! catch_up(K, rain): optional source dump; then K blocks of (≤N_ET hydro, 1 unit sink, light+compress+crowd, growth, seed).
 //! catch_up_chunk: same calendar on one chunk + 1-cell halo; other chunks unchanged.
 //! Unique-min-H chute revoked. Capillary stays.
+//! S18: one clock. A tick lasts tick_dt base units (DT_BASE_S = 1 day = the prior implicit tick; default 1).
+//! Every per-tick rate scales by dt: I_max, D_max, R_MAX, E_OPEN, E_SOIL, uptake, growth Δ0. Flux rest floor
+//! V_REST·min(dt,1). Stress counters still count steps (thresholds unchanged). Continuous rain adds
+//! rain_per_tick_m to each observed-chunk cell at the start of every live tick; catch_up adds K·N_ET·r.
+//! Roots: r = root_depth_m·height_frac; layer k is reached iff the catalog mask has k and top_k < r
+//! (layer 0 always). Uptake and f_w use only reached layers. No catalog depth → catalog mask as before.
 
 /// Absolute / relative tolerance for water-mass comparisons (f64).
 use smallvec::SmallVec;
@@ -204,6 +210,8 @@ pub struct Occupant {
     pub crowd_steps: u32,
     /// Crowd compress scale s (1 if load≤1); scales uptake. Herb band or canopy. S15/S16.2.
     pub band_scale: f64,
+    /// Catalog mature root depth (m) snapshotted at plant time; None = static root mask. S18.
+    pub root_depth_max_m: Option<f64>,
 }
 
 impl Occupant {
@@ -226,6 +234,7 @@ impl Occupant {
             drain_ok: None,
             crowd_steps: 0,
             band_scale: 1.0,
+            root_depth_max_m: None,
         }
     }
 
@@ -248,6 +257,7 @@ impl Occupant {
             drain_ok: None,
             crowd_steps: 0,
             band_scale: 1.0,
+            root_depth_max_m: None,
         }
     }
 }
@@ -464,8 +474,9 @@ pub fn drain_fw_params(drain_ok: Option<&str>) -> (f64, f64) {
 fn mean_rooted_s(col: &Column, occ: &Occupant) -> f64 {
     let mut wsum = 0.0;
     let mut fsum = 0.0;
+    let root = root_access(col, occ);
     for k in 0..N_LAYERS {
-        let w = occ.root[k];
+        let w = root[k];
         if w <= 0.0 {
             continue;
         }
@@ -508,6 +519,69 @@ pub fn f_w_growth(col: &Column, occ: &Occupant) -> f64 {
     let f_soil = (1.0 - (s - s_opt).abs()).clamp(0.0, 1.0);
     let ponded = col.surface_water_m > 0.0;
     f_soil * if ponded { p } else { 1.0 }
+}
+
+/// Current root depth r = root_depth_m · height_frac (m). None if no catalog depth. S18.
+pub fn root_depth_now_m(occ: &Occupant) -> Option<f64> {
+    occ.root_depth_max_m
+        .map(|d| d.max(0.0) * occ.height_frac.clamp(0.0, 1.0))
+}
+
+/// Root weights limited to soil layers the roots reach. Layer k (k ≥ 1) is reached iff
+/// the catalog mask has k and its top depth (Σ thickness of layers above) < r. Layer 0 is
+/// always reached. No catalog depth → the stored mask unchanged. S18.
+pub fn root_access(col: &Column, occ: &Occupant) -> [f64; N_LAYERS] {
+    let Some(r) = root_depth_now_m(occ) else {
+        return occ.root;
+    };
+    let mut out = occ.root;
+    let mut top = 0.0;
+    for k in 0..N_LAYERS {
+        if k > 0 && !(top < r) {
+            out[k] = 0.0;
+        }
+        top += col.layers.get(k).map(|l| l.thickness_m).unwrap_or(f64::INFINITY);
+    }
+    out
+}
+
+/// Deepest soil layer index the roots reach (None if no layer or no root weight). S18.
+pub fn max_root_layer(col: &Column, occ: &Occupant) -> Option<usize> {
+    let w = root_access(col, occ);
+    (0..N_LAYERS.min(col.layers.len())).rev().find(|&k| w[k] > 0.0)
+}
+
+/// S18 base unit of tick_dt: the prior implicit tick, one day (seconds).
+pub const DT_BASE_S: f64 = 86_400.0;
+
+/// S18 tick length presets in base units (days).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TickUnit {
+    Second,
+    Day,
+    Month,
+    Year,
+}
+
+impl TickUnit {
+    /// tick_dt in base units: 1 s = 1/86400, day = 1, month = 365.25/12, year = 365.25.
+    pub fn dt(self) -> f64 {
+        match self {
+            TickUnit::Second => 1.0 / DT_BASE_S,
+            TickUnit::Day => 1.0,
+            TickUnit::Month => 365.25 / 12.0,
+            TickUnit::Year => 365.25,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TickUnit::Second => "1 s",
+            TickUnit::Day => "1 day",
+            TickUnit::Month => "1 month",
+            TickUnit::Year => "1 year",
+        }
+    }
 }
 
 /// Size-scaled canopy alpha: α_eff = α · height_frac². S14.
@@ -683,6 +757,10 @@ pub struct TileOccupantView {
     pub waterlog_steps: u32,
     pub submerge_steps: u32,
     pub crowd_steps: u32,
+    /// S18: current root depth r = root_depth_m · height_frac (m); None without catalog depth.
+    pub root_depth_m: Option<f64>,
+    /// S18: deepest soil layer index the roots reach.
+    pub max_layer: Option<usize>,
 }
 
 /// S17.2: kernel stress thresholds, by counter, for read-only display.
@@ -709,6 +787,11 @@ pub struct TileView {
     pub pond_m: f64,
     /// S17.2: per soil layer (θ, θ_fc), top first.
     pub layers: Vec<(f64, f64)>,
+    /// S18: tick length in base units (days) and elapsed simulated time (s).
+    pub tick_dt: f64,
+    pub sim_time_s: f64,
+    /// S18: continuous rain depth added each live tick (m).
+    pub rain_per_tick_m: f64,
 }
 
 /// Crowd layout of living occupants with the same sort, H_BAND herb bands and
@@ -890,9 +973,9 @@ impl Column {
     /// Rate-limited capacity-step infiltration (no clock).
     /// budget = min(h_surf, I_max); fill top-down into remaining pores.
     /// Skips if take ≤ V_REST. Returns depth moved (0 if skipped).
-    fn infiltrate_step(&mut self) -> f64 {
-        let mut budget = self.surface_water_m.min(self.i_max());
-        if budget <= V_REST {
+    fn infiltrate_step(&mut self, dt: f64, vr: f64) -> f64 {
+        let mut budget = self.surface_water_m.min(self.i_max() * dt);
+        if budget <= vr {
             return 0.0;
         }
         let mut remaining_surface = self.surface_water_m;
@@ -906,7 +989,7 @@ impl Column {
                 continue;
             }
             let fill = budget.min(capacity);
-            if fill <= V_REST {
+            if fill <= vr {
                 // Tiny residual fill — stop rather than drip below floor.
                 break;
             }
@@ -916,7 +999,7 @@ impl Column {
             moved += fill;
         }
         self.surface_water_m = remaining_surface.max(0.0);
-        if moved <= V_REST {
+        if moved <= vr {
             // Should not happen if we filled, but treat sub-floor as idle.
             return 0.0;
         }
@@ -1002,7 +1085,7 @@ impl Column {
     /// in layers k+1…. Snapshot θ, then apply. Do not pull below θ_fc.
     /// Shared texture → one D_max budget for the column; else each source layer's D_max.
     /// Returns total depth moved (counts against the column's lateral D_max budget this tick).
-    fn percolate_step(&mut self) -> f64 {
+    fn percolate_step(&mut self, dt: f64, vr: f64) -> f64 {
         let n = self.layers.len();
         if n < 2 {
             return 0.0;
@@ -1024,7 +1107,7 @@ impl Column {
         let mut delta = vec![0.0f64; n];
 
         if same_texture {
-            let mut budget = self.d_max();
+            let mut budget = self.d_max() * dt;
             for k in 0..n {
                 if budget <= 0.0 {
                     break;
@@ -1044,7 +1127,7 @@ impl Column {
                         continue;
                     }
                     let take = available.min(can).min(budget);
-                    if take <= V_REST {
+                    if take <= vr {
                         continue;
                     }
                     delta[k] -= take;
@@ -1056,7 +1139,7 @@ impl Column {
             }
         } else {
             for k in 0..n {
-                let mut budget = self.layers[k].texture.d_max();
+                let mut budget = self.layers[k].texture.d_max() * dt;
                 if budget <= 0.0 {
                     continue;
                 }
@@ -1075,7 +1158,7 @@ impl Column {
                         continue;
                     }
                     let take = available.min(can).min(budget);
-                    if take <= V_REST {
+                    if take <= vr {
                         continue;
                     }
                     delta[k] -= take;
@@ -1097,7 +1180,9 @@ impl Column {
             }
             layer.theta += delta[i] / layer.thickness_m;
             let fc = layer.theta_fc();
-            if layer.theta < fc {
+            // fp guard for sources only. S18: a receiver below θ_fc keeps its θ (snapping it
+            // up to θ_fc created mass once uptake/ET at large dt dried a lower layer).
+            if delta[i] < 0.0 && layer.theta < fc {
                 layer.theta = fc;
             }
             if layer.theta > layer.porosity {
@@ -1183,6 +1268,16 @@ pub struct World {
     hydro_reject: Vec<HydroReject>,
     /// Last light reject reason per cell. S13.
     light_reject: Vec<LightReject>,
+    /// Tick length in base units (DT_BASE_S). Default 1 = prior tick. S18.
+    tick_dt: f64,
+    /// Flux rest floor V_REST·min(dt,1). S18.
+    v_rest: f64,
+    /// Elapsed simulated time in base units (Σ dt). S18.
+    elapsed_dt: f64,
+    /// Continuous rain depth per live tick (m, A = 1) on observed-chunk cells. S18.
+    rain_per_tick_m: f64,
+    /// Cumulative continuous-rain mass added (m·cells, A = 1). S18.
+    rain_added_m: f64,
 }
 
 impl World {
@@ -1213,6 +1308,11 @@ impl World {
             climate_reject: vec![ClimateReject::None],
             hydro_reject: vec![HydroReject::None],
             light_reject: vec![LightReject::None],
+            tick_dt: 1.0,
+            v_rest: V_REST,
+            elapsed_dt: 0.0,
+            rain_per_tick_m: 0.0,
+            rain_added_m: 0.0,
         }
     }
 
@@ -1250,6 +1350,11 @@ impl World {
             climate_reject: vec![ClimateReject::None; n],
             hydro_reject: vec![HydroReject::None; n],
             light_reject: vec![LightReject::None; n],
+            tick_dt: 1.0,
+            v_rest: V_REST,
+            elapsed_dt: 0.0,
+            rain_per_tick_m: 0.0,
+            rain_added_m: 0.0,
         }
     }
 
@@ -1451,10 +1556,13 @@ impl World {
 
         // Optional source dump (one dump if R>0); wake region cells.
         if k > 0 {
-            let add = (k as f64) * rain_per_step;
+            // S18: plus continuous rain for the K·N_ET ticks this stands in for.
+            let cont = (k_u * N_ET) as f64 * self.rain_per_tick_m;
+            let add = (k as f64) * rain_per_step + cont;
             if add > 0.0 {
                 for &i in &region_ids {
                     self.columns[i].surface_water_m += add;
+                    self.rain_added_m += cont;
                     self.wake_idx(i);
                 }
             }
@@ -1462,7 +1570,7 @@ impl World {
         // R=0 come-back: still drain any pond/mobile left in the region. S10.
         for &i in &region_ids {
             let col = &self.columns[i];
-            if col.surface_water_m > V_REST || col.mobile_water_m() > V_REST {
+            if col.surface_water_m > self.v_rest || col.mobile_water_m() > self.v_rest {
                 self.wake_one(i);
             }
         }
@@ -1744,6 +1852,63 @@ impl World {
         self.rain_year_mm
     }
 
+    /// Set tick length in base units (1 = one day = prior tick). Must be > 0. S18.
+    pub fn set_tick_dt(&mut self, dt: f64) {
+        assert!(dt > 0.0 && dt.is_finite(), "tick_dt must be positive");
+        self.tick_dt = dt;
+        self.v_rest = V_REST * dt.min(1.0);
+    }
+
+    pub fn tick_dt(&self) -> f64 {
+        self.tick_dt
+    }
+
+    /// Elapsed simulated time in seconds (Σ tick_dt · DT_BASE_S). S18.
+    pub fn sim_time_s(&self) -> f64 {
+        self.elapsed_dt * DT_BASE_S
+    }
+
+    /// Continuous rain depth (m) added to each observed-chunk cell every live tick. S18.
+    pub fn set_rain_per_tick_m(&mut self, r: f64) {
+        assert!(r >= 0.0 && r.is_finite(), "rain_per_tick_m must be non-negative");
+        self.rain_per_tick_m = r;
+    }
+
+    pub fn rain_per_tick_m(&self) -> f64 {
+        self.rain_per_tick_m
+    }
+
+    /// Cumulative continuous-rain mass added so far (m, summed over cells, A = 1). S18.
+    pub fn rain_added_m(&self) -> f64 {
+        self.rain_added_m
+    }
+
+    /// Live continuous rain on observed-chunk cells; wakes them. S18.
+    fn apply_continuous_rain_live(&mut self) {
+        let r = self.rain_per_tick_m;
+        if r <= 0.0 || self.n_observed == 0 {
+            return;
+        }
+        let mut ids: Vec<usize> = Vec::new();
+        for cy in 0..self.n_chunk_y {
+            for cx in 0..self.n_chunk_x {
+                if !self.chunks[cy * self.n_chunk_x + cx].observed {
+                    continue;
+                }
+                for y in cy * CHUNK..((cy + 1) * CHUNK).min(self.height) {
+                    for x in cx * CHUNK..((cx + 1) * CHUNK).min(self.width) {
+                        ids.push(y * self.width + x);
+                    }
+                }
+            }
+        }
+        for i in ids {
+            self.columns[i].surface_water_m += r;
+            self.rain_added_m += r;
+            self.wake_idx(i);
+        }
+    }
+
     /// Last climate reject reason for cell (x,y). S12.
     pub fn climate_reject(&self, x: usize, y: usize) -> ClimateReject {
         self.climate_reject[self.idx(x, y)]
@@ -1821,7 +1986,8 @@ impl World {
     /// Read-only crowd/light view of tile (x,y): living count, cap and per living occupant
     /// its layer, bucket load A, crowd counter and last light. Same grouping as the kernel. S17.
     pub fn query_tile(&self, x: usize, y: usize) -> TileView {
-        let occs = &self.columns[self.idx(x, y)].occupants;
+        let col = &self.columns[self.idx(x, y)];
+        let occs = &col.occupants;
         let occupants: Vec<TileOccupantView> = crowd_layout(&self.catalog, occs)
             .into_iter()
             .map(|(oi, h, _a_eff, kind, lid, load)| {
@@ -1842,10 +2008,11 @@ impl World {
                     waterlog_steps: o.waterlog_steps,
                     submerge_steps: o.submerge_steps,
                     crowd_steps: o.crowd_steps,
+                    root_depth_m: root_depth_now_m(o),
+                    max_layer: max_root_layer(col, o),
                 }
             })
             .collect();
-        let col = &self.columns[self.idx(x, y)];
         TileView {
             living: occupants.len(),
             cap: MAX_OCCUPANTS,
@@ -1853,6 +2020,9 @@ impl World {
             tick: self.tick_count(),
             pond_m: col.surface_water_m,
             layers: col.layers.iter().map(|l| (l.theta, l.theta_fc())).collect(),
+            tick_dt: self.tick_dt,
+            sim_time_s: self.sim_time_s(),
+            rain_per_tick_m: self.rain_per_tick_m,
         }
     }
 
@@ -2269,7 +2439,7 @@ impl World {
             let f_t = f_t_growth(t_air, params.t_min_c, params.t_max_c);
             let d0 = delta0_for_form(form);
             let hf = self.columns[i].occupants[oi].height_frac;
-            let next = (hf + d0 * f_l * f_w * f_t).clamp(H0, 1.0);
+            let next = (hf + d0 * f_l * f_w * f_t * self.tick_dt).clamp(H0, 1.0);
             self.columns[i].occupants[oi].height_frac = next;
         }
     }
@@ -2412,6 +2582,9 @@ impl World {
     /// S04.1: soil flux capped by unused pore room; lake snap after soil.
     /// S05/S06: sink cadence after advance; ticks 10,20,… run one ET+occupant step.
     pub fn tick(&mut self) {
+        // S18: one clock — every live tick advances dt; continuous rain first.
+        self.elapsed_dt += self.tick_dt;
+        self.apply_continuous_rain_live();
         // S10: fully ignored + asleep worlds must stay wall-clock cheap (no O(n) scans).
         if self.n_observed == 0 && self.n_awake == 0 {
             self.last_hydro_visits = 0;
@@ -2475,11 +2648,14 @@ impl World {
         let n = self.columns.len();
 
         // 1. Optional source: every cell h += K * rain_per_step; wake cell + neighbors.
+        // S18: plus continuous rain for the K·N_ET ticks this stands in for.
         if k > 0 {
-            let add = (k as f64) * rain_per_step;
+            let cont = (k_u * N_ET) as f64 * self.rain_per_tick_m;
+            let add = (k as f64) * rain_per_step + cont;
             if add > 0.0 {
                 for i in 0..n {
                     self.columns[i].surface_water_m += add;
+                    self.rain_added_m += cont;
                     self.wake_idx(i);
                 }
             }
@@ -2515,8 +2691,9 @@ impl World {
             self.prune_awake();
         }
 
-        // 3. Calendar: K sink-steps ≡ K * N_ET hydro ticks.
+        // 3. Calendar: K sink-steps ≡ K * N_ET hydro ticks (S18: K·N_ET·dt of time).
         self.clock.tick = self.clock.tick.saturating_add(k_u.saturating_mul(N_ET));
+        self.elapsed_dt += (k_u * N_ET) as f64 * self.tick_dt;
     }
 
     /// Hydro-only step (no clock, no ET): visit = observed ∪ awake. S09.
@@ -2695,8 +2872,8 @@ impl World {
 
     fn infiltrate_active_ids(&mut self, active_ids: &[usize], busy: &mut HashSet<usize>) {
         for &i in active_ids {
-            let moved = self.columns[i].infiltrate_step();
-            if moved > V_REST {
+            let moved = self.columns[i].infiltrate_step(self.tick_dt, self.v_rest);
+            if moved > self.v_rest {
                 busy.insert(i);
             }
         }
@@ -2709,11 +2886,11 @@ impl World {
     ) -> HashMap<usize, f64> {
         let mut out = HashMap::new();
         for &i in active_ids {
-            let moved = self.columns[i].percolate_step();
+            let moved = self.columns[i].percolate_step(self.tick_dt, self.v_rest);
             if moved != 0.0 {
                 out.insert(i, moved);
             }
-            if moved > V_REST {
+            if moved > self.v_rest {
                 busy.insert(i);
             }
         }
@@ -2731,16 +2908,16 @@ impl World {
                 );
                 let shade_factor = 1.0 - c;
                 if col.surface_water_m > 0.0 {
-                    let e_eff = E_OPEN * shade_factor;
+                    let e_eff = E_OPEN * shade_factor * self.tick_dt;
                     (col.surface_water_m.min(e_eff), true)
                 } else if let Some(top) = col.layers.first() {
-                    let e_eff = E_SOIL * shade_factor;
+                    let e_eff = E_SOIL * shade_factor * self.tick_dt;
                     ((top.theta * top.thickness_m).min(e_eff), false)
                 } else {
                     (0.0, false)
                 }
             };
-            if take <= V_REST {
+            if take <= self.v_rest {
                 continue;
             }
             busy.insert(i);
@@ -2771,8 +2948,9 @@ impl World {
                     continue;
                 }
                 let u = self.columns[i].occupants[oi].uptake_max
-                    * self.columns[i].occupants[oi].band_scale;
-                let root = self.columns[i].occupants[oi].root;
+                    * self.columns[i].occupants[oi].band_scale
+                    * self.tick_dt;
+                let root = root_access(&self.columns[i], &self.columns[i].occupants[oi]);
                 let mut taken = 0.0f64;
                 for k in 0..N_LAYERS {
                     if k >= self.columns[i].layers.len() {
@@ -2807,7 +2985,7 @@ impl World {
                 }
                 cell_taken += taken;
             }
-            if cell_taken > V_REST {
+            if cell_taken > self.v_rest {
                 busy.insert(i);
             }
             self.extract_lost += cell_taken;
@@ -2823,7 +3001,7 @@ impl World {
         let mut cand_ids: Vec<usize> = Vec::new();
         let mut is_cand = vec![false; self.columns.len()];
         for &i in seed_ids {
-            if self.columns[i].surface_water_m > V_REST && !is_cand[i] {
+            if self.columns[i].surface_water_m > self.v_rest && !is_cand[i] {
                 is_cand[i] = true;
                 cand_ids.push(i);
             }
@@ -2849,7 +3027,7 @@ impl World {
                 if is_cand[j] {
                     continue;
                 }
-                if self.columns[j].surface_water_m <= V_REST {
+                if self.columns[j].surface_water_m <= self.v_rest {
                     continue;
                 }
                 if (h_i - self.columns[j].head()).abs() <= H_REST {
@@ -2971,7 +3149,7 @@ impl World {
 
     fn singleton_snap_eligible_live(&self, i: usize) -> bool {
         let mobile = self.columns[i].mobile_water_m();
-        if mobile <= V_REST {
+        if mobile <= self.v_rest {
             return true;
         }
         let z_i = self.columns[i].elevation_m;
@@ -2992,18 +3170,20 @@ impl World {
     }
 
     fn infiltrate_all(&mut self) {
+        let (dt, vr) = (self.tick_dt, self.v_rest);
         for col in &mut self.columns {
-            let _ = col.infiltrate_step();
+            let _ = col.infiltrate_step(dt, vr);
         }
     }
 
     fn infiltrate_active(&mut self, active: &[bool], busy: &mut [bool]) {
+        let (dt, vr) = (self.tick_dt, self.v_rest);
         for (i, col) in self.columns.iter_mut().enumerate() {
             if !active[i] {
                 continue;
             }
-            let moved = col.infiltrate_step();
-            if moved > V_REST {
+            let moved = col.infiltrate_step(dt, vr);
+            if moved > self.v_rest {
                 busy[i] = true;
             }
         }
@@ -3068,7 +3248,7 @@ impl World {
             let mut sum_v = 0.0;
             for &(j, d_h) in &lower {
                 let w = d_h / sum_delta;
-                let v_j = (h_i * w).min(0.5 * d_h).min(R_MAX);
+                let v_j = (h_i * w).min(0.5 * d_h).min(R_MAX * self.tick_dt);
                 if v_j > 0.0 {
                     sends.push((j, v_j));
                     sum_v += v_j;
@@ -3116,7 +3296,7 @@ impl World {
 
         let mut delta: HashMap<usize, f64> = HashMap::new();
         for (i, j, v) in edges {
-            if v <= V_REST {
+            if v <= self.v_rest {
                 continue;
             }
             *delta.entry(i).or_insert(0.0) -= v;
@@ -3160,10 +3340,10 @@ impl World {
             let x = i % self.width;
             let y = i / self.width;
             let m_i = self.columns[i].mobile_water_m();
-            if m_i <= V_REST {
+            if m_i <= self.v_rest {
                 continue;
             }
-            let d_i = self.columns[i].d_max();
+            let d_i = self.columns[i].d_max() * self.tick_dt;
             let d_rem = (d_i - percolated.get(&i).copied().unwrap_or(0.0)).max(0.0);
             if d_i <= 0.0 || d_rem <= 0.0 {
                 continue;
@@ -3211,9 +3391,9 @@ impl World {
                 let mut total = 0.0;
                 let equal_share = m_i / n_t as f64;
                 for j in targets {
-                    let contact = d_rem.min(self.columns[j].d_max());
+                    let contact = d_rem.min(self.columns[j].d_max() * self.tick_dt);
                     let v_j = equal_share.min(contact);
-                    if v_j > V_REST {
+                    if v_j > self.v_rest {
                         planned.push((j, v_j));
                         total += v_j;
                     }
@@ -3225,7 +3405,7 @@ impl World {
                 let scale = if total > cap { cap / total } else { 1.0 };
                 for (j, v_j) in planned {
                     let v = v_j * scale;
-                    if v > V_REST {
+                    if v > self.v_rest {
                         transfers.push((i, j, v));
                     }
                 }
@@ -3233,9 +3413,9 @@ impl World {
                 let mut planned: Vec<(usize, f64)> = Vec::new();
                 let mut total = 0.0;
                 for (j, m_nbr) in equal_poorer {
-                    let contact = d_rem.min(self.columns[j].d_max());
+                    let contact = d_rem.min(self.columns[j].d_max() * self.tick_dt);
                     let v_j = contact.min(0.5 * (m_i - m_nbr));
-                    if v_j > V_REST {
+                    if v_j > self.v_rest {
                         planned.push((j, v_j));
                         total += v_j;
                     }
@@ -3247,7 +3427,7 @@ impl World {
                 let scale = if total > cap { cap / total } else { 1.0 };
                 for (j, v_j) in planned {
                     let v = v_j * scale;
-                    if v > V_REST {
+                    if v > self.v_rest {
                         transfers.push((i, j, v));
                     }
                 }
@@ -3257,7 +3437,7 @@ impl World {
         // Cap by unused pore room (snapshot at receivers).
         let mut incoming: HashMap<usize, f64> = HashMap::new();
         for &(_from, to, amount) in &transfers {
-            if amount > V_REST {
+            if amount > self.v_rest {
                 *incoming.entry(to).or_insert(0.0) += amount;
             }
         }
@@ -3280,7 +3460,7 @@ impl World {
         for (from, to, amount) in transfers {
             let scale = recv_scale.get(&to).copied().unwrap_or(1.0);
             let v = amount * scale;
-            if v <= V_REST {
+            if v <= self.v_rest {
                 continue;
             }
             *remove_amt.entry(from).or_insert(0.0) += v;
@@ -3293,12 +3473,12 @@ impl World {
         }
 
         for (i, amt) in remove_amt {
-            if amt > V_REST {
+            if amt > self.v_rest {
                 self.columns[i].remove_mobile_water(amt);
             }
         }
         for (i, amt) in soil_add {
-            if amt > V_REST {
+            if amt > self.v_rest {
                 let _ = self.columns[i].fill_soil_only(amt);
             }
         }
@@ -3380,7 +3560,7 @@ impl World {
                 let mut sum_v = 0.0;
                 for &(j, d_h) in &lower {
                     let w = d_h / sum_delta;
-                    let v_j = (h_i * w).min(0.5 * d_h).min(R_MAX);
+                    let v_j = (h_i * w).min(0.5 * d_h).min(R_MAX * self.tick_dt);
                     if v_j > 0.0 {
                         sends.push((j, v_j));
                         sum_v += v_j;
@@ -3431,7 +3611,7 @@ impl World {
         // S04: after all scales, drop V ≤ V_REST (treat as 0).
         let mut delta = vec![0.0f64; n];
         for (i, j, v) in edges {
-            if v <= V_REST {
+            if v <= self.v_rest {
                 continue;
             }
             delta[i] -= v;
@@ -3461,9 +3641,9 @@ impl World {
             if !active[i] {
                 continue;
             }
-            let moved = self.columns[i].percolate_step();
+            let moved = self.columns[i].percolate_step(self.tick_dt, self.v_rest);
             out[i] = moved;
-            if moved > V_REST {
+            if moved > self.v_rest {
                 busy[i] = true;
             }
         }
@@ -3493,7 +3673,8 @@ impl World {
 
         let elevations: Vec<f64> = self.columns.iter().map(|c| c.elevation_m).collect();
         let mobiles: Vec<f64> = self.columns.iter().map(Column::mobile_water_m).collect();
-        let d_maxes: Vec<f64> = self.columns.iter().map(Column::d_max).collect();
+        let dt = self.tick_dt;
+        let d_maxes: Vec<f64> = self.columns.iter().map(|c| c.d_max() * dt).collect();
         // Remaining drain budget after profile percolation (shared column D_max).
         let rem_d: Vec<f64> = (0..n)
             .map(|i| (d_maxes[i] - percolated.get(i).copied().unwrap_or(0.0)).max(0.0))
@@ -3509,7 +3690,7 @@ impl World {
                     continue;
                 }
                 let m_i = mobiles[i];
-                if m_i <= V_REST {
+                if m_i <= self.v_rest {
                     continue;
                 }
                 let d_i = d_maxes[i];
@@ -3561,7 +3742,7 @@ impl World {
                         // Contact: min(donor remaining D, neighbor D_max).
                         let contact = d_rem.min(d_maxes[j]);
                         let v_j = equal_share.min(contact);
-                        if v_j > V_REST {
+                        if v_j > self.v_rest {
                             planned.push((j, v_j));
                             total += v_j;
                         }
@@ -3573,7 +3754,7 @@ impl World {
                     let scale = if total > cap { cap / total } else { 1.0 };
                     for (j, v_j) in planned {
                         let v = v_j * scale;
-                        if v > V_REST {
+                        if v > self.v_rest {
                             transfers.push((i, j, v));
                         }
                     }
@@ -3583,7 +3764,7 @@ impl World {
                     for (j, m_nbr) in equal_poorer {
                         let contact = d_rem.min(d_maxes[j]);
                         let v_j = contact.min(0.5 * (m_i - m_nbr));
-                        if v_j > V_REST {
+                        if v_j > self.v_rest {
                             planned.push((j, v_j));
                             total += v_j;
                         }
@@ -3595,7 +3776,7 @@ impl World {
                     let scale = if total > cap { cap / total } else { 1.0 };
                     for (j, v_j) in planned {
                         let v = v_j * scale;
-                        if v > V_REST {
+                        if v > self.v_rest {
                             transfers.push((i, j, v));
                         }
                     }
@@ -3612,7 +3793,7 @@ impl World {
             .collect();
         let mut incoming: Vec<f64> = vec![0.0; n];
         for &(_from, to, amount) in &transfers {
-            if amount > V_REST {
+            if amount > self.v_rest {
                 incoming[to] += amount;
             }
         }
@@ -3634,7 +3815,7 @@ impl World {
 
         for (from, to, amount) in transfers {
             let v = amount * recv_scale[to];
-            if v <= V_REST {
+            if v <= self.v_rest {
                 continue;
             }
             remove_amt[from] += v;
@@ -3645,12 +3826,12 @@ impl World {
         }
 
         for i in 0..n {
-            if remove_amt[i] > V_REST {
+            if remove_amt[i] > self.v_rest {
                 self.columns[i].remove_mobile_water(remove_amt[i]);
             }
         }
         for i in 0..n {
-            if soil_add[i] > V_REST {
+            if soil_add[i] > self.v_rest {
                 // Fill soil only; leftover must not become pond in the soil pass.
                 let placed = self.columns[i].fill_soil_only(soil_add[i]);
                 // If fp left a speck unplaced, it stays unapplied (donor already
@@ -3680,16 +3861,16 @@ impl World {
                 );
                 let shade_factor = 1.0 - c;
                 if col.surface_water_m > 0.0 {
-                    let e_eff = E_OPEN * shade_factor;
+                    let e_eff = E_OPEN * shade_factor * self.tick_dt;
                     (col.surface_water_m.min(e_eff), true)
                 } else if let Some(top) = col.layers.first() {
-                    let e_eff = E_SOIL * shade_factor;
+                    let e_eff = E_SOIL * shade_factor * self.tick_dt;
                     ((top.theta * top.thickness_m).min(e_eff), false)
                 } else {
                     (0.0, false)
                 }
             };
-            if take <= V_REST {
+            if take <= self.v_rest {
                 continue;
             }
             busy[i] = true;
@@ -3730,8 +3911,9 @@ impl World {
                     continue;
                 }
                 let u = self.columns[i].occupants[oi].uptake_max
-                    * self.columns[i].occupants[oi].band_scale;
-                let root = self.columns[i].occupants[oi].root;
+                    * self.columns[i].occupants[oi].band_scale
+                    * self.tick_dt;
+                let root = root_access(&self.columns[i], &self.columns[i].occupants[oi]);
                 let mut taken = 0.0f64;
                 for k in 0..N_LAYERS {
                     if k >= self.columns[i].layers.len() {
@@ -3766,7 +3948,7 @@ impl World {
                 }
                 cell_taken += taken;
             }
-            if cell_taken > V_REST {
+            if cell_taken > self.v_rest {
                 busy[i] = true;
             }
             self.extract_lost += cell_taken;
@@ -3787,7 +3969,7 @@ impl World {
             .columns
             .iter()
             .enumerate()
-            .filter_map(|(i, c)| if c.surface_water_m > V_REST { Some(i) } else { None })
+            .filter_map(|(i, c)| if c.surface_water_m > self.v_rest { Some(i) } else { None })
             .collect();
         if wet.is_empty() {
             return;
@@ -3809,7 +3991,7 @@ impl World {
         // Candidates: cells with pond above the rest floor.
         let mut cand = vec![false; n];
         for i in 0..n {
-            if depths[i] > V_REST {
+            if depths[i] > self.v_rest {
                 cand[i] = true;
             }
         }
@@ -3948,7 +4130,7 @@ impl World {
     /// leave to a lower-z 4-neighbor.
     fn singleton_snap_eligible(&self, i: usize, elevations: &[f64]) -> bool {
         let mobile = self.columns[i].mobile_water_m();
-        if mobile <= V_REST {
+        if mobile <= self.v_rest {
             return true;
         }
         let z_i = elevations[i];

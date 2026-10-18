@@ -115,6 +115,7 @@ impl OccupantParams {
         occ.shade_class = self.shade;
         occ.drain_ok = self.drain_ok.clone();
         occ.height_frac = 1.0;
+        occ.root_depth_max_m = self.root_depth_m;
         occ
     }
 

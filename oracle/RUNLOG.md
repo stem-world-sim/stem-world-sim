@@ -197,3 +197,16 @@ tests added:
   - d172_common_name_on_demo
   - d172_taeda_fills_then_wilts
 notes S17.2: catalog parses optional `common_name` column (OccupantParams::common_name, display_name → `Common (Scientific)`, scientific only if missing). query_tile adds tick, pond_m, per-layer (θ, θ_fc), and per-plant dry/dark/waterlog/submerge/crowd steps; STRESS_THRESHOLDS exports T_WILT/T_DARK/T_WL/T_WL_D/T_SUB/T_CROWD for display. Critic: reason line per plant from counters, event log (seed placed / wilted / thinned / removed) by diffing query snapshots per tick, rain button via existing add_rain_at, Key panel one tap away, narrow (<600 pt) layout wraps and enlarges tap targets inside a vertical scroll. No physics, seed rain, cap, uptake or wilt change. No prior test amended. Result 168 acceptance + 4 unit + 8 critic green. Page rebuilt and critic.html.gz replaced on release `critic`. docs/ untouched.
+
+## S18 — telemetry, continuous rain, text size, unified clock (2026-10-18 PT)
+tests added:
+  - d18_root_depth_queryable
+  - d18_oak_root_grows_to_next_layer
+  - d18_continuous_rain_applied_each_tick
+  - d18_tick_dt_scales_growth_and_et
+  - d18_mass_conserved_under_scaled_dt
+  - d18_default_dt_matches_prior_behavior
+  - d18_catchup_root_and_rain
+invariants: (1) one clock — a tick lasts tick_dt base units, base DT_BASE_S = 1 day = the prior implicit tick, default dt = 1; every per-tick rate scales by dt (I_max, D_max, R_MAX, E_OPEN, E_SOIL, uptake, growth Δ0); flux rest floor V_REST·min(dt,1); K ticks advance K·dt (sim_time_s), catch_up K blocks advance K·N_ET·dt. Stress counters still count steps (thresholds unchanged, non-goal). (2) continuous rain — rain_per_tick_m lands on each observed-chunk cell at the start of every live tick, booked in rain_added_m; catch_up / catch_up_chunk add K·N_ET·rain_per_tick_m in their source dump. Closed basin: initial + adds + rain_added = grid mass + et_lost + extract_lost. (3) roots — r = catalog root_depth_m · height_frac; layer k ≥ 1 is reached iff the catalog mask has k and its top depth < r (layer 0 always); uptake and f_w use only reached layers; no catalog depth → stored mask as before. Catch-up uses the same rule (root follows height_frac).
+notes S18: query_tile adds per-plant root_depth_m + max_layer and tile tick_dt, sim_time_s, rain_per_tick_m. Critic: text-size slider (egui zoom), tick length radio (1 s / 1 day / 1 month / 1 year via TickUnit), rain-per-tick field (mm, applied by the kernel each tick; 10 mm button kept), roots shown per plant, elapsed time shown. Kernel fix: percolate's θ_fc floor now guards sources only — snapping a below-θ_fc receiver up to θ_fc created mass when uptake/ET at large dt dried a lower layer. Default dt reproduces a pre-S18 script exactly (golden from 77cd639).
+amended: d16_catchup_seeds_same_as_live — seedlings now drink only reached layers, so a catch_up seedling can stay at exactly H0 on a dry top layer; the test now compares pines placed north (= K seed attempts) for live and catch_up instead of counting plants at exactly H0. No test deleted or renamed. Result 175 acceptance + 4 unit + 8 critic green. Cargo.lock untracked. docs/ untouched.
