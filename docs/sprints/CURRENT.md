@@ -1,6 +1,5 @@
 # Current sprint
 
-**Active file:** `docs/sprints/S18.1-sink-each-tick.md`
-**Target:** sinks every tick; elapsed time only
-**Oracle allowlist:** `crates/sim-core/**`, `crates/critic/**`, `oracle/RUNLOG.md`
+**Active file:** none. S18.1 is a draft. Do not start it.
+**Oracle allowlist:** none until a sprint is locked.
 **Spec allowlist:** `docs/**`, `AGENTS.md`, `README.md`
