@@ -1,7 +1,7 @@
 //! S17/S17.2 critic window (egui). Narrow widths stack and wrap. Formats text only; every number comes from `Critic::query_tile`.
 
 use critic::{condition_line, fmt_sim_time, reason, store_line, Critic, HeightChoice, LayerKind, TickUnit, RAIN_STEP_M};
-use sim_core::{CONDITION_FLAGS, NUTRIENT_IDS, STRESS_THRESHOLDS};
+use sim_core::{CONDITION_FLAGS, NUTRIENT_IDS};
 use eframe::egui;
 
 struct App {
@@ -146,17 +146,12 @@ impl eframe::App for App {
                                 ui.label(*v);
                             });
                         }
-                        ui.strong("Stress counters (count up each bad step; plant dies or is thinned at the threshold)");
-                        for (counter, name, v) in STRESS_THRESHOLDS {
-                            ui.label(format!("{counter} n/{v}: steps toward {name}={v}"));
-                        }
-                        ui.strong("Nutrient stores (% of capacity; ↓ = fell last step; any store at 0% kills)");
+                        ui.strong("Nutrient stores (% of capacity; falling = fell last step; a store at 0% kills)");
                         ui.label(format!("ids: {}", NUTRIENT_IDS.join(", ")));
                         ui.label("water: soil water reached by roots; energy: fixed carbon (sugar, starch); nitrogen: soil pool");
-                        ui.strong("Conditions (computed each step; ✗ = gate closed)");
+                        ui.strong("Conditions (computed each step; ok = open, no = closed)");
                         ui.label(format!("flags: {}", CONDITION_FLAGS.join(", ")));
-                        ui.label("L: light ≥ L_min (fixation); CO2: air, or dissolved carbon when submerged for plants that take it (fixation); root O2: root zone not waterlogged (soil uptake); T: temperature in envelope (fixation)");
-                        ui.label("dry: no water taken; dark: below minimum light; waterlogged: saturated soil; submerged: under pond; crowded: layer A > 1, weakest thinned");
+                        ui.label("L: light at or above L_min (fixation); CO2: air, or dissolved carbon when submerged for plants that take it (fixation); root O2: root zone not waterlogged (soil uptake); T: temperature in envelope (fixation)");
                     });
                 }
                 let q = self.critic.query_tile();
@@ -190,7 +185,7 @@ impl eframe::App for App {
                     ui.group(|ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.strong(format!("#{} {name}", o.slot));
-                            ui.label(format!("— {}", reason(&o)));
+                            ui.label(format!("- {}", reason(&o)));
                         });
                         ui.horizontal_wrapped(|ui| {
                             ui.label(format!("height_m {:.2}", o.height_m));
@@ -201,22 +196,14 @@ impl eframe::App for App {
                             ui.label(format!("light {}", o.light.map(|l| format!("{l:.3}")).unwrap_or_else(|| "-".into())));
                             ui.label(format!("alive {}", o.alive));
                             ui.label(match (o.root_depth_m, o.max_layer) {
-                                (Some(r), Some(k)) => format!("roots {r:.2} m → layer{k}"),
-                                (None, Some(k)) => format!("roots → layer{k}"),
+                                (Some(r), Some(k)) => format!("roots {r:.2} m to layer{k}"),
+                                (None, Some(k)) => format!("roots to layer{k}"),
                                 _ => "roots -".into(),
                             });
                         });
                         ui.horizontal_wrapped(|ui| {
                             ui.label(format!("stores: {}", store_line(&o)));
                             ui.label(format!("conditions: {}", condition_line(&o)));
-                        });
-                        ui.horizontal_wrapped(|ui| {
-                            let th = STRESS_THRESHOLDS;
-                            ui.small(format!(
-                                "dry {}/{}  dark {}/{}  waterlogged {}/{}  submerged {}/{}  crowded {}/{}",
-                                o.dry_steps, th[0].2, o.dark_steps, th[1].2, o.waterlog_steps, th[2].2,
-                                o.submerge_steps, th[4].2, o.crowd_steps, th[5].2
-                            ));
                         });
                     });
                 }

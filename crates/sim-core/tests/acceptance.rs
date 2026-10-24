@@ -6824,3 +6824,35 @@ fn d191_root_o2_is_not_a_store() {
     assert!(sim_core::CONDITION_FLAGS.contains(&"root O2"));
     assert!(!sim_core::NUTRIENT_IDS.iter().any(|i| i.contains("o2") || i.contains("oxygen")));
 }
+
+/// D19.2: waterlogged rice (takes_dissolved) keeps root O2 open and drinks soil water.
+#[test]
+fn d192_rice_drinks_when_waterlogged() {
+    let mut w = World::new(1921, saturated_column(0.0, H_POND * 5.0));
+    w.set_climate(20.0, 1000.0);
+    w.plant_taxon(0, 0, "oryza_sativa").unwrap();
+    assert!(w.column_at(0, 0).surface_water_m > H_POND);
+    assert!(w.column_at(0, 0).layers[0].theta >= Texture::Sand.porosity() - 1e-9);
+    assert!(w.column_at(0, 0).occupants[0].takes_dissolved, "rice takes_dissolved");
+    assert!(w.conditions(0, 0, 0).root_o2, "rice root O2 open");
+    let s0 = s191_store(&w, "water");
+    let x0 = w.extract_lost();
+    w.tick();
+    let up = w.extract_lost() - x0;
+    assert!(up > 0.0, "rice soil uptake > 0: {up}");
+    let s1 = s191_store(&w, "water");
+    assert!(s1 >= s0 - 1e-12, "rice water store not falling: {s0} -> {s1}");
+}
+
+/// D19.2: same tile, a pine: root O2 closed, no soil uptake.
+#[test]
+fn d192_pine_does_not() {
+    let mut w = World::new(1922, saturated_column(0.0, H_POND * 5.0));
+    w.set_climate(20.0, 1000.0);
+    w.plant_taxon(0, 0, "pinus_taeda").unwrap();
+    assert!(!w.column_at(0, 0).occupants[0].takes_dissolved);
+    assert!(!w.conditions(0, 0, 0).root_o2, "pine root O2 closed");
+    let x0 = w.extract_lost();
+    w.tick();
+    assert_eq!(w.extract_lost() - x0, 0.0, "pine soil uptake 0");
+}

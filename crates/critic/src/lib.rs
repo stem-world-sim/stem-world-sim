@@ -2,15 +2,7 @@
 //! No physics here: layers, thinning and light all come from `World::query_tile`.
 
 pub use sim_core::{LayerKind, PlantTaxonError, TickUnit, TileOccupantView, TileView, DT_BASE_S};
-use sim_core::{Column, SoilLayer, Texture, World, STRESS_THRESHOLDS as TH};
-
-/// Kernel thresholds by index into `STRESS_THRESHOLDS`.
-const WILT: u32 = TH[0].2;
-const DARK: u32 = TH[1].2;
-const WL: u32 = TH[2].2;
-const WL_D: u32 = TH[3].2;
-const SUB: u32 = TH[4].2;
-const CROWD: u32 = TH[5].2;
+use sim_core::{Column, SoilLayer, Texture, World};
 
 /// Fixed critic seed (no RNG is used by the kernel paths exercised here).
 pub const CRITIC_SEED: u64 = 17;
@@ -49,48 +41,32 @@ pub const EVENT_KEEP: usize = 8;
 /// S17.2: rain-button depth (m), added through the kernel rain path.
 pub const RAIN_STEP_M: f64 = 0.01;
 
-/// S17.2 reason line from kernel counters only. Plain words.
+/// S19.2 reason line: the falling store (`water falling`), or `ok`. No counters.
 pub fn reason(o: &TileOccupantView) -> String {
     if !o.alive {
         return death_reason(o);
     }
-    let mut parts = Vec::new();
-    if o.dry_steps > 0 {
-        parts.push(format!("dry {}/{}", o.dry_steps, WILT));
+    match falling_store(o) {
+        Some(id) => format!("{id} falling"),
+        None => "ok".into(),
     }
-    if o.dark_steps > 0 {
-        parts.push(format!("dark {}/{}", o.dark_steps, DARK));
-    }
-    if o.waterlog_steps > 0 {
-        parts.push(format!("waterlogged {}/{}", o.waterlog_steps, WL));
-    }
-    if o.submerge_steps > 0 {
-        parts.push(format!("submerged {}/{}", o.submerge_steps, SUB));
-    }
-    if o.crowd_steps > 0 {
-        parts.push(format!("crowded {}/{}", o.crowd_steps, CROWD));
-    }
-    if let Some(id) = falling_store(o) {
-        parts.push(format!("{id} falling"));
-    }
-    if parts.is_empty() { "ok".into() } else { parts.join(", ") }
 }
 
-/// S19: each store as a percentage of capacity, falling ones marked ↓.
+/// S19.2: each store as a percentage of capacity, plain ASCII (falling ones marked `falling`).
 pub fn store_line(o: &TileOccupantView) -> String {
     o.stores
         .iter()
-        .map(|(id, f, d)| format!("{id} {:.0}%{}", f * 100.0, if *d < 0.0 { "↓" } else { "" }))
+        .map(|(id, f, d)| format!("{id} {:.0}%{}", f * 100.0, if *d < 0.0 { " falling" } else { "" }))
         .collect::<Vec<_>>()
         .join("  ")
 }
 
-/// S19.1: condition flags, closed ones marked ✗ (e.g. `L ✓  CO2 ✗  root O2 ✓  T ✓`).
+/// S19.2: condition flags in plain ASCII (e.g. `L ok  CO2 no  root O2 ok  T ok`).
 pub fn condition_line(o: &TileOccupantView) -> String {
     o.conditions
         .flags()
         .iter()
-        .map(|(f, open)| format!("{f} {}", if *open { "✓" } else { "✗" }))
+        .map(|(f, open)| format!("{f} {}", if *open { "ok" } else { "no" }))
         .collect::<Vec<_>>()
         .join("  ")
 }
@@ -109,38 +85,19 @@ pub fn falling_store(o: &TileOccupantView) -> Option<String> {
         .map(|(id, _, _)| id.clone())
 }
 
-/// Cause for a plant that left the living list, judged from its last counters.
-/// A counter one step short of its threshold means the kernel tripped it this tick.
+/// S19.2: death is an empty store; the reason names the falling store. No counters.
 pub fn death_reason(o: &TileOccupantView) -> String {
-    // S19: non-store removals first (thin, waterlog), then the falling store.
-    if o.crowd_steps + 1 >= CROWD {
-        return "thinned: crowded".into();
-    }
-    if o.waterlog_steps + 1 >= WL.min(WL_D) && o.waterlog_steps > 0 {
-        return "died: waterlogged".into();
-    }
-    if let Some(id) = falling_store(o) {
-        if id == sim_core::NUT_WATER {
-            return "wilted: soil dry (water store empty)".into();
+    match falling_store(o) {
+        Some(id) if id == sim_core::NUT_WATER => "wilted: soil dry (water store empty)".into(),
+        Some(id) => {
+            let closed = closed_gates(o);
+            if closed.is_empty() {
+                format!("died: {id} store empty")
+            } else {
+                format!("died: {id} store empty (closed: {})", closed.join(", "))
+            }
         }
-        let closed = closed_gates(o);
-        if closed.is_empty() {
-            return format!("died: {id} store empty");
-        }
-        return format!("died: {id} store empty (closed: {})", closed.join(", "));
-    }
-    if o.dry_steps + 1 >= WILT {
-        "wilted: soil dry".into()
-    } else if o.submerge_steps + 1 >= SUB {
-        "died: submerged".into()
-    } else if o.waterlog_steps + 1 >= WL.min(WL_D) && o.waterlog_steps > 0 {
-        "died: waterlogged".into()
-    } else if o.dark_steps + 1 >= DARK {
-        "died: too dark".into()
-    } else if o.crowd_steps + 1 >= CROWD {
-        "thinned: crowded".into()
-    } else {
-        "removed".into()
+        None => "removed".into(),
     }
 }
 
@@ -264,8 +221,8 @@ impl Critic {
     }
 
     fn push_event(&mut self, e: String) {
-        let t = self.world.tick_count();
-        self.events.push(format!("t{t}: {e}"));
+        let d = self.world.elapsed_days();
+        self.events.push(format!("{d:.1} d: {e}"));
         let n = self.events.len();
         if n > EVENT_KEEP {
             self.events.drain(0..n - EVENT_KEEP);
@@ -315,6 +272,18 @@ impl Critic {
 
     pub fn query_tile(&self) -> TileView {
         self.world.query_tile(0, 0)
+    }
+
+    /// S19.2 plant card text (header, stores, conditions) as shown on the page.
+    pub fn card(&self, o: &TileOccupantView) -> String {
+        let name = self.label(o.taxon.as_deref().unwrap_or("-"));
+        format!(
+            "#{} {name} - {}\nstores: {}\nconditions: {}",
+            o.slot,
+            reason(o),
+            store_line(o),
+            condition_line(o)
+        )
     }
 
     pub fn tick_count(&self) -> u64 {
