@@ -1,7 +1,7 @@
 //! S17/S17.2 critic window (egui). Narrow widths stack and wrap. Formats text only; every number comes from `Critic::query_tile`.
 
-use critic::{fmt_sim_time, reason, store_line, Critic, HeightChoice, LayerKind, TickUnit, RAIN_STEP_M};
-use sim_core::{NUTRIENT_IDS, STRESS_THRESHOLDS};
+use critic::{condition_line, fmt_sim_time, reason, store_line, Critic, HeightChoice, LayerKind, TickUnit, RAIN_STEP_M};
+use sim_core::{CONDITION_FLAGS, NUTRIENT_IDS, STRESS_THRESHOLDS};
 use eframe::egui;
 
 struct App {
@@ -152,7 +152,10 @@ impl eframe::App for App {
                         }
                         ui.strong("Nutrient stores (% of capacity; ↓ = fell last step; any store at 0% kills)");
                         ui.label(format!("ids: {}", NUTRIENT_IDS.join(", ")));
-                        ui.label("water: soil water reached by roots; energy: canopy light; co2: air (under water only dissolved CO2, for plants that take it); nitrogen: soil pool");
+                        ui.label("water: soil water reached by roots; energy: fixed carbon (sugar, starch); nitrogen: soil pool");
+                        ui.strong("Conditions (computed each step; ✗ = gate closed)");
+                        ui.label(format!("flags: {}", CONDITION_FLAGS.join(", ")));
+                        ui.label("L: light ≥ L_min (fixation); CO2: air, or dissolved carbon when submerged for plants that take it (fixation); root O2: root zone not waterlogged (soil uptake); T: temperature in envelope (fixation)");
                         ui.label("dry: no water taken; dark: below minimum light; waterlogged: saturated soil; submerged: under pond; crowded: layer A > 1, weakest thinned");
                     });
                 }
@@ -205,6 +208,7 @@ impl eframe::App for App {
                         });
                         ui.horizontal_wrapped(|ui| {
                             ui.label(format!("stores: {}", store_line(&o)));
+                            ui.label(format!("conditions: {}", condition_line(&o)));
                         });
                         ui.horizontal_wrapped(|ui| {
                             let th = STRESS_THRESHOLDS;

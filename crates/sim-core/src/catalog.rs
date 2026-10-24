@@ -128,12 +128,6 @@ impl OccupantParams {
             crate::CAP_DAYS_ENERGY,
         ));
         occ.needs.push(crate::Need::new(
-            crate::NUT_CO2,
-            crate::NutrientSource::Air,
-            crate::USE_CO2,
-            crate::CAP_DAYS_CO2,
-        ));
-        occ.needs.push(crate::Need::new(
             crate::NUT_NITROGEN,
             crate::NutrientSource::SoilPool,
             crate::nitrogen_use_for_fertility(self.fertility.as_deref()),

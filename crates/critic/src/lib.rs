@@ -85,6 +85,21 @@ pub fn store_line(o: &TileOccupantView) -> String {
         .join("  ")
 }
 
+/// S19.1: condition flags, closed ones marked ✗ (e.g. `L ✓  CO2 ✗  root O2 ✓  T ✓`).
+pub fn condition_line(o: &TileOccupantView) -> String {
+    o.conditions
+        .flags()
+        .iter()
+        .map(|(f, open)| format!("{f} {}", if *open { "✓" } else { "✗" }))
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+/// S19.1: closed condition flags (empty if all open).
+pub fn closed_gates(o: &TileOccupantView) -> Vec<&'static str> {
+    o.conditions.flags().iter().filter(|(_, open)| !open).map(|(f, _)| *f).collect()
+}
+
 /// S19: the store closest to empty among those that fell last step (None if none fell).
 pub fn falling_store(o: &TileOccupantView) -> Option<String> {
     o.stores
@@ -108,7 +123,11 @@ pub fn death_reason(o: &TileOccupantView) -> String {
         if id == sim_core::NUT_WATER {
             return "wilted: soil dry (water store empty)".into();
         }
-        return format!("died: {id} store empty");
+        let closed = closed_gates(o);
+        if closed.is_empty() {
+            return format!("died: {id} store empty");
+        }
+        return format!("died: {id} store empty (closed: {})", closed.join(", "));
     }
     if o.dry_steps + 1 >= WILT {
         "wilted: soil dry".into()
