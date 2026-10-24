@@ -1,6 +1,6 @@
 # Current sprint
 
-**Active file:** none. S19.1 merged as PR #81 (`c157db8`).
-**Page:** release tag `critic`, asset `critic.html.gz`.
-**Oracle allowlist:** none until the next sprint is locked.
+**Active file:** `docs/sprints/S19.2-page-and-pond.md`
+**Target:** plain page, rice drinks when waterlogged
+**Oracle allowlist:** `crates/sim-core/**`, `crates/critic/**`, `oracle/RUNLOG.md`
 **Spec allowlist:** `docs/**`, `AGENTS.md`, `README.md`
