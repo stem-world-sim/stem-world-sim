@@ -3,7 +3,7 @@
 //! Water mass (A = 1): M = h_surf + sum_i (theta_i * L_i)
 //! Grid mass: sum of column M. Closed basin: M + et_lost() + extract_lost() == mass ever added.
 //! Tick order: infiltrate → pond → soil → lake_snap → at_rest/awake prune; advance clock;
-//! if clock.tick % N_ET == 0: ET → occupants → lake_snap → rest/awake again.
+//! then (S19: every step) ET → occupants → lake_snap → filters → growth → stores → seed.
 //! Hydro + sinks visit observed-chunk cells ∪ awake set. CHUNK=8; ignore allowed while moving.
 //! Rain / add_occupant / flux / catch_up wake cell+4-nbrs.
 //! After a tick, at_rest cells whose 4-neighbors are also at_rest leave the awake set.
@@ -29,19 +29,28 @@
 //! (herb-only A_b). S16.3: the bucket is split into height layers (|Δh| ≤ max(1 m, 0.25·max h),
 //! transitive); each layer has its own A_L, s_L and crowd thin. Light still walks H_BAND bands top-down using each member's compressed α.
 //! S16: seed rain — fertile (alive, height_frac≥F=0.5) one attempt/tick after growth; dispersal wind|animal→NESW+same, water→same|pond|lower-z, else same; seedling H0.
-//! catch_up(K, rain): optional source dump; then K blocks of (≤N_ET hydro, 1 unit sink, light+compress+crowd, growth, seed).
+//! catch_up(K, rain): optional source dump; then K of the same step as live (S19).
 //! catch_up_chunk: same calendar on one chunk + 1-cell halo; other chunks unchanged.
 //! Unique-min-H chute revoked. Capillary stays.
 //! S18: one clock. A tick lasts tick_dt base units (DT_BASE_S = 1 day = the prior implicit tick; default 1).
 //! Every per-tick rate scales by dt: I_max, D_max, R_MAX, E_OPEN, E_SOIL, uptake, growth Δ0. Flux rest floor
 //! V_REST·min(dt,1). Stress counters still count steps (thresholds unchanged). Continuous rain adds
-//! rain_per_tick_m to each observed-chunk cell at the start of every live tick; catch_up adds K·N_ET·r.
+//! rain to each observed-chunk cell at the start of every live tick (S19: rain_per_day_m·dt per step).
 //! Roots: r = root_depth_m·height_frac; layer k is reached iff the catalog mask has k and top_k < r
 //! (layer 0 always). Uptake and f_w use only reached layers. No catalog depth → catalog mask as before.
+//! S19: a step only advances the clock; no rule reads the step count. The N_ET gate is gone: hydro, ET,
+//! uptake and every nutrient flux run every step scaled by tick_dt (legacy per-batch amounts E_OPEN,
+//! E_SOIL, uptake_max are per N_ET days, so rate/day = amount/N_ET). catch_up(K) = K of the same step.
+//! Rain is rain_per_day_m (step adds r·dt). Seed: one attempt per elapsed day (≤ MAX_OCCUPANTS per step).
+//! Nutrient stores: each occupant carries a need list (id, source, use/day, capacity days). A step
+//! recharges each store from its source and spends use·dt; any empty store kills; on death remaining
+//! water → soil, soil-pool nutrients → their pool, air nutrients → air. Energy is not returned.
+//! Sources: SoilWater (hydro), Light (canopy light ≥ L_min), Air (world pool; when submerged only via the
+//! tile dissolved pool if takes_dissolved), SoilPool (tile pool keyed by nutrient id; nitrogen this sprint).
 
 /// Absolute / relative tolerance for water-mass comparisons (f64).
 use smallvec::SmallVec;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub mod catalog;
 pub use catalog::{
@@ -65,8 +74,38 @@ pub const E_OPEN: f64 = 0.02;
 /// Top-layer soil evaporation depth per ET-step (metres water). S05.
 pub const E_SOIL: f64 = 0.005;
 
-/// ET-step cadence: run evaporation when clock.tick % N_ET == 0 after advance. S05.
+/// Legacy S05 sink-batch length in days. S19: no longer a gate and no rule reads the step
+/// count; per-batch sink amounts (E_OPEN, E_SOIL, uptake_max) are spread over N_ET days.
 pub const N_ET: u64 = 10;
+/// Per-day fraction of a legacy sink-batch amount (rate = amount / N_ET per day). S19.
+pub const SINK_PER_DAY: f64 = 1.0 / N_ET as f64;
+
+/// S19 nutrient ids (data, not branches).
+pub const NUT_WATER: &str = "water";
+pub const NUT_ENERGY: &str = "energy";
+pub const NUT_CO2: &str = "co2";
+pub const NUT_NITROGEN: &str = "nitrogen";
+/// S19 nutrient ids wired this sprint (display/key order).
+pub const NUTRIENT_IDS: [&str; 4] = [NUT_WATER, NUT_ENERGY, NUT_CO2, NUT_NITROGEN];
+/// Store capacity in days of use at height_frac = 1 (capacity = use·(days − 1 + height_frac)). S19.
+/// Water: T_WILT legacy sink batches of N_ET days each (same drought tolerance in time).
+pub const CAP_DAYS_WATER: f64 = (T_WILT as u64 * N_ET) as f64;
+pub const CAP_DAYS_ENERGY: f64 = T_DARK as f64;
+pub const CAP_DAYS_CO2: f64 = T_SUB as f64;
+pub const CAP_DAYS_NITROGEN: f64 = 30.0;
+/// Energy and CO2 use per day (store units). S19.
+pub const USE_ENERGY: f64 = 1.0;
+pub const USE_CO2: f64 = 1.0;
+/// Nitrogen use per day by catalog fertility. S19.
+pub const N_USE_LOW: f64 = 0.02;
+pub const N_USE_MODERATE: f64 = 0.05;
+pub const N_USE_HIGH: f64 = 0.10;
+/// Initial soil nitrogen per tile (store units). S19.
+pub const SOIL_N0: f64 = 50.0;
+/// Initial dissolved CO2 per tile (store units). S19.
+pub const DISSOLVED_CO2_0: f64 = 30.0;
+/// Initial world air CO2 (effectively unbounded). S19.
+pub const AIR_CO2_0: f64 = 1.0e9;
 
 /// Max occupants per cell. S06.
 pub const MAX_OCCUPANTS: usize = 8;
@@ -181,6 +220,62 @@ pub enum OccupantKind {
     PlantStub,
 }
 
+/// Where a nutrient store recharges from. S19.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NutrientSource {
+    /// Soil water reached by roots (existing hydro state).
+    SoilWater,
+    /// Canopy light (received L ≥ L_min charges a full step).
+    Light,
+    /// World air pool; while submerged only the tile dissolved pool (takes_dissolved).
+    Air,
+    /// Tile soil pool keyed by nutrient id.
+    SoilPool,
+}
+
+/// One required nutrient store on an occupant. S19.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Need {
+    pub id: String,
+    pub source: NutrientSource,
+    /// Use per day (store units).
+    pub use_per_day: f64,
+    /// Capacity in days of use at height_frac = 1.
+    pub cap_days: f64,
+    /// Current store.
+    pub store: f64,
+    /// Net change last step (recharge − spend).
+    pub last_delta: f64,
+}
+
+impl Need {
+    /// New store, starting full at height_frac = 1 (clamped to capacity on the first step).
+    pub fn new(id: &str, source: NutrientSource, use_per_day: f64, cap_days: f64) -> Self {
+        Self {
+            id: id.to_string(),
+            source,
+            use_per_day,
+            cap_days,
+            store: use_per_day * cap_days,
+            last_delta: 0.0,
+        }
+    }
+
+    /// Capacity grows with height_frac while use does not: use·(cap_days − 1 + hf).
+    pub fn capacity(&self, height_frac: f64) -> f64 {
+        self.use_per_day * (self.cap_days - 1.0 + height_frac.clamp(0.0, 1.0)).max(0.0)
+    }
+}
+
+/// Nitrogen use per day from catalog `fertility` (low|moderate|high; missing → moderate). S19.
+pub fn nitrogen_use_for_fertility(fertility: Option<&str>) -> f64 {
+    match fertility.map(|f| f.trim().to_ascii_lowercase()) {
+        Some(ref f) if f == "low" => N_USE_LOW,
+        Some(ref f) if f == "high" => N_USE_HIGH,
+        _ => N_USE_MODERATE,
+    }
+}
+
 /// Cell occupant with root mask and uptake demand. S06.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Occupant {
@@ -212,6 +307,12 @@ pub struct Occupant {
     pub band_scale: f64,
     /// Catalog mature root depth (m) snapshotted at plant time; None = static root mask. S18.
     pub root_depth_max_m: Option<f64>,
+    /// S19 required nutrient stores (iterated as data).
+    pub needs: Vec<Need>,
+    /// S19: can recharge air nutrients from the tile dissolved pool while submerged.
+    pub takes_dissolved: bool,
+    /// S19: water taken from soil this step (recharge for the SoilWater store).
+    pub water_taken: f64,
 }
 
 impl Occupant {
@@ -235,6 +336,14 @@ impl Occupant {
             crowd_steps: 0,
             band_scale: 1.0,
             root_depth_max_m: None,
+            needs: vec![Need::new(
+                NUT_WATER,
+                NutrientSource::SoilWater,
+                P_MAX * SINK_PER_DAY,
+                CAP_DAYS_WATER,
+            )],
+            takes_dissolved: false,
+            water_taken: 0.0,
         }
     }
 
@@ -258,6 +367,14 @@ impl Occupant {
             crowd_steps: 0,
             band_scale: 1.0,
             root_depth_max_m: None,
+            needs: vec![Need::new(
+                NUT_WATER,
+                NutrientSource::SoilWater,
+                P_MAX * SINK_PER_DAY,
+                CAP_DAYS_WATER,
+            )],
+            takes_dissolved: false,
+            water_taken: 0.0,
         }
     }
 }
@@ -761,6 +878,8 @@ pub struct TileOccupantView {
     pub root_depth_m: Option<f64>,
     /// S18: deepest soil layer index the roots reach.
     pub max_layer: Option<usize>,
+    /// S19: per required nutrient (id, store / capacity, net change last step).
+    pub stores: Vec<(String, f64, f64)>,
 }
 
 /// S17.2: kernel stress thresholds, by counter, for read-only display.
@@ -790,8 +909,10 @@ pub struct TileView {
     /// S18: tick length in base units (days) and elapsed simulated time (s).
     pub tick_dt: f64,
     pub sim_time_s: f64,
-    /// S18: continuous rain depth added each live tick (m).
-    pub rain_per_tick_m: f64,
+    /// S19: continuous rain (m/day).
+    pub rain_per_day_m: f64,
+    /// S19: tile soil pools by nutrient id.
+    pub soil_pools: Vec<(String, f64)>,
 }
 
 /// Crowd layout of living occupants with the same sort, H_BAND herb bands and
@@ -907,6 +1028,10 @@ pub struct Column {
     pub layers: SmallVec<[SoilLayer; N_LAYERS]>,
     /// Per-cell occupants, capped at [`MAX_OCCUPANTS`]. S06. Inline one plant.
     pub occupants: SmallVec<[Occupant; 1]>,
+    /// S19 soil-bound nutrient pools keyed by id (nitrogen = SOIL_N0 initially).
+    pub soil_pools: BTreeMap<String, f64>,
+    /// S19 dissolved nutrient pools keyed by id (co2 = DISSOLVED_CO2_0); usable while water is present.
+    pub dissolved: BTreeMap<String, f64>,
 }
 
 impl Column {
@@ -920,6 +1045,8 @@ impl Column {
             surface_water_m,
             layers: layers.into(),
             occupants: SmallVec::new(),
+            soil_pools: BTreeMap::from([(NUT_NITROGEN.to_string(), SOIL_N0)]),
+            dissolved: BTreeMap::from([(NUT_CO2.to_string(), DISSOLVED_CO2_0)]),
         }
     }
 
@@ -1274,8 +1401,14 @@ pub struct World {
     v_rest: f64,
     /// Elapsed simulated time in base units (Σ dt). S18.
     elapsed_dt: f64,
-    /// Continuous rain depth per live tick (m, A = 1) on observed-chunk cells. S18.
-    rain_per_tick_m: f64,
+    /// Continuous rain (m/day, A = 1); a step adds r·dt. S19.
+    rain_per_day_m: f64,
+    /// Fractional elapsed days not yet spent on seed attempts. S19.
+    seed_day_acc: f64,
+    /// Evaporation multiplier (default 1; 0 = hydro-only world). S19.
+    et_scale: f64,
+    /// World air pools by nutrient id (co2). S19.
+    air: BTreeMap<String, f64>,
     /// Cumulative continuous-rain mass added (m·cells, A = 1). S18.
     rain_added_m: f64,
 }
@@ -1311,7 +1444,10 @@ impl World {
             tick_dt: 1.0,
             v_rest: V_REST,
             elapsed_dt: 0.0,
-            rain_per_tick_m: 0.0,
+            rain_per_day_m: 0.0,
+            seed_day_acc: 0.0,
+            et_scale: 1.0,
+            air: BTreeMap::from([(NUT_CO2.to_string(), AIR_CO2_0)]),
             rain_added_m: 0.0,
         }
     }
@@ -1353,7 +1489,10 @@ impl World {
             tick_dt: 1.0,
             v_rest: V_REST,
             elapsed_dt: 0.0,
-            rain_per_tick_m: 0.0,
+            rain_per_day_m: 0.0,
+            seed_day_acc: 0.0,
+            et_scale: 1.0,
+            air: BTreeMap::from([(NUT_CO2.to_string(), AIR_CO2_0)]),
             rain_added_m: 0.0,
         }
     }
@@ -1545,26 +1684,19 @@ impl World {
         }
     }
 
-    /// S09.1: calendar-block catch-up on chunk (cx,cy) plus a 1-cell (4-neighbor) halo.
-    /// Other chunks' cells are not sourced or sink-processed.
+    /// S09.1/S19: catch-up on chunk (cx,cy) plus a 1-cell (4-neighbor) halo: optional source
+    /// dump, then K of the same step scoped to the region. Other chunks are untouched.
     pub fn catch_up_chunk(&mut self, cx: usize, cy: usize, k: u32, rain_per_step: f64) {
         debug_assert!(rain_per_step >= 0.0, "rain_per_step must be non-negative");
         let _ = self.chunk_index(cx, cy); // bounds check
         let region_ids = self.chunk_halo_ids(cx, cy);
         let region_set: HashSet<usize> = region_ids.iter().copied().collect();
-        let k_u = k as u64;
 
-        // Optional source dump (one dump if R>0); wake region cells.
-        if k > 0 {
-            // S18: plus continuous rain for the K·N_ET ticks this stands in for.
-            let cont = (k_u * N_ET) as f64 * self.rain_per_tick_m;
-            let add = (k as f64) * rain_per_step + cont;
-            if add > 0.0 {
-                for &i in &region_ids {
-                    self.columns[i].surface_water_m += add;
-                    self.rain_added_m += cont;
-                    self.wake_idx(i);
-                }
+        if k > 0 && rain_per_step > 0.0 {
+            let add = (k as f64) * rain_per_step;
+            for &i in &region_ids {
+                self.columns[i].surface_water_m += add;
+                self.wake_idx(i);
             }
         }
         // R=0 come-back: still drain any pond/mobile left in the region. S10.
@@ -1575,43 +1707,28 @@ impl World {
             }
         }
 
-        // K calendar blocks: ≤N_ET scoped hydro, then one unit sink. No settle-before-sink.
         for _ in 0..k {
-            for _ in 0..N_ET {
-                let mut step_ids: Vec<usize> = Vec::new();
+            let r = self.rain_per_day_m * self.tick_dt;
+            if r > 0.0 {
                 for &i in &region_ids {
-                    if self.awake[i] {
-                        step_ids.push(i);
-                    }
+                    self.columns[i].surface_water_m += r;
+                    self.rain_added_m += r;
+                    self.wake_idx(i);
                 }
-                if step_ids.is_empty() {
-                    break;
-                }
+            }
+            let step_ids: Vec<usize> =
+                region_ids.iter().copied().filter(|&i| self.awake[i]).collect();
+            if !step_ids.is_empty() {
                 self.hydro_step_active_ids(&step_ids, Some(&region_set));
-                self.apply_hydro_filter_ids(&step_ids);
             }
-            // S14.1: after hydro (θ aggregates), before sinks — one light if needed, one growth.
-            self.apply_catchup_light_and_growth(&region_ids);
-            let mut sink_busy: HashSet<usize> = HashSet::new();
-            self.et_pass_ids(&mut sink_busy, &region_ids);
-            self.occupant_pass_ids(&mut sink_busy, &region_ids);
-            self.apply_climate_filter_ids(&region_ids, true);
-            self.lake_snap_ids(&region_ids);
-            for &i in &region_ids {
-                let is_busy = sink_busy.contains(&i);
-                self.at_rest[i] = !is_busy;
-                if is_busy {
-                    self.wake_one(i);
-                }
-            }
-            self.prune_awake();
+            self.sink_and_life_ids(&region_ids, true);
         }
 
         // Catch-up clears away-time for this chunk (still ignored unless observed).
         let ci = self.chunk_index(cx, cy);
         self.chunks[ci].t_away = 0;
 
-        self.clock.tick = self.clock.tick.saturating_add(k_u.saturating_mul(N_ET));
+        self.clock.tick = self.clock.tick.saturating_add(k as u64);
     }
 
     fn make_chunks(width: usize, height: usize) -> (usize, usize, Vec<ChunkState>) {
@@ -1868,14 +1985,81 @@ impl World {
         self.elapsed_dt * DT_BASE_S
     }
 
-    /// Continuous rain depth (m) added to each observed-chunk cell every live tick. S18.
+    /// Continuous rain (m/day); each step adds r·tick_dt. Zero is a drought. S19.
+    pub fn set_rain_per_day_m(&mut self, r: f64) {
+        assert!(r >= 0.0 && r.is_finite(), "rain_per_day_m must be non-negative");
+        self.rain_per_day_m = r;
+    }
+
+    pub fn rain_per_day_m(&self) -> f64 {
+        self.rain_per_day_m
+    }
+
+    /// S18 name kept: sets the per-day rain (S19: rain is per day, not per step).
     pub fn set_rain_per_tick_m(&mut self, r: f64) {
-        assert!(r >= 0.0 && r.is_finite(), "rain_per_tick_m must be non-negative");
-        self.rain_per_tick_m = r;
+        self.set_rain_per_day_m(r);
     }
 
     pub fn rain_per_tick_m(&self) -> f64 {
-        self.rain_per_tick_m
+        self.rain_per_day_m
+    }
+
+    /// Evaporation multiplier (default 1). 0 gives a hydro-only world (no ET sink). S19.
+    pub fn set_et_scale(&mut self, k: f64) {
+        assert!(k >= 0.0 && k.is_finite(), "et_scale must be non-negative");
+        self.et_scale = k;
+    }
+
+    /// Elapsed simulated days (Σ tick_dt). S19.
+    pub fn elapsed_days(&self) -> f64 {
+        self.elapsed_dt
+    }
+
+    /// Tile soil pool for nutrient `id` (0 if absent). S19.
+    pub fn soil_pool(&self, x: usize, y: usize, id: &str) -> f64 {
+        self.columns[self.idx(x, y)].soil_pools.get(id).copied().unwrap_or(0.0)
+    }
+
+    pub fn set_soil_pool(&mut self, x: usize, y: usize, id: &str, v: f64) {
+        let i = self.idx(x, y);
+        self.columns[i].soil_pools.insert(id.to_string(), v.max(0.0));
+    }
+
+    /// Tile dissolved pool for nutrient `id` (0 if absent). S19.
+    pub fn dissolved_pool(&self, x: usize, y: usize, id: &str) -> f64 {
+        self.columns[self.idx(x, y)].dissolved.get(id).copied().unwrap_or(0.0)
+    }
+
+    pub fn set_dissolved_pool(&mut self, x: usize, y: usize, id: &str, v: f64) {
+        let i = self.idx(x, y);
+        self.columns[i].dissolved.insert(id.to_string(), v.max(0.0));
+    }
+
+    /// World air pool for nutrient `id`. S19.
+    pub fn air_pool(&self, id: &str) -> f64 {
+        self.air.get(id).copied().unwrap_or(0.0)
+    }
+
+    /// Add a required nutrient to occupant `slot` on (x,y). Test hook for data-only ids. S19.
+    pub fn add_need(&mut self, x: usize, y: usize, slot: usize, need: Need) {
+        let i = self.idx(x, y);
+        self.columns[i].occupants[slot].needs.push(need);
+    }
+
+    /// Mutable store of nutrient `id` on occupant `slot` (x,y). S19.
+    pub fn set_store(&mut self, x: usize, y: usize, slot: usize, id: &str, v: f64) {
+        let i = self.idx(x, y);
+        for n in self.columns[i].occupants[slot].needs.iter_mut() {
+            if n.id == id {
+                n.store = v;
+            }
+        }
+    }
+
+    /// Store of nutrient `id` on occupant `slot` (x,y). S19.
+    pub fn store_of(&self, x: usize, y: usize, slot: usize, id: &str) -> Option<f64> {
+        let i = self.idx(x, y);
+        self.columns[i].occupants.get(slot)?.needs.iter().find(|n| n.id == id).map(|n| n.store)
     }
 
     /// Cumulative continuous-rain mass added so far (m, summed over cells, A = 1). S18.
@@ -1885,7 +2069,7 @@ impl World {
 
     /// Live continuous rain on observed-chunk cells; wakes them. S18.
     fn apply_continuous_rain_live(&mut self) {
-        let r = self.rain_per_tick_m;
+        let r = self.rain_per_day_m * self.tick_dt;
         if r <= 0.0 || self.n_observed == 0 {
             return;
         }
@@ -2010,6 +2194,15 @@ impl World {
                     crowd_steps: o.crowd_steps,
                     root_depth_m: root_depth_now_m(o),
                     max_layer: max_root_layer(col, o),
+                    stores: o
+                        .needs
+                        .iter()
+                        .map(|n| {
+                            let cap = n.capacity(o.height_frac);
+                            let f = if cap > 0.0 { (n.store / cap).clamp(0.0, 1.0) } else { 0.0 };
+                            (n.id.clone(), f, n.last_delta)
+                        })
+                        .collect(),
                 }
             })
             .collect();
@@ -2022,7 +2215,8 @@ impl World {
             layers: col.layers.iter().map(|l| (l.theta, l.theta_fc())).collect(),
             tick_dt: self.tick_dt,
             sim_time_s: self.sim_time_s(),
-            rain_per_tick_m: self.rain_per_tick_m,
+            rain_per_day_m: self.rain_per_day_m,
+            soil_pools: col.soil_pools.iter().map(|(k, v)| (k.clone(), *v)).collect(),
         }
     }
 
@@ -2114,7 +2308,8 @@ impl World {
         #[derive(Clone, Copy)]
         enum Kill {
             Waterlog,
-            Submerged,
+            #[allow(dead_code)]
+            Submerged, // S19: submergence kills via the CO2 store
         }
         let mut kills: Vec<(usize, Kill)> = Vec::new();
         let occ_len = self.columns[i].occupants.len();
@@ -2143,7 +2338,8 @@ impl World {
             }
 
             // Waterlog counter (skip if drain_ok contains W).
-            if immune_wl {
+            // S19: full submergence is the CO2 store's job, not a waterlog count.
+            if immune_wl || h_surf >= height {
                 self.columns[i].occupants[oi].waterlog_steps = 0;
             } else if waterlogged {
                 self.columns[i].occupants[oi].waterlog_steps =
@@ -2154,9 +2350,9 @@ impl World {
 
             let sub_steps = self.columns[i].occupants[oi].submerge_steps;
             let wl_steps = self.columns[i].occupants[oi].waterlog_steps;
-            if sub_steps >= T_SUB {
-                kills.push((oi, Kill::Submerged));
-            } else if !immune_wl && wl_steps >= wl_limit {
+            // S19: submergence kills through the CO2 store, not a step count.
+            let _ = sub_steps;
+            if !immune_wl && wl_steps >= wl_limit {
                 kills.push((oi, Kill::Waterlog));
             }
         }
@@ -2236,7 +2432,7 @@ impl World {
         };
 
         let mut l = L0;
-        let mut dark_kills: Vec<usize> = Vec::new();
+        let dark_kills: Vec<usize> = Vec::new();
         let mut crowd_kills: Vec<usize> = Vec::new();
         // Received L per canopy member (oi, L) for the canopy thin after the light walk.
         let mut canopy_received: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n_layers];
@@ -2274,9 +2470,7 @@ impl World {
                 } else {
                     self.columns[i].occupants[oi].dark_steps = 0;
                 }
-                if self.columns[i].occupants[oi].dark_steps >= T_DARK {
-                    dark_kills.push(oi);
-                }
+                // S19: darkness kills through the energy store, not a step count.
             }
 
             // Herb crowd counter / thin (A_b>1 ⇔ s_b < 1). S15.
@@ -2408,6 +2602,152 @@ impl World {
         let f_w = f_w_growth(&self.columns[i], occ);
         let f_t = f_t_growth(t_air, t_min, t_max);
         f_l * f_w * f_t * occ.height_frac
+    }
+
+    /// S19 nutrient stores: for every living occupant iterate its need list; recharge from the
+    /// need's source, spend use·dt, clamp to capacity(height_frac). Any empty store kills; the
+    /// remainder returns to its source pool (water → top soil, soil pools → pool, air → air).
+    fn apply_stores_ids(&mut self, ids: &[usize]) {
+        for &i in ids {
+            self.apply_stores_at(i);
+        }
+    }
+
+    fn apply_stores_at(&mut self, i: usize) {
+        let dt = self.tick_dt;
+        let h_surf = self.columns[i].surface_water_m;
+        let mut deaths: Vec<(usize, Option<NutrientSource>)> = Vec::new();
+        for oi in 0..self.columns[i].occupants.len() {
+            if !self.columns[i].occupants[oi].alive {
+                continue;
+            }
+            // Occupant traits for source checks.
+            let (height_m, l_min) = {
+                let o = &self.columns[i].occupants[oi];
+                match o.taxon_id.as_deref().and_then(|t| self.catalog.get(t).ok()) {
+                    Some(p) => (
+                        effective_height_m(p) * o.height_frac.clamp(0.0, 1.0),
+                        l_min_for_form(p.form),
+                    ),
+                    None => (f64::INFINITY, l_min_for_form(Form::Herb)),
+                }
+            };
+            let submerged = h_surf >= height_m;
+            let hf = self.columns[i].occupants[oi].height_frac;
+            let band = self.columns[i].occupants[oi].band_scale;
+            let light = self.columns[i].occupants[oi].last_light;
+            let takes_dissolved = self.columns[i].occupants[oi].takes_dissolved;
+            let water_taken = self.columns[i].occupants[oi].water_taken;
+            self.columns[i].occupants[oi].water_taken = 0.0;
+            let n_needs = self.columns[i].occupants[oi].needs.len();
+            // A store already empty at step start (e.g. emptied externally) kills now,
+            // before any recharge or spend this step.
+            let pre_empty = self.columns[i].occupants[oi]
+                .needs
+                .iter()
+                .find(|n| n.use_per_day > 0.0 && n.store <= 0.0)
+                .map(|n| n.source);
+            if pre_empty.is_some() {
+                deaths.push((oi, pre_empty));
+                continue;
+            }
+            let mut empty: Option<NutrientSource> = None;
+            for ni in 0..n_needs {
+                let (id, source, use_d, cap, store) = {
+                    let n = &self.columns[i].occupants[oi].needs[ni];
+                    (n.id.clone(), n.source, n.use_per_day, n.capacity(hf), n.store.min(n.capacity(hf)))
+                };
+                if use_d <= 0.0 {
+                    continue; // a zero-use need is not required
+                }
+                let spend = match source {
+                    NutrientSource::SoilWater => use_d * band * dt,
+                    _ => use_d * dt,
+                };
+                let want = spend + (cap - store).max(0.0);
+                let recharge = match source {
+                    NutrientSource::SoilWater => water_taken,
+                    NutrientSource::Light => {
+                        if light.map_or(true, |l| l >= l_min) {
+                            want
+                        } else {
+                            0.0
+                        }
+                    }
+                    NutrientSource::Air => {
+                        if !submerged {
+                            let pool = self.air.entry(id.clone()).or_insert(0.0);
+                            let t = want.min(*pool).max(0.0);
+                            *pool -= t;
+                            t
+                        } else if takes_dissolved && h_surf > 0.0 {
+                            let pool = self.columns[i].dissolved.entry(id.clone()).or_insert(0.0);
+                            let t = want.min(*pool).max(0.0);
+                            *pool -= t;
+                            t
+                        } else {
+                            0.0
+                        }
+                    }
+                    NutrientSource::SoilPool => {
+                        let pool = self.columns[i].soil_pools.entry(id.clone()).or_insert(0.0);
+                        let t = want.min(*pool).max(0.0);
+                        *pool -= t;
+                        t
+                    }
+                };
+                let next = (store + recharge - spend).min(cap);
+                let n = &mut self.columns[i].occupants[oi].needs[ni];
+                n.last_delta = next - store;
+                n.store = next.max(0.0);
+                if next <= 1e-12 * use_d.max(1e-12) && empty.is_none() {
+                    empty = Some(source);
+                }
+            }
+            if empty.is_some() {
+                deaths.push((oi, empty));
+            }
+        }
+        if deaths.is_empty() {
+            return;
+        }
+        for (oi, src) in deaths.iter().rev() {
+            match src {
+                Some(NutrientSource::Light) => self.light_reject[i] = LightReject::Dark,
+                Some(NutrientSource::Air) => self.hydro_reject[i] = HydroReject::Submerged,
+                _ => {}
+            }
+            let occ = self.columns[i].occupants.remove(*oi);
+            self.return_stores(i, &occ);
+        }
+        self.wake_idx(i);
+    }
+
+    /// Death return: water → top soil layer (un-extract), soil pools → pool, air → air. S19.
+    fn return_stores(&mut self, i: usize, occ: &Occupant) {
+        for n in &occ.needs {
+            let r = n.store.max(0.0);
+            if r <= 0.0 {
+                continue;
+            }
+            match n.source {
+                NutrientSource::SoilWater => {
+                    if let Some(top) = self.columns[i].layers.first_mut() {
+                        if top.thickness_m > 0.0 {
+                            top.theta += r / top.thickness_m;
+                            self.extract_lost -= r;
+                        }
+                    }
+                }
+                NutrientSource::SoilPool => {
+                    *self.columns[i].soil_pools.entry(n.id.clone()).or_insert(0.0) += r;
+                }
+                NutrientSource::Air => {
+                    *self.air.entry(n.id.clone()).or_insert(0.0) += r;
+                }
+                NutrientSource::Light => {}
+            }
+        }
     }
 
     /// Growth clock on live visit set (once per live tick, after light). S14.
@@ -2555,6 +2895,7 @@ impl World {
     /// When any living occupant is present, light runs every calendar block so the crowd
     /// counter matches live per-block cadence; empty work sets skip the O(n) light walk.
     /// L held for the block via last_light; θ/T from current catch_up aggregates.
+    #[allow(dead_code)]
     fn apply_catchup_light_and_growth(&mut self, ids: &[usize]) {
         if ids.is_empty() {
             return;
@@ -2576,13 +2917,10 @@ impl World {
         self.clock.advance();
     }
 
-    /// Full tick: infiltrate → pond → soil → lake_snap → at_rest/awake prune; advance clock;
-    /// if clock.tick % N_ET == 0: ET → occupants → lake_snap → rest/awake again (S05/S06/S08).
-    /// S08: hydro visits only the awake set. S04 sleep integrated via awake prune.
-    /// S04.1: soil flux capped by unused pore room; lake snap after soil.
-    /// S05/S06: sink cadence after advance; ticks 10,20,… run one ET+occupant step.
+    /// Full step (S19): elapsed += dt; rain r·dt; hydro; clock += 1; then on the visit set
+    /// ET → uptake → lake_snap → climate(T) → waterlog → light → growth → stores → seed.
+    /// No rule reads the step count.
     pub fn tick(&mut self) {
-        // S18: one clock — every live tick advances dt; continuous rain first.
         self.elapsed_dt += self.tick_dt;
         self.apply_continuous_rain_live();
         // S10: fully ignored + asleep worlds must stay wall-clock cheap (no O(n) scans).
@@ -2592,6 +2930,7 @@ impl World {
             for ch in &mut self.chunks {
                 ch.t_away = ch.t_away.saturating_add(1);
             }
+            self.seed_day_acc += self.tick_dt;
             return;
         }
 
@@ -2604,96 +2943,67 @@ impl World {
                 ch.t_away = ch.t_away.saturating_add(1);
             }
         }
+        let ids = self.visit_indices();
+        self.sink_and_life_ids(&ids, false);
+    }
 
-        // S05/S06 sink batch: after advance, when tick is a multiple of N_ET.
-        // S09: sinks only on observed ∪ awake (same visit set as hydro).
-        if self.clock.tick % N_ET == 0 {
-            let ids = self.visit_indices();
-            if !ids.is_empty() {
-                let mut sink_busy: HashSet<usize> = HashSet::new();
-                self.et_pass_ids(&mut sink_busy, &ids);
-                self.occupant_pass_ids(&mut sink_busy, &ids);
-                self.lake_snap_ids(&ids);
-                for &i in &ids {
-                    let is_busy = sink_busy.contains(&i);
-                    self.at_rest[i] = !is_busy;
-                    if is_busy {
-                        self.wake_one(i);
-                    }
-                }
-                self.prune_awake();
-            }
+    /// S19 shared step tail (live and catch_up): sinks every step, then filters, growth,
+    /// nutrient stores and seed attempts (one per elapsed day).
+    fn sink_and_life_ids(&mut self, ids: &[usize], catchup: bool) {
+        self.seed_day_acc += self.tick_dt;
+        let n_seed = (self.seed_day_acc + 1e-9).floor().max(0.0);
+        self.seed_day_acc = (self.seed_day_acc - n_seed).max(0.0);
+        if ids.is_empty() {
+            return;
         }
-        // S12.1/S13.1/S14: live climate = T only; hydro + light + growth on visit set.
-        let climate_ids = self.visit_indices();
-        if !climate_ids.is_empty() {
-            self.apply_climate_filter_ids(&climate_ids, false);
-            self.apply_hydro_filter_ids(&climate_ids);
-            self.apply_light_filter_ids(&climate_ids);
-            // Growth once per live tick after light (uses last_light). Not on sink cadence.
-            self.apply_growth_ids(&climate_ids);
-            // S16: seed rain once per live tick after growth/compress/thin.
-            self.apply_seed_rain_ids(&climate_ids);
+        let mut sink_busy: HashSet<usize> = HashSet::new();
+        self.et_pass_ids(&mut sink_busy, ids);
+        self.occupant_pass_ids(&mut sink_busy, ids);
+        self.lake_snap_ids(ids);
+        // S19: sinks run every step and do not touch the rest flag (hydro owns rest/awake;
+        // observed cells are visited every step regardless, ignored chunks use catch_up).
+        let _ = sink_busy;
+        self.apply_climate_filter_ids(ids, catchup);
+        self.apply_hydro_filter_ids(ids);
+        let any_alive = ids.iter().any(|&i| self.columns[i].occupants.iter().any(|o| o.alive));
+        if any_alive {
+            self.apply_light_filter_ids(ids);
+            self.apply_growth_ids(ids);
+            self.apply_stores_ids(ids);
+            let n = (n_seed as usize).min(MAX_OCCUPANTS);
+            for _ in 0..n {
+                self.apply_seed_rain_ids(ids);
+            }
         }
     }
 
-    /// S09.1 catch-up facsimile: K calendar blocks of unobserved climate.
-    /// Order: optional source dump → for each of K: ≤N_ET hydro then one unit sink.
-    /// Do not hydro-to-rest before the first sink. Calendar advances by K * N_ET.
-    /// When already at rest and rain_per_step == 0, inner hydro loops are empty and
-    /// sinks match K live unit sink-steps (exact θ/h/et/extract).
+    /// S19 catch-up: optional source dump (K·rain_per_step), then K of the same step as a
+    /// live step over every cell (climate adds rain_year). Clock += K; elapsed += K·dt.
     pub fn catch_up(&mut self, k: u32, rain_per_step: f64) {
         debug_assert!(rain_per_step >= 0.0, "rain_per_step must be non-negative");
-        let k_u = k as u64;
         let n = self.columns.len();
-
-        // 1. Optional source: every cell h += K * rain_per_step; wake cell + neighbors.
-        // S18: plus continuous rain for the K·N_ET ticks this stands in for.
-        if k > 0 {
-            let cont = (k_u * N_ET) as f64 * self.rain_per_tick_m;
-            let add = (k as f64) * rain_per_step + cont;
-            if add > 0.0 {
+        if k > 0 && rain_per_step > 0.0 {
+            let add = (k as f64) * rain_per_step;
+            for i in 0..n {
+                self.columns[i].surface_water_m += add;
+                self.wake_idx(i);
+            }
+        }
+        let all_ids: Vec<usize> = (0..n).collect();
+        for _ in 0..k {
+            self.elapsed_dt += self.tick_dt;
+            let r = self.rain_per_day_m * self.tick_dt;
+            if r > 0.0 {
                 for i in 0..n {
-                    self.columns[i].surface_water_m += add;
-                    self.rain_added_m += cont;
+                    self.columns[i].surface_water_m += r;
+                    self.rain_added_m += r;
                     self.wake_idx(i);
                 }
             }
+            self.hydro_step();
+            self.clock.advance();
+            self.sink_and_life_ids(&all_ids, true);
         }
-
-        // 2. K calendar blocks — interleave hydro and unit sinks (no settle-first).
-        for _ in 0..k {
-            for _ in 0..N_ET {
-                if self.awake_count() == 0 {
-                    break;
-                }
-                self.hydro_step();
-                let hydro_ids = self.visit_indices();
-                if !hydro_ids.is_empty() {
-                    self.apply_hydro_filter_ids(&hydro_ids);
-                }
-            }
-            // S14.1: after hydro (θ aggregates), before sinks — one light if needed, one growth.
-            let all_ids: Vec<usize> = (0..self.columns.len()).collect();
-            self.apply_catchup_light_and_growth(&all_ids);
-            let mut sink_busy = vec![false; n];
-            self.et_pass(&mut sink_busy, None);
-            self.occupant_pass(&mut sink_busy, None);
-            // S12.1: catch_up climate = T + rain_year.
-            self.apply_climate_filter_ids(&all_ids, true);
-            self.lake_snap();
-            for i in 0..n {
-                self.at_rest[i] = !sink_busy[i];
-                if sink_busy[i] {
-                    self.wake_one(i);
-                }
-            }
-            self.prune_awake();
-        }
-
-        // 3. Calendar: K sink-steps ≡ K * N_ET hydro ticks (S18: K·N_ET·dt of time).
-        self.clock.tick = self.clock.tick.saturating_add(k_u.saturating_mul(N_ET));
-        self.elapsed_dt += (k_u * N_ET) as f64 * self.tick_dt;
     }
 
     /// Hydro-only step (no clock, no ET): visit = observed ∪ awake. S09.
@@ -2908,10 +3218,10 @@ impl World {
                 );
                 let shade_factor = 1.0 - c;
                 if col.surface_water_m > 0.0 {
-                    let e_eff = E_OPEN * shade_factor * self.tick_dt;
+                    let e_eff = E_OPEN * SINK_PER_DAY * self.et_scale * shade_factor * self.tick_dt;
                     (col.surface_water_m.min(e_eff), true)
                 } else if let Some(top) = col.layers.first() {
-                    let e_eff = E_SOIL * shade_factor * self.tick_dt;
+                    let e_eff = E_SOIL * SINK_PER_DAY * self.et_scale * shade_factor * self.tick_dt;
                     ((top.theta * top.thickness_m).min(e_eff), false)
                 } else {
                     (0.0, false)
@@ -2947,9 +3257,18 @@ impl World {
                 if !self.columns[i].occupants[oi].alive {
                     continue;
                 }
-                let u = self.columns[i].occupants[oi].uptake_max
-                    * self.columns[i].occupants[oi].band_scale
-                    * self.tick_dt;
+                let u = {
+                    let o = &self.columns[i].occupants[oi];
+                    // S19: per-day uptake plus refill of the water store deficit.
+                    let base = o.uptake_max * SINK_PER_DAY * o.band_scale * self.tick_dt;
+                    let deficit = o
+                        .needs
+                        .iter()
+                        .find(|n| n.source == NutrientSource::SoilWater)
+                        .map(|n| (n.capacity(o.height_frac) - n.store).max(0.0))
+                        .unwrap_or(0.0);
+                    base + deficit
+                };
                 let root = root_access(&self.columns[i], &self.columns[i].occupants[oi]);
                 let mut taken = 0.0f64;
                 for k in 0..N_LAYERS {
@@ -2980,9 +3299,8 @@ impl World {
                 } else {
                     self.columns[i].occupants[oi].dry_steps = 0;
                 }
-                if self.columns[i].occupants[oi].dry_steps >= T_WILT {
-                    self.columns[i].occupants[oi].alive = false;
-                }
+                // S19: death is the water store emptying (store pass), not a dry count.
+                self.columns[i].occupants[oi].water_taken = taken;
                 cell_taken += taken;
             }
             if cell_taken > self.v_rest {
@@ -3861,10 +4179,10 @@ impl World {
                 );
                 let shade_factor = 1.0 - c;
                 if col.surface_water_m > 0.0 {
-                    let e_eff = E_OPEN * shade_factor * self.tick_dt;
+                    let e_eff = E_OPEN * SINK_PER_DAY * self.et_scale * shade_factor * self.tick_dt;
                     (col.surface_water_m.min(e_eff), true)
                 } else if let Some(top) = col.layers.first() {
-                    let e_eff = E_SOIL * shade_factor * self.tick_dt;
+                    let e_eff = E_SOIL * SINK_PER_DAY * self.et_scale * shade_factor * self.tick_dt;
                     ((top.theta * top.thickness_m).min(e_eff), false)
                 } else {
                     (0.0, false)
@@ -3910,9 +4228,18 @@ impl World {
                 if !self.columns[i].occupants[oi].alive {
                     continue;
                 }
-                let u = self.columns[i].occupants[oi].uptake_max
-                    * self.columns[i].occupants[oi].band_scale
-                    * self.tick_dt;
+                let u = {
+                    let o = &self.columns[i].occupants[oi];
+                    // S19: per-day uptake plus refill of the water store deficit.
+                    let base = o.uptake_max * SINK_PER_DAY * o.band_scale * self.tick_dt;
+                    let deficit = o
+                        .needs
+                        .iter()
+                        .find(|n| n.source == NutrientSource::SoilWater)
+                        .map(|n| (n.capacity(o.height_frac) - n.store).max(0.0))
+                        .unwrap_or(0.0);
+                    base + deficit
+                };
                 let root = root_access(&self.columns[i], &self.columns[i].occupants[oi]);
                 let mut taken = 0.0f64;
                 for k in 0..N_LAYERS {
@@ -3943,9 +4270,8 @@ impl World {
                 } else {
                     self.columns[i].occupants[oi].dry_steps = 0;
                 }
-                if self.columns[i].occupants[oi].dry_steps >= T_WILT {
-                    self.columns[i].occupants[oi].alive = false;
-                }
+                // S19: death is the water store emptying (store pass), not a dry count.
+                self.columns[i].occupants[oi].water_taken = taken;
                 cell_taken += taken;
             }
             if cell_taken > self.v_rest {

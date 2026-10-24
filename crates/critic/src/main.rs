@@ -1,7 +1,7 @@
 //! S17/S17.2 critic window (egui). Narrow widths stack and wrap. Formats text only; every number comes from `Critic::query_tile`.
 
-use critic::{fmt_sim_time, reason, Critic, HeightChoice, LayerKind, TickUnit, RAIN_STEP_M};
-use sim_core::STRESS_THRESHOLDS;
+use critic::{fmt_sim_time, reason, store_line, Critic, HeightChoice, LayerKind, TickUnit, RAIN_STEP_M};
+use sim_core::{NUTRIENT_IDS, STRESS_THRESHOLDS};
 use eframe::egui;
 
 struct App {
@@ -14,7 +14,7 @@ struct App {
     show_key: bool,
     /// S18 text size (egui zoom factor).
     text_scale: f32,
-    /// S18 continuous rain, mm per tick (UI copy of the kernel setting).
+    /// S19 continuous rain, mm per day (UI copy of the kernel setting).
     rain_mm: f64,
 }
 
@@ -63,7 +63,7 @@ impl App {
             ui.add(egui::Slider::new(&mut self.text_scale, 0.75..=2.5).step_by(0.05).suffix("×"));
         });
         ui.horizontal_wrapped(|ui| {
-            ui.label("Tick =");
+            ui.label("Step =");
             let cur = self.critic.tick_unit();
             for u in [TickUnit::Second, TickUnit::Day, TickUnit::Month, TickUnit::Year] {
                 if ui.radio(cur == u, u.label()).clicked() && cur != u {
@@ -72,9 +72,9 @@ impl App {
             }
         });
         ui.horizontal_wrapped(|ui| {
-            ui.label("Rain per tick:");
-            if ui.add(egui::DragValue::new(&mut self.rain_mm).range(0.0..=500.0).speed(0.1).suffix(" mm")).changed() {
-                self.critic.set_rain_per_tick_m(self.rain_mm / 1000.0);
+            ui.label("Rain:");
+            if ui.add(egui::DragValue::new(&mut self.rain_mm).range(0.0..=500.0).speed(0.1).suffix(" mm/day")).changed() {
+                self.critic.set_rain_per_day_m(self.rain_mm / 1000.0);
             }
         });
         ui.horizontal_wrapped(|ui| height_row(ui, self));
@@ -150,16 +150,21 @@ impl eframe::App for App {
                         for (counter, name, v) in STRESS_THRESHOLDS {
                             ui.label(format!("{counter} n/{v}: steps toward {name}={v}"));
                         }
+                        ui.strong("Nutrient stores (% of capacity; ↓ = fell last step; any store at 0% kills)");
+                        ui.label(format!("ids: {}", NUTRIENT_IDS.join(", ")));
+                        ui.label("water: soil water reached by roots; energy: canopy light; co2: air (under water only dissolved CO2, for plants that take it); nitrogen: soil pool");
                         ui.label("dry: no water taken; dark: below minimum light; waterlogged: saturated soil; submerged: under pond; crowded: layer A > 1, weakest thinned");
                     });
                 }
                 let q = self.critic.query_tile();
                 ui.separator();
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(format!("tick {}", q.tick));
-                    ui.label(format!("time {}", fmt_sim_time(q.sim_time_s)));
-                    ui.label(format!("tick = {}", self.critic.tick_unit().label()));
-                    ui.label(format!("rain/tick {:.1} mm", q.rain_per_tick_m * 1000.0));
+                    ui.label(format!("elapsed {}", fmt_sim_time(q.sim_time_s)));
+                    ui.label(format!("step = {}", self.critic.tick_unit().label()));
+                    ui.label(format!("rain {:.1} mm/day", q.rain_per_day_m * 1000.0));
+                    for (id, v) in &q.soil_pools {
+                        ui.label(format!("soil {id} {v:.2}"));
+                    }
                     ui.label(format!("living {}/{}", q.living, q.cap));
                     ui.label(format!("pond {:.4} m", q.pond_m));
                     for (i, (th, fc)) in q.layers.iter().enumerate() {
@@ -197,6 +202,9 @@ impl eframe::App for App {
                                 (None, Some(k)) => format!("roots → layer{k}"),
                                 _ => "roots -".into(),
                             });
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("stores: {}", store_line(&o)));
                         });
                         ui.horizontal_wrapped(|ui| {
                             let th = STRESS_THRESHOLDS;

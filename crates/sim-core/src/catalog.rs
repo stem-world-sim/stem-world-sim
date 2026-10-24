@@ -96,6 +96,10 @@ pub struct OccupantParams {
     pub shade: ShadeClass,
     /// Presence mask derived from `root_depth_m` / form (not normalized weights).
     pub root_mask: [f64; N_LAYERS],
+    /// S19 optional `fertility` (low|moderate|high) → nitrogen demand.
+    pub fertility: Option<String>,
+    /// S19 optional `takes_dissolved` (1 = can recharge air nutrients from water).
+    pub takes_dissolved: bool,
 }
 
 impl OccupantParams {
@@ -116,6 +120,25 @@ impl OccupantParams {
         occ.drain_ok = self.drain_ok.clone();
         occ.height_frac = 1.0;
         occ.root_depth_max_m = self.root_depth_m;
+        occ.takes_dissolved = self.takes_dissolved;
+        occ.needs.push(crate::Need::new(
+            crate::NUT_ENERGY,
+            crate::NutrientSource::Light,
+            crate::USE_ENERGY,
+            crate::CAP_DAYS_ENERGY,
+        ));
+        occ.needs.push(crate::Need::new(
+            crate::NUT_CO2,
+            crate::NutrientSource::Air,
+            crate::USE_CO2,
+            crate::CAP_DAYS_CO2,
+        ));
+        occ.needs.push(crate::Need::new(
+            crate::NUT_NITROGEN,
+            crate::NutrientSource::SoilPool,
+            crate::nitrogen_use_for_fertility(self.fertility.as_deref()),
+            crate::CAP_DAYS_NITROGEN,
+        ));
         occ
     }
 
@@ -204,6 +227,9 @@ impl Catalog {
         let i_shade = cols.iter().position(|c| c.as_str() == "shade");
         // S17.2: optional common_name column.
         let i_common = cols.iter().position(|c| c.as_str() == "common_name");
+        // S19: optional fertility / takes_dissolved columns.
+        let i_fert = cols.iter().position(|c| c.as_str() == "fertility");
+        let i_diss = cols.iter().position(|c| c.as_str() == "takes_dissolved");
 
         let mut by_id = HashMap::new();
         for (lineno, line) in lines.enumerate() {
@@ -249,6 +275,8 @@ impl Catalog {
                     None => ShadeClass::Empty,
                 },
                 root_mask,
+                fertility: i_fert.and_then(|i| opt_string(get(i))),
+                takes_dissolved: i_diss.map(|i| get(i).trim() == "1").unwrap_or(false),
             };
             if by_id.insert(taxon_id.clone(), params).is_some() {
                 return Err(CatalogError::Parse(format!(
