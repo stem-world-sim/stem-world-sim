@@ -209,6 +209,7 @@ fn d0_rain_fits_in_pores_surface_dries() {
 #[test]
 fn d0_rain_exceeds_pores_remainder_ponds() {
     let mut world = World::new(5, default_column(0.1, 0.4));
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let pore0 = world.remaining_pore_capacity_m();
     let r = pore0 + 0.15;
     assert!(r > pore0);
@@ -293,6 +294,7 @@ fn i4_disconnected_dry_stays_dry() {
         field_capacity_column(100.0, 0.0), // no mobile water → no gravity drain
     ];
     let mut world = World::grid(13, 3, 1, cols);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let m_isolated0 = world.water_mass_at(2, 0);
     assert_approx_eq(m_isolated0, world.water_mass_at(2, 0), "baseline");
     assert!(world.surface_water_m_at(2, 0) <= MASS_EPSILON);
@@ -355,6 +357,7 @@ fn d1_no_uphill_creation() {
         saturated_column(5.0, 0.4),       // low with pond
     ];
     let mut world = World::grid(19, 2, 1, cols);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let m_high0 = world.water_mass_at(0, 0);
 
     for _ in 0..8 {
@@ -376,6 +379,7 @@ fn d1_flat_equal_H_no_net_drain() {
     let z = 7.0;
     let cols = vec![saturated_column(z, h), saturated_column(z, h)];
     let mut world = World::grid(23, 2, 1, cols);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let m0_a = world.water_mass_at(0, 0);
     let m0_b = world.water_mass_at(1, 0);
     let surf0_a = world.surface_water_m_at(0, 0);
@@ -408,6 +412,7 @@ fn d1_flat_pair_equalizes_no_oscillation() {
         saturated_column(z, 0.0),  // B — dry
     ];
     let mut world = World::grid(31, 2, 1, cols);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let m0 = world.grid_water_mass();
 
     // Half-drop + R_max: equalizes in a few ticks. Stay < N_ET so ET does not eat the pond.
@@ -504,6 +509,7 @@ fn d3_infiltrate_respects_I_max() {
     let tex = Texture::Sand;
     let i_max = tex.i_max();
     let mut world = World::new(103, textured_column(0.0, 0.0, 0.1, tex));
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let soil0 = world.column_at(0, 0).soil_water_mass();
     let r = 1.0; // large rain
     world.add_rain(r);
@@ -535,6 +541,7 @@ fn d3_hill_soil_drains_to_valley() {
         textured_column(5.0, 0.0, fc, tex),   // low at θ_fc (unused pores)
     ];
     let mut world = World::grid(107, 2, 1, cols);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let m0 = world.grid_water_mass();
     let m_low0 = world.water_mass_at(1, 0);
     let theta_high0: Vec<f64> = world
@@ -581,6 +588,7 @@ fn d3_below_fc_does_not_drain() {
         textured_column(5.0, 0.0, fc, tex),  // low at field capacity
     ];
     let mut world = World::grid(109, 2, 1, cols);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let m_high0 = world.water_mass_at(0, 0);
     let m0 = world.grid_water_mass();
 
@@ -608,6 +616,7 @@ fn d3_no_soil_drain_uphill() {
         textured_column(5.0, 0.0, phi, tex),       // low saturated
     ];
     let mut world = World::grid(113, 2, 1, cols);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let m_high0 = world.water_mass_at(0, 0);
     let soil_high0 = world.column_at(0, 0).soil_water_mass();
     let m0 = world.grid_water_mass();
@@ -681,6 +690,7 @@ fn d31_equal_z_mobile_shares() {
         textured_column(z, 0.0, fc, tex),  // B at field capacity
     ];
     let mut world = World::grid(131, 2, 1, cols);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let m0 = world.grid_water_mass();
     let theta_a0: Vec<f64> = world
         .column_at(0, 0)
@@ -775,6 +785,7 @@ fn d31_equal_z_below_fc_no_share() {
         textured_column(z, 0.0, fc * 0.5, tex), // B drier
     ];
     let mut world = World::grid(137, 2, 1, cols);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let m_a0 = world.water_mass_at(0, 0);
     let soil_a0 = world.column_at(0, 0).soil_water_mass();
     let mobile_a0 = world.column_at(0, 0).mobile_water_m();
@@ -809,6 +820,7 @@ fn d31_downslope_beats_equal_z() {
         textured_column(5.0, 0.0, fc, tex),   // (1,1) valley
     ];
     let mut world = World::grid(139, 2, 2, cols);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let m0 = world.grid_water_mass();
     let m_eq0 = world.water_mass_at(1, 0);
     let mobile_eq0 = world.column_at(1, 0).mobile_water_m();
@@ -907,6 +919,7 @@ fn d32_no_percolate_below_fc() {
         ],
     );
     let mut world = World::new(151, col);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let top_m0 = world.column_at(0, 0).layers[0].water_mass();
     let top_theta0 = world.column_at(0, 0).layers[0].theta;
     let m0 = world.water_mass();
@@ -1039,6 +1052,7 @@ fn d33_steep_face_does_not_empty_in_one_tick() {
         saturated_column(0.0, 0.0),  // low
     ];
     let mut world = World::grid(173, 2, 1, cols);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let h0 = world.surface_water_m_at(0, 0);
     let m0 = world.grid_water_mass();
     assert!((h0 - pond).abs() <= MASS_EPSILON);
@@ -1104,6 +1118,7 @@ fn d33_drowned_lake_heads_equalize_no_oscillation() {
         saturated_column(0.0, h_low0),
     ];
     let mut world = World::grid(181, 2, 1, cols);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let m0 = world.grid_water_mass();
     let dh0 = (world.column_at(0, 0).head() - world.column_at(1, 0).head()).abs();
     assert!(dh0 > MASS_EPSILON, "start with a small head gap");
@@ -1160,6 +1175,7 @@ fn d33_equal_H_no_flux() {
         Column::new(9.0, 2.0, vec![]),
     ];
     let mut world = World::grid(191, 2, 1, cols);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let m_a0 = world.water_mass_at(0, 0);
     let m_b0 = world.water_mass_at(1, 0);
     let h_a0 = world.surface_water_m_at(0, 0);
@@ -1232,6 +1248,7 @@ fn d331_drowned_lake_no_period2() {
         Column::new(0.0, 8.20, vec![]),
     ];
     let mut world = World::grid(3312, 2, 1, cols_pair);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let m0 = world.grid_water_mass();
     let dh0 = (world.column_at(0, 0).head() - world.column_at(1, 0).head()).abs();
     assert!(dh0 > H_REST, "start with head gap above H_REST");
@@ -1284,6 +1301,7 @@ fn d331_drowned_lake_no_period2() {
         Column::new(8.0, 0.30, vec![]), // B H=8.30 (lower donor)
     ];
     let mut w3 = World::grid(3313, 3, 1, cols3);
+    w3.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let m3 = w3.grid_water_mass();
     let dh3_0 = (w3.column_at(0, 0).head() - w3.column_at(1, 0).head()).abs();
     let mut v_hist = Vec::with_capacity(41);
@@ -1321,6 +1339,7 @@ fn d4_pond_below_H_rest_no_flux() {
         Column::new(0.0, 0.10, vec![]),
     ];
     let mut world = World::grid(401, 2, 1, cols);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let h_a0 = world.surface_water_m_at(0, 0);
     let h_b0 = world.surface_water_m_at(1, 0);
     let dh = (world.column_at(0, 0).head() - world.column_at(1, 0).head()).abs();
@@ -1349,6 +1368,7 @@ fn d4_drowned_lake_reaches_rest() {
         mk(8.0, 0.21), // (2,1) H=8.21
     ];
     let mut world = World::grid(404, 3, 2, cols);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let m0 = world.grid_water_mass();
 
     let mut reached = false;
@@ -1419,6 +1439,7 @@ fn d4_rain_wakes_rest() {
         saturated_column(z, h),
     ];
     let mut world = World::grid(405, 2, 2, cols);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     for _ in 0..8 {
         world.tick();
     }
@@ -1486,6 +1507,7 @@ fn d41_no_soil_into_full() {
         textured_column(z, 0.0, sand.porosity(), sand), // receiver: both layers at φ
     ];
     let mut world = World::grid(411, 2, 1, cols);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let theta_recv0: Vec<f64> = world
         .column_at(1, 0)
         .layers
@@ -1535,6 +1557,7 @@ fn d41_valley_lake_snaps() {
         saturated_column(z, 1.99),
     ];
     let mut world = World::grid(412, 3, 1, cols);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     let dh01 = (world.column_at(0, 0).head() - world.column_at(1, 0).head()).abs();
     let dh12 = (world.column_at(1, 0).head() - world.column_at(2, 0).head()).abs();
     let dh02 = (world.column_at(0, 0).head() - world.column_at(2, 0).head()).abs();
@@ -1615,11 +1638,9 @@ fn d41_high_dry_not_in_valley_component() {
 
 /// Advance until the next ET-step completes (clock.tick % N_ET == 0 after tick).
 fn tick_through_next_et(world: &mut World) {
-    loop {
+    // S19 amend: no gate; N_ET daily sink steps sum to one legacy sink batch.
+    for _ in 0..N_ET {
         world.tick();
-        if world.tick_count() % N_ET == 0 {
-            break;
-        }
     }
 }
 
@@ -1738,34 +1759,25 @@ fn d5_bot_untouched() {
 /// D5: N_et hydro ticks with no ET-step in between; M unchanged until the ET tick.
 #[test]
 fn d5_batch_not_every_tick() {
+    // S19 amend: the N_ET batch gate is gone. ET runs every step at E/N_ET per day, so
+    // N_ET daily steps still remove one legacy batch (E_OPEN) from a pond.
     let mut world = World::new(505, saturated_column(0.0, 0.25));
     let m0 = world.grid_water_mass();
     assert_eq!(world.tick_count(), 0);
     assert_approx_eq(world.et_lost(), 0.0, "no ET yet");
 
-    // Ticks 1..N_ET-1: hydro only, no ET.
-    for i in 1..N_ET {
+    for i in 1..=N_ET {
         world.tick();
         assert_eq!(world.tick_count(), i);
-        assert_approx_eq(world.et_lost(), 0.0, &format!("no ET before tick {N_ET}"));
-        assert_mass_close(world.grid_water_mass(), m0);
+        assert_approx_eq(
+            world.et_lost(),
+            E_OPEN * i as f64 / N_ET as f64,
+            &format!("ET every step (tick {i})"),
+        );
         assert_mass_close(closed_mass(&world), m0);
     }
-
-    // Tick N_ET: ET fires.
-    world.tick();
-    assert_eq!(world.tick_count(), N_ET);
-    assert!(
-        world.et_lost() > V_REST,
-        "ET-step at tick {N_ET} should evaporate, et_lost={}",
-        world.et_lost()
-    );
-    assert!(
-        world.grid_water_mass() < m0 - V_REST,
-        "on-grid M should drop on the ET tick"
-    );
-    assert_mass_close(closed_mass(&world), m0);
-    assert_approx_eq(world.et_lost(), E_OPEN, "one pond ET-step takes E_OPEN");
+    assert!(world.grid_water_mass() < m0 - V_REST, "on-grid M drops");
+    assert_approx_eq(world.et_lost(), E_OPEN, "N_ET daily steps take E_OPEN");
 }
 
 /// D5: rain then ET; M + et_lost == initial + rain.
@@ -2045,7 +2057,8 @@ fn d7_one_plant_cuts_pond_et() {
 
     let h1 = world.surface_water_m();
     let expected = 0.75 * E_OPEN;
-    assert_approx_eq(h0 - h1, expected, "one plant pond drop == 0.75*E_OPEN");
+    // S19 amend: daily uptake lets the pond refill soil, so pond drop ≥ ET (ET checked below).
+    assert!(h0 - h1 >= expected - 1e-9, "one plant pond drop == 0.75*E_OPEN");
     assert_approx_eq(world.et_lost(), expected, "et_lost == 0.75*E_OPEN");
     assert_mass_close(closed_mass(&world), m0);
 }
@@ -2065,7 +2078,8 @@ fn d7_two_sum() {
     let c = overlap_cover_from_alphas([0.25, 0.25]);
     assert!((c - 0.4375).abs() < 1e-12);
     let expected = E_OPEN * (1.0 - c);
-    assert_approx_eq(h0 - h1, expected, "two plants pond drop == E*(1-C) product");
+    // S19 amend: daily uptake lets the pond refill soil, so pond drop ≥ ET (ET checked below).
+    assert!(h0 - h1 >= expected - 1e-9, "two plants pond drop == E*(1-C) product");
     assert_approx_eq(world.et_lost(), expected, "et_lost == E*(1-C) product");
     // Sum form would be 0.50*E_OPEN; product is strictly larger remaining ET.
     assert!(expected > 0.50 * E_OPEN + 1e-12);
@@ -2090,7 +2104,8 @@ fn d7_shade_cap_one() {
     assert!(c < 1.0 - 1e-9);
     assert!(c < C_MAX);
     let expected = E_OPEN * (1.0 - c);
-    assert_approx_eq(h0 - h1, expected, "four plants: E*(1-C) product cover");
+    // S19 amend: daily uptake lets the pond refill soil, so pond drop ≥ ET (ET checked below).
+    assert!(h0 - h1 >= expected - 1e-9, "four plants: E*(1-C) product cover");
     assert_approx_eq(world.et_lost(), expected, "et_lost matches product cover");
     assert!(expected > MASS_EPSILON, "product cover must not zero ET at four stubs");
     // Uptake still runs (plants drink soil, not pond).
@@ -2277,7 +2292,7 @@ fn d8_drought_wilt() {
     assert!(world.plant_at(0, 0), "precondition: alive before drought catch_up");
 
     let m0 = closed_mass(&world);
-    world.catch_up(5, 0.0);
+    world.catch_up(5 * N_ET as u32, 0.0); // S19 amend: K daily steps (5 legacy batches)
 
     assert!(
         !world.plant_at(0, 0),
@@ -2306,7 +2321,8 @@ fn d8_rain_fills_then_plants() {
     }
     let h0 = world.surface_water_m_at(2, 0);
     let theta0 = world.layer_theta_at(2, 0, 0);
-    let m_before = world.grid_water_mass();
+    // S19 amend: sinks ran in the 8 warm-up steps, so the books start with et/extract.
+    let m_before = world.grid_water_mass() + world.et_lost() + world.extract_lost();
     let et0 = world.et_lost();
     let ex0 = world.extract_lost();
 
@@ -2368,7 +2384,7 @@ fn d8_drought_matches_live_sinks() {
         tick_through_next_et(&mut live);
     }
 
-    caught.catch_up(k, 0.0);
+    caught.catch_up(k * N_ET as u32, 0.0); // S19 amend: catch_up(K) = K daily steps
 
     assert_approx_eq(
         caught.surface_water_m(),
@@ -2672,7 +2688,7 @@ fn d9_drought_chunk_wilts() {
     let mass_b0 = world.water_mass_at(CHUNK + 1, 1);
 
     world.ignore_chunk(0, 0).expect("A at rest");
-    world.catch_up_chunk(0, 0, 5, 0.0);
+    world.catch_up_chunk(0, 0, 5 * N_ET as u32, 0.0); // S19 amend: K daily steps
 
     assert!(!world.plant_at(1, 1), "plant in A should wilt");
     assert!(world.plant_at(CHUNK + 1, 1), "plant in B stays alive");
@@ -2711,6 +2727,7 @@ fn d9_halo_can_export_pond() {
         })
         .collect();
     let mut world = World::grid(906, w, h, cols);
+    world.set_et_scale(0.0); // S19 amend: hydro-only (ET now runs every step)
     rest_all(&mut world);
 
     let mut valley0 = 0.0;
@@ -2825,7 +2842,7 @@ fn d91_matches_live_100() {
     for _ in 0..100 {
         live.tick();
     }
-    caught.catch_up(10, 0.0);
+    caught.catch_up(100, 0.0); // S19 amend: catch_up(K) = K steps
 
     assert_eq!(live.tick_count(), caught.tick_count(), "calendar advances K*N_ET");
     let tol = 1e-6;
@@ -2899,7 +2916,7 @@ fn d91_rest_drought_still_exact() {
     for _ in 0..k {
         tick_through_next_et(&mut live);
     }
-    caught.catch_up(k, 0.0);
+    caught.catch_up(k * N_ET as u32, 0.0); // S19 amend: catch_up(K) = K daily steps
 
     assert_approx_eq(caught.surface_water_m(), live.surface_water_m(), "h");
     assert_approx_eq(
@@ -3524,8 +3541,9 @@ fn d121_wheat_waterlogs_in_pond() {
     assert!(world.surface_water_m() >= H_POND);
 
     for t in 1..=T_WL {
-        if world.surface_water_m() < H_POND {
-            world.add_rain(H_POND - world.surface_water_m() + 0.01);
+        // S19 amend: daily uptake drains the pond within a step; keep it above H_POND.
+        if world.surface_water_m() < H_POND + 0.02 {
+            world.add_rain(H_POND - world.surface_water_m() + 0.03);
         }
         world.tick();
         if t < T_WL {
@@ -3642,14 +3660,19 @@ fn d121_drought_kills_at_good_rain_year() {
             );
         }
     }
+    // S19 amend: same-cell seedlings are younger; the planted (mature) rice is what wilts.
     assert!(
-        !world.plant_at(0, 0),
+        !world.column_at(0, 0).occupants.iter().any(|o| is_mature(o)),
         "plant should wilt after T_WILT dry sinks despite good rain_year"
     );
     // Wilt leaves occupant (alive=false); not a climate/hydro remove.
     assert_eq!(world.climate_reject(0, 0), ClimateReject::None);
     assert_eq!(world.hydro_reject(0, 0), HydroReject::None);
-    assert!(world.occupant_count(0, 0) >= 1, "wilt keeps occupant slot");
+    // S19 amend: an empty store removes the plant (its remainder returns to the pools).
+    assert!(
+        !world.column_at(0, 0).occupants.iter().any(|o| is_mature(o)),
+        "empty water store removes the plant"
+    );
 }
 
 /// D121: hydro uses catalog drain_ok + height — no species-name branching.
@@ -3975,14 +3998,15 @@ fn d13_et_uses_alpha() {
     );
 
     let h_before = world.surface_water_m();
+    let et_before = world.et_lost(); // S19 amend: ET ran on the warm-up days
     world.tick(); // N_ET: ET then filters
     let h1 = world.surface_water_m();
-    let expected = E_OPEN * (1.0 - c);
+    let expected = E_OPEN * sim_core::SINK_PER_DAY * (1.0 - c); // S19 amend: one daily step
     assert_approx_eq(h_before - h1, expected, "pond ET scaled by overlap C (product)");
-    assert_approx_eq(world.et_lost(), expected, "et_lost matches product C");
-    let sum_expected = E_OPEN * (1.0 - sum_clamp);
+    assert_approx_eq(world.et_lost() - et_before, expected, "et_lost matches product C");
+    let sum_expected = E_OPEN * sim_core::SINK_PER_DAY * (1.0 - sum_clamp);
     assert!(
-        (world.et_lost() - sum_expected).abs() > 1e-6,
+        (world.et_lost() - et_before - sum_expected).abs() > 1e-7,
         "ET must not follow sum-of-alphas shade"
     );
 }
@@ -4277,14 +4301,15 @@ fn d132_eight_oaks_hits_cap() {
         canopy.plant_taxon(0, 0, "quercus_alba").unwrap();
     }
     let h_before = canopy.surface_water_m();
+    let et_before = canopy.et_lost(); // S19 amend: ET ran on the warm-up days
     canopy.tick();
-    let expected_et = E_OPEN * (1.0 - C_MAX);
+    let expected_et = E_OPEN * sim_core::SINK_PER_DAY * (1.0 - C_MAX); // S19 amend: one daily step
     assert_approx_eq(
         h_before - canopy.surface_water_m(),
         expected_et,
         "eight oaks ET uses C_MAX",
     );
-    assert_approx_eq(canopy.et_lost(), expected_et, "et_lost at C_MAX");
+    assert_approx_eq(canopy.et_lost() - et_before, expected_et, "et_lost at C_MAX");
 
     // Understory with 7 oaks (cell full): L = overlap T of 7 oaks.
     for _ in 0..(MAX_OCCUPANTS - 1) {
@@ -4505,7 +4530,8 @@ fn d14_intolerant_prefers_sun() {
     shade.plant_taxon(0, 0, "quercus_alba").unwrap();
     shade.plant_params(0, 0, &pinus_i, H0).unwrap();
 
-    let steps = 40u32;
+    // S19 amend: daily sinks dry the shaded tile (oak + seedlings) by ~day 9; compare before.
+    let steps = 8u32;
     for _ in 0..steps {
         sun.tick();
         shade.tick();
@@ -4535,7 +4561,8 @@ fn d14_tolerant_prefers_gap() {
     sun.set_climate(19.5, 1000.0);
     sun.plant_params(0, 0, &rye_t, H0).unwrap();
 
-    let steps = 15u32;
+    // S19 amend: daily sinks dry the gap tile (oak + seedlings) by ~day 9; compare before.
+    let steps = 8u32;
     for _ in 0..steps {
         gap.tick();
         sun.tick();
@@ -4814,9 +4841,15 @@ fn d141_wilt_block_no_grow() {
 
     world.force_sleep_all();
     ignore_all_chunks(&mut world);
-    world.catch_up(T_WILT, 0.0);
+    world.catch_up(T_WILT * N_ET as u32, 0.0); // S19 amend: K daily steps
 
-    let hf = height_frac_of(&world, 0, 0, "pinus_taeda");
+    // S19 amend: the empty water store removes the pine; absent ⇒ it never grew.
+    let hf = world
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .find(|o| o.taxon_id.as_deref() == Some("pinus_taeda"))
+        .map_or(H0, |o| o.height_frac);
     assert!(
         (hf - H0).abs() < 1e-9,
         "drought catch_up must not grow: frac={hf} expect ~{H0}"
@@ -4979,7 +5012,8 @@ fn d142_xeric_slower_at_fc() {
     assert!((fw_m - 1.0).abs() < 1e-9, "mesic at FC f_w={fw_m}");
 
     // No rain: stay at FC, h_surf=0 so P=0; both share the same θ path.
-    for _ in 0..10u32 {
+    // S19 amend: sinks now run daily, so compare over 3 steps while θ is still ≈ FC.
+    for _ in 0..3u32 {
         w_x.tick();
         w_m.tick();
     }
@@ -5336,7 +5370,10 @@ fn d15_catchup_thins_same_as_live() {
     }
     caught.force_sleep_all();
     ignore_all_chunks(&mut caught);
-    caught.catch_up(T_CROWD, 0.05);
+    // S19 amend: catch_up(1, r) per step = the live rain cadence (one dump of r per step).
+    for _ in 0..T_CROWD {
+        caught.catch_up(1, 0.05);
+    }
 
     // Height≈1 adults only (ignore S16 seedlings). Catch_up sinks can wilt corpses;
     // pre-S16 counted remaining adult rows regardless of alive.
@@ -6239,7 +6276,8 @@ fn d18_continuous_rain_applied_each_tick() {
     w.set_rain_per_tick_m(r);
     assert_eq!(w.rain_per_tick_m(), r);
     w.tick();
-    assert_approx_eq(w.water_mass() - m0, r, "one tick adds r to surface+soil");
+    // S19 amend: sinks run every step, so count ET/extract in the books.
+    assert_approx_eq(w.water_mass() + w.et_lost() + w.extract_lost() - m0, r, "one tick adds r to surface+soil");
     assert_approx_eq(w.rain_added_m(), r, "rain_added after 1 tick");
     for n in 2..=25u32 {
         w.tick();
@@ -6261,6 +6299,10 @@ fn d18_tick_dt_scales_growth_and_et() {
         w.set_tick_dt(dt);
         let p = w.catalog().get("pinus_taeda").unwrap().clone();
         w.plant_params(0, 0, &p, 0.3).unwrap();
+        // S19 amend: sinks now run every step; switch them off so θ (f_w) stays at θ_fc.
+        w.set_et_scale(0.0);
+        w.column_at_mut(0, 0).occupants[0].uptake_max = 0.0;
+        w.column_at_mut(0, 0).occupants[0].needs.clear();
         for _ in 0..9 {
             w.tick();
         }
@@ -6315,7 +6357,7 @@ fn d18_mass_conserved_under_scaled_dt() {
         added += 2.0 * 0.001 * 3.0;
         s18_closed(&w, added + w.rain_added_m());
         assert!(w.et_lost() > 0.0 || dt < 1e-3, "dt={dt}: ET ran");
-        assert_approx_eq(w.sim_time_s(), (60 + 2 * N_ET) as f64 * dt * 86_400.0, "sim time = ticks·dt");
+        assert_approx_eq(w.sim_time_s(), (60 + 2) as f64 * dt * 86_400.0 /* S19 amend: catch_up(K) = K steps */, "sim time = ticks·dt");
     }
 }
 
@@ -6338,11 +6380,13 @@ fn d18_default_dt_matches_prior_behavior() {
     let c = w.column_at(0, 0);
     assert!(c.occupants[0].alive);
     assert_eq!(c.occupants[0].dry_steps, 0);
-    assert_approx_eq(c.occupants[0].height_frac, 4.075770307678128e-1, "pine h_frac");
-    assert_approx_eq(c.layers[0].theta, 8.278077739485262e-2, "θ0");
+    // S19 amend: golden re-cut for daily sinks (S18 golden: h 4.075770307678128e-1,
+    // θ0 8.278077739485262e-2, et 1.0165766781544261e-2; extract 9e-2 unchanged).
+    assert_approx_eq(c.occupants[0].height_frac, 3.953161257342996e-1, "pine h_frac");
+    assert_approx_eq(c.layers[0].theta, 7.536602512612135e-2, "θ0");
     assert_approx_eq(c.layers[1].theta, 4.1e-1, "θ1");
     assert_approx_eq(c.surface_water_m, 0.0, "pond");
-    assert_approx_eq(w.et_lost(), 1.0165766781544261e-2, "et_lost");
+    assert_approx_eq(w.et_lost(), 1.2390192462163671e-2, "et_lost");
     assert_approx_eq(w.extract_lost(), 9e-2, "extract_lost");
     assert_eq!(w.tick_count(), 30);
     assert_approx_eq(w.sim_time_s(), 30.0 * 86_400.0, "30 days");
@@ -6368,7 +6412,7 @@ fn d18_catchup_root_and_rain() {
     }
     caught.force_sleep_all();
     ignore_all_chunks(&mut caught);
-    caught.catch_up(k, 0.0);
+    caught.catch_up(k * N_ET as u32, 0.0); // S19 amend: catch_up(K) = K steps
 
     let depth = live.catalog().get("quercus_alba").unwrap().root_depth_m.unwrap();
     for (label, w) in [("live", &live), ("catch_up", &caught)] {
@@ -6383,4 +6427,227 @@ fn d18_catchup_root_and_rain() {
         let want = if rd > 0.3 { 1 } else { 0 };
         assert_eq!(oak.max_layer, Some(want), "{label} max_layer");
     }
+}
+
+// --- Sprint 19 — clock + generic nutrient stores ----------------------------------
+
+fn s19_mature_count(w: &World, taxon: &str) -> usize {
+    w.column_at(0, 0)
+        .occupants
+        .iter()
+        .filter(|o| o.alive && o.taxon_id.as_deref() == Some(taxon) && (o.height_frac - 1.0).abs() < 1e-9)
+        .count()
+}
+
+/// D19: pond, no plants, tick = 1 day: the pond drops on steps 1, 2 and 3 (no N_ET batch).
+#[test]
+fn d19_sinks_every_step() {
+    let mut w = World::new(1901, saturated_column(0.0, 0.10));
+    assert_eq!(w.tick_dt(), 1.0);
+    let mut h = w.surface_water_m();
+    for step in 1..=3 {
+        w.tick();
+        let h1 = w.surface_water_m();
+        assert!(h1 < h - 1e-12, "pond must drop on step {step}: {h} -> {h1}");
+        h = h1;
+    }
+    assert!(w.et_lost() > 0.0);
+}
+
+/// D19: K live steps and catch_up(K, 0) match pond, stores and elapsed time.
+#[test]
+fn d19_catchup_matches_live() {
+    let mk = || {
+        let mut w = World::new(1902, saturated_column(0.0, 0.05));
+        w.set_climate(20.0, 1000.0);
+        w.plant_taxon(0, 0, "pinus_taeda").unwrap();
+        w.plant_seedling(0, 0, "typha_latifolia").unwrap();
+        w
+    };
+    let k = 25u32;
+    let mut live = mk();
+    let mut caught = mk();
+    for _ in 0..k {
+        live.tick();
+    }
+    caught.catch_up(k, 0.0);
+    assert_eq!(live.tick_count(), caught.tick_count());
+    assert_approx_eq(caught.sim_time_s(), live.sim_time_s(), "elapsed");
+    assert_approx_eq(caught.elapsed_days(), k as f64, "elapsed days = K·dt");
+    assert_approx_eq(caught.surface_water_m(), live.surface_water_m(), "pond");
+    let (a, b) = (&live.column_at(0, 0).occupants, &caught.column_at(0, 0).occupants);
+    assert_eq!(a.len(), b.len(), "occupant count");
+    for (oa, ob) in a.iter().zip(b.iter()) {
+        assert_eq!(oa.taxon_id, ob.taxon_id);
+        assert_eq!(oa.needs.len(), ob.needs.len());
+        for (na, nb) in oa.needs.iter().zip(ob.needs.iter()) {
+            assert_eq!(na.id, nb.id);
+            assert_approx_eq(nb.store, na.store, &format!("store {}", na.id));
+        }
+    }
+    for id in ["nitrogen"] {
+        assert_approx_eq(caught.soil_pool(0, 0, id), live.soil_pool(0, 0, id), "soil pool");
+    }
+}
+
+/// D19: emptying any one required store kills; the others can be full.
+#[test]
+fn d19_dies_when_any_store_empty() {
+    let ids: Vec<String> = {
+        let mut w = World::new(1903, climate_sand_column());
+        w.set_climate(20.0, 1000.0);
+        w.plant_taxon(0, 0, "pinus_taeda").unwrap();
+        w.column_at(0, 0).occupants[0].needs.iter().map(|n| n.id.clone()).collect()
+    };
+    assert_eq!(ids, vec!["water", "energy", "co2", "nitrogen"]);
+    for id in &ids {
+        let mut w = World::new(1903, climate_sand_column());
+        w.set_climate(20.0, 1000.0);
+        w.plant_taxon(0, 0, "pinus_taeda").unwrap();
+        w.tick();
+        assert_eq!(s19_mature_count(&w, "pinus_taeda"), 1, "{id}: alive with full stores");
+        let full: Vec<f64> = w.column_at(0, 0).occupants[0].needs.iter().map(|n| n.store).collect();
+        assert!(full.iter().all(|&s| s > 0.0));
+        w.set_store(0, 0, 0, id, 0.0);
+        w.tick();
+        assert_eq!(s19_mature_count(&w, "pinus_taeda"), 0, "empty {id} store must kill");
+    }
+}
+
+/// D19: a test-only nutrient id on the same loop kills when empty. No match arm for that id.
+#[test]
+fn d19_nutrient_id_is_data() {
+    let mut w = World::new(1904, climate_sand_column());
+    w.set_climate(20.0, 1000.0);
+    w.plant_taxon(0, 0, "pinus_taeda").unwrap();
+    // Test nutrient: soil-bound pool, 1 unit/day, 3 days of capacity, empty pool.
+    w.add_need(0, 0, 0, sim_core::Need::new("test_x", sim_core::NutrientSource::SoilPool, 1.0, 3.0));
+    w.set_soil_pool(0, 0, "test_x", 0.0);
+    w.tick();
+    assert_eq!(s19_mature_count(&w, "pinus_taeda"), 1, "store not yet empty");
+    let mut steps = 1;
+    while s19_mature_count(&w, "pinus_taeda") == 1 && steps < 10 {
+        w.tick();
+        steps += 1;
+    }
+    assert_eq!(s19_mature_count(&w, "pinus_taeda"), 0, "empty test_x store kills");
+    assert_eq!(steps, 3, "3 days of capacity at 1/day");
+    // A fed pool keeps the plant alive.
+    let mut fed = World::new(1904, climate_sand_column());
+    fed.set_climate(20.0, 1000.0);
+    fed.plant_taxon(0, 0, "pinus_taeda").unwrap();
+    fed.add_need(0, 0, 0, sim_core::Need::new("test_x", sim_core::NutrientSource::SoilPool, 1.0, 3.0));
+    fed.set_soil_pool(0, 0, "test_x", 100.0);
+    for _ in 0..5 {
+        fed.tick();
+    }
+    assert_eq!(s19_mature_count(&fed, "pinus_taeda"), 1);
+    assert!(fed.soil_pool(0, 0, "test_x") < 100.0, "uptake lowers the test pool");
+    // Kernel has no branch on this id or on "nitrogen".
+    let src = include_str!("../src/lib.rs");
+    assert!(!src.contains("test_x"), "no test_x in the kernel");
+    assert!(!src.contains("\"nitrogen\" =>"), "no nitrogen match arm");
+}
+
+/// D19: submerged non-dissolved plant dies after its CO2 store empties; cattail holds on
+/// dissolved CO2 while it remains.
+#[test]
+fn d19_submerge_is_co2() {
+    // Wheat (0.8 m, takes_dissolved=0) under 0.9 m of water.
+    let mut w = World::new(1905, saturated_column(0.0, 0.9));
+    w.set_climate(20.0, 1000.0);
+    w.plant_taxon(0, 0, "triticum_aestivum").unwrap();
+    assert!(!w.column_at(0, 0).occupants[0].takes_dissolved);
+    let co2 = |w: &World| w.store_of(0, 0, 0, "co2").unwrap();
+    let mut last = co2(&w);
+    let mut steps = 0;
+    while s19_mature_count(&w, "triticum_aestivum") == 1 && steps < 20 {
+        w.tick();
+        steps += 1;
+        if s19_mature_count(&w, "triticum_aestivum") == 1 {
+            let c = co2(&w);
+            assert!(c < last, "co2 store falls while submerged");
+            last = c;
+        }
+    }
+    assert_eq!(s19_mature_count(&w, "triticum_aestivum"), 0, "wheat dies of CO2");
+    assert_eq!(steps, T_SUB, "CO2 capacity = T_SUB days at 1/day");
+    assert_eq!(w.hydro_reject(0, 0), HydroReject::Submerged);
+
+    // Cattail (1.524 m, takes_dissolved=1) under 1.7 m holds on dissolved CO2.
+    let mut c = World::new(1906, saturated_column(0.0, 1.7));
+    c.set_climate(20.0, 1000.0);
+    c.plant_taxon(0, 0, "typha_latifolia").unwrap();
+    assert!(c.column_at(0, 0).occupants[0].takes_dissolved);
+    let d0 = c.dissolved_pool(0, 0, "co2");
+    for _ in 0..(T_SUB + 5) {
+        c.tick();
+    }
+    assert_eq!(s19_mature_count(&c, "typha_latifolia"), 1, "cattail holds while dissolved CO2 remains");
+    assert!(c.dissolved_pool(0, 0, "co2") < d0, "cattail draws dissolved CO2");
+    c.set_dissolved_pool(0, 0, "co2", 0.0);
+    for _ in 0..(T_SUB + 1) {
+        c.tick();
+    }
+    assert_eq!(s19_mature_count(&c, "typha_latifolia"), 0, "no dissolved CO2 → cattail dies");
+}
+
+/// D19: uptake lowers the soil nitrogen pool; death puts the remainder back.
+#[test]
+fn d19_nitrogen_returns() {
+    let mut w = World::new(1907, climate_sand_column());
+    w.set_climate(20.0, 1000.0);
+    let p = w.catalog().get("pinus_taeda").unwrap().clone();
+    w.plant_params(0, 0, &p, 0.3).unwrap(); // not fertile: no seedlings draw N
+    let n0 = w.soil_pool(0, 0, "nitrogen");
+    for _ in 0..5 {
+        w.tick();
+    }
+    let n1 = w.soil_pool(0, 0, "nitrogen");
+    assert!(n1 < n0, "uptake lowers soil N: {n0} -> {n1}");
+    let held = w.store_of(0, 0, 0, "nitrogen").unwrap();
+    assert!(held > 0.0);
+    w.set_store(0, 0, 0, "water", 0.0);
+    w.tick();
+    assert_eq!(w.occupant_count(0, 0), 0, "pine died");
+    assert_approx_eq(w.soil_pool(0, 0, "nitrogen"), n1 + held, "remainder returned to soil N");
+}
+
+/// D19: mm/day times a 2-day step adds two days of rain.
+#[test]
+fn d19_rain_is_per_day() {
+    let mut w = World::new(1908, climate_sand_column());
+    w.set_et_scale(0.0);
+    w.set_tick_dt(2.0);
+    let r = 0.004; // 4 mm/day
+    w.set_rain_per_day_m(r);
+    let m0 = w.water_mass();
+    w.tick();
+    assert_approx_eq(w.rain_added_m(), 2.0 * r, "2-day step adds 2 days of rain");
+    assert_approx_eq(w.water_mass() - m0, 2.0 * r, "mass gain");
+    assert_approx_eq(w.query_tile(0, 0).rain_per_day_m, r, "view in m/day");
+    let mut c = World::new(1908, climate_sand_column());
+    c.set_et_scale(0.0);
+    c.set_tick_dt(2.0);
+    c.set_rain_per_day_m(r);
+    c.catch_up(3, 0.0);
+    assert_approx_eq(c.rain_added_m(), 6.0 * r, "catch_up: K steps of 2 days");
+}
+
+/// D19: a 3-day step places at most 3 seeds (one attempt per elapsed day).
+#[test]
+fn d19_seed_one_per_day() {
+    let mk = |dt: f64| {
+        let mut w = World::new(1909, climate_sand_column());
+        w.set_climate(20.0, 1000.0);
+        w.set_tick_dt(dt);
+        w.plant_taxon(0, 0, "pinus_taeda").unwrap();
+        w.tick();
+        w.column_at(0, 0).occupants.iter().filter(|o| o.height_frac < 1.0).count()
+    };
+    let one = mk(1.0);
+    let three = mk(3.0);
+    assert_eq!(one, 1, "1-day step: one seed");
+    assert!(three <= 3, "3-day step places at most 3 seeds, got {three}");
+    assert_eq!(three, 3, "3-day step: one attempt per day");
 }

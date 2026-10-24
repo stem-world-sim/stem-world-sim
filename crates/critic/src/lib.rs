@@ -70,12 +70,46 @@ pub fn reason(o: &TileOccupantView) -> String {
     if o.crowd_steps > 0 {
         parts.push(format!("crowded {}/{}", o.crowd_steps, CROWD));
     }
+    if let Some(id) = falling_store(o) {
+        parts.push(format!("{id} falling"));
+    }
     if parts.is_empty() { "ok".into() } else { parts.join(", ") }
+}
+
+/// S19: each store as a percentage of capacity, falling ones marked ↓.
+pub fn store_line(o: &TileOccupantView) -> String {
+    o.stores
+        .iter()
+        .map(|(id, f, d)| format!("{id} {:.0}%{}", f * 100.0, if *d < 0.0 { "↓" } else { "" }))
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+/// S19: the store closest to empty among those that fell last step (None if none fell).
+pub fn falling_store(o: &TileOccupantView) -> Option<String> {
+    o.stores
+        .iter()
+        .filter(|(_, _, d)| *d < -1e-12)
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(id, _, _)| id.clone())
 }
 
 /// Cause for a plant that left the living list, judged from its last counters.
 /// A counter one step short of its threshold means the kernel tripped it this tick.
 pub fn death_reason(o: &TileOccupantView) -> String {
+    // S19: non-store removals first (thin, waterlog), then the falling store.
+    if o.crowd_steps + 1 >= CROWD {
+        return "thinned: crowded".into();
+    }
+    if o.waterlog_steps + 1 >= WL.min(WL_D) && o.waterlog_steps > 0 {
+        return "died: waterlogged".into();
+    }
+    if let Some(id) = falling_store(o) {
+        if id == sim_core::NUT_WATER {
+            return "wilted: soil dry (water store empty)".into();
+        }
+        return format!("died: {id} store empty");
+    }
     if o.dry_steps + 1 >= WILT {
         "wilted: soil dry".into()
     } else if o.submerge_steps + 1 >= SUB {
@@ -178,6 +212,15 @@ impl Critic {
     }
 
     /// S18 continuous rain: kernel adds this depth (m) on every tick.
+    /// S19: continuous rain in m/day.
+    pub fn set_rain_per_day_m(&mut self, r: f64) {
+        self.world.set_rain_per_day_m(r.max(0.0));
+    }
+
+    pub fn rain_per_day_m(&self) -> f64 {
+        self.world.rain_per_day_m()
+    }
+
     pub fn set_rain_per_tick_m(&mut self, r: f64) {
         self.world.set_rain_per_tick_m(r.max(0.0));
     }
