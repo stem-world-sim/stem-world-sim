@@ -205,3 +205,25 @@ fn d172_taeda_fills_then_wilts() {
     assert!(saw_dry || wilt_event, "query reports dry_steps or a wilt reason");
     assert!(wilt_event, "events name the wilt: {:?}", c.events());
 }
+
+/// D19.2: the plant card has no counters; events stamp elapsed days, not a step count.
+#[test]
+fn d192_page_no_counters() {
+    let mut c = Critic::new();
+    c.plant("pinus_taeda").unwrap();
+    c.tick_n(3);
+    c.rain(0.01);
+    let q = c.query_tile();
+    for o in &q.occupants {
+        let card = c.card(o);
+        assert!(!card.contains("dry /") && !card.contains("dry "), "no dry counter: {card}");
+        assert!(!card.contains("dark /") && !card.contains("dark "), "no dark counter: {card}");
+        for g in ['\u{2713}', '\u{2717}', '\u{2193}', '\u{2192}'] {
+            assert!(!card.contains(g), "plain ASCII card: {card}");
+        }
+        assert!(card.is_ascii() || card.chars().all(|ch| ch.is_alphanumeric() || ch.is_ascii()), "{card}");
+    }
+    let last = c.events().last().unwrap();
+    assert!(last.starts_with("3.0 d:"), "event stamps elapsed days: {last}");
+    assert!(!last.starts_with('t'), "no step count: {last}");
+}

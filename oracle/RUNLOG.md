@@ -254,3 +254,13 @@ amended (minimal, each marked `S19.1 amend`):
   - d14_grown_intolerant_reaches_mature: was 0.05 m rain per step (tile ponded metres deep → root O2 blocks uptake); now holds each layer between θ_fc and porosity each step.
   - d18_default_dt_matches_prior_behavior: golden re-cut (the 0.15 m rain briefly waterlogs the top layer); S19 values kept in a comment.
 No test deleted. Result 189 acceptance + 4 unit + 8 critic green. Cargo.lock untracked. docs/ untouched.
+
+## S19.2 — page and pond (2026-10-24 PT) — NO SHIP
+tests added:
+  - d192_rice_drinks_when_waterlogged (FAILS: rice takes_dissolved is false)
+  - d192_pine_does_not (green; soil uptake measured as the extract_lost delta over one step)
+  - d192_page_no_counters (green)
+page: counters dropped from card, reason and Key; reason = `<store> falling` or `ok`; death = empty store; flags `ok`/`no`; store marker `falling` instead of the arrow; roots line uses `to`; events stamp elapsed days (`3.0 d: ...`). New Critic::card() returns the card text.
+NO SHIP — gap: docs/data/kernel_catalog.csv row `oryza_sativa` has 19 fields against a 20-column header (also dactylis_glomerata, zea_mays, hilaria_jamesii). The parser maps rice's `1` to fertility and takes_dissolved reads empty → false. Fixing it needs either a docs/ data edit (spec allowlist, not oracle) or a parser rule for short rows that the spec does not name. Neither done. Checked: with takes_dissolved forced true, the kernel passes d192_rice_drinks_when_waterlogged unchanged (uptake > 0, water store not falling), so no sim-core code change is needed once the row is fixed.
+also noted: seeds spawned from a planted rice carry takes_dissolved false (seed comes from the same catalog row).
+No test deleted, renamed or amended. Result 190/191 acceptance + 4 unit + 9 critic. Not merged; page not rebuilt. Cargo.lock untracked. docs/ untouched.
