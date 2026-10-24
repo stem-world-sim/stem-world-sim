@@ -235,3 +235,22 @@ amended (minimal, each marked `S19 amend` in the test):
   - d14_intolerant_prefers_sun, d14_tolerant_prefers_gap: compare over 8 steps (shaded tile dries by ~day 9). d142_xeric_slower_at_fc: 3 steps while θ ≈ θ_fc.
   - d18_continuous_rain_applied_each_tick: books include et/extract. d18_tick_dt_scales_growth_and_et: growth part runs with ET and uptake off. d18_mass_conserved_under_scaled_dt: sim time (60 + 2)·dt. d18_default_dt_matches_prior_behavior: golden re-cut (S18 values kept in a comment).
 No test deleted or renamed. Result 183 acceptance + 4 unit + 8 critic green. Cargo.lock untracked. docs/ untouched.
+
+## S19.1 — conditions and stores (2026-10-24 PT)
+tests added:
+  - d191_no_co2_store
+  - d191_submerge_stops_fixation
+  - d191_waterlog_blocks_uptake
+  - d191_dark_drains_energy
+  - d191_dies_when_any_store_empty
+  - d191_root_o2_is_not_a_store
+invariants: (1) stores are water, energy, nitrogen; co2 store dropped (NUT_CO2, USE_CO2, CAP_DAYS_CO2 deleted; AIR_CO2_0 and DISSOLVED_CO2_0 removed). Capacity formula unchanged from S19 (use·(days − 1 + height_frac)); water 30 days of P_MAX/N_ET use, energy 7 at 1.0/day, nitrogen 30 days at 0.02/0.05/0.10, soil N 50. (2) conditions computed each step, not stored on the plant (World::conditions, TileOccupantView.conditions, CONDITION_FLAGS = L, CO2, root O2, T): L = received light ≥ L_min; CO2 = 1 in air, when submerged (pond ≥ height) 1 only if takes_dissolved and the tile `carbon` pool (start DISSOLVED_CARBON_0 = 30) is > 0; root O2 = not waterlogged (pond ≥ H_POND or top layer at porosity) or takes_dissolved; T = air temperature inside the envelope. (3) fixation (energy recharge) is 0 unless L, CO2, T are open and the water store is non-empty; respiration (USE_ENERGY·dt) runs every step. (4) root O2 closed → no soil-water uptake and no soil-pool uptake that step. (5) any empty store kills; death return as S19.
+assumptions (flagged; spec did not name these): submerged fixation draws the carbon pool 1 store unit per energy unit fixed. Root O2 gates catalog plants only; a bare PlantStub (no taxon/catalog traits) is not gated (gating it broke d6/d7 pure-uptake tests on saturated columns). Fixation size scaling unchanged from S19 (refill to capacity when open). Waterlog step-count kill (T_WL) kept; spec did not remove it.
+notes S19.1: critic shows per-plant condition flags (✓/✗) beside stores, death reason names closed gates, Key lists store ids and condition flags; no CO2 percentage. Page rebuilt and critic.html.gz replaced on release `critic`; dist/ not committed.
+renamed (spec-directed): d5_batch_not_every_tick → d5_et_every_step (body unchanged; it asserts ET every step).
+amended (minimal, each marked `S19.1 amend`):
+  - d19_dies_when_any_store_empty: id list without co2.
+  - d19_submerge_is_co2: watches the energy store and the `carbon` dissolved pool (no co2 store).
+  - d14_grown_intolerant_reaches_mature: was 0.05 m rain per step (tile ponded metres deep → root O2 blocks uptake); now holds each layer between θ_fc and porosity each step.
+  - d18_default_dt_matches_prior_behavior: golden re-cut (the 0.15 m rain briefly waterlogs the top layer); S19 values kept in a comment.
+No test deleted. Result 189 acceptance + 4 unit + 8 critic green. Cargo.lock untracked. docs/ untouched.

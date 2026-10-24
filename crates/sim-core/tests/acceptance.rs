@@ -1758,7 +1758,8 @@ fn d5_bot_untouched() {
 
 /// D5: N_et hydro ticks with no ET-step in between; M unchanged until the ET tick.
 #[test]
-fn d5_batch_not_every_tick() {
+fn d5_et_every_step() {
+    // S19.1: renamed from d5_batch_not_every_tick (spec: name must match the check).
     // S19 amend: the N_ET batch gate is gone. ET runs every step at E/N_ET per day, so
     // N_ET daily steps still remove one legacy batch (E_OPEN) from a pond.
     let mut world = World::new(505, saturated_column(0.0, 0.25));
@@ -4589,7 +4590,14 @@ fn d14_grown_intolerant_reaches_mature() {
     for _ in 0..n {
         // Keep θ near FC so f_w≈1 and uptake prevents wilt (dry_steps).
         // Extra rain: S16 seed rain adds sibling seedlings that also drink.
-        world.add_rain_at(0, 0, 0.05);
+        // S19.1 amend: was add_rain_at(0, 0, 0.05) every step; that waterlogs the tile and
+        // root O2 blocks uptake. Now hold every layer between FC and porosity each step
+        // (wet, s = 1 after uptake, but not waterlogged).
+        let mut c = world.column_at(0, 0).clone();
+        for l in c.layers.iter_mut() {
+            l.theta = l.theta.max((l.theta_fc() + l.texture.porosity()) / 2.0);
+        }
+        world.set_column(0, 0, c);
         world.tick();
     }
     let hf = world
@@ -6382,12 +6390,15 @@ fn d18_default_dt_matches_prior_behavior() {
     assert_eq!(c.occupants[0].dry_steps, 0);
     // S19 amend: golden re-cut for daily sinks (S18 golden: h 4.075770307678128e-1,
     // θ0 8.278077739485262e-2, et 1.0165766781544261e-2; extract 9e-2 unchanged).
-    assert_approx_eq(c.occupants[0].height_frac, 3.953161257342996e-1, "pine h_frac");
-    assert_approx_eq(c.layers[0].theta, 7.536602512612135e-2, "θ0");
+    // S19.1 amend: re-cut for root O2 (the 0.15 m rain briefly waterlogs the top layer, so
+    // the pine takes no soil water those steps). S19 golden: h 3.953161257342996e-1,
+    // θ0 7.536602512612135e-2, et 1.2390192462163671e-2.
+    assert_approx_eq(c.occupants[0].height_frac, 3.953137013800713e-1, "pine h_frac");
+    assert_approx_eq(c.layers[0].theta, 7.535747967314846e-2, "θ0");
     assert_approx_eq(c.layers[1].theta, 4.1e-1, "θ1");
     assert_approx_eq(c.surface_water_m, 0.0, "pond");
-    assert_approx_eq(w.et_lost(), 1.2390192462163671e-2, "et_lost");
-    assert_approx_eq(w.extract_lost(), 9e-2, "extract_lost");
+    assert_approx_eq(w.et_lost(), 1.2390198203318648e-2, "et_lost");
+    assert_approx_eq(w.extract_lost(), 9.000255789473689e-2, "extract_lost"); // S19.1 amend: was 9e-2
     assert_eq!(w.tick_count(), 30);
     assert_approx_eq(w.sim_time_s(), 30.0 * 86_400.0, "30 days");
 }
@@ -6499,7 +6510,8 @@ fn d19_dies_when_any_store_empty() {
         w.plant_taxon(0, 0, "pinus_taeda").unwrap();
         w.column_at(0, 0).occupants[0].needs.iter().map(|n| n.id.clone()).collect()
     };
-    assert_eq!(ids, vec!["water", "energy", "co2", "nitrogen"]);
+    // S19.1 amend: the co2 store is dropped (carbon is fixed into energy).
+    assert_eq!(ids, vec!["water", "energy", "nitrogen"]);
     for id in &ids {
         let mut w = World::new(1903, climate_sand_column());
         w.set_climate(20.0, 1000.0);
@@ -6558,7 +6570,8 @@ fn d19_submerge_is_co2() {
     w.set_climate(20.0, 1000.0);
     w.plant_taxon(0, 0, "triticum_aestivum").unwrap();
     assert!(!w.column_at(0, 0).occupants[0].takes_dissolved);
-    let co2 = |w: &World| w.store_of(0, 0, 0, "co2").unwrap();
+    // S19.1 amend: no co2 store; submergence closes CO2 access so the energy store falls.
+    let co2 = |w: &World| w.store_of(0, 0, 0, "energy").unwrap();
     let mut last = co2(&w);
     let mut steps = 0;
     while s19_mature_count(&w, "triticum_aestivum") == 1 && steps < 20 {
@@ -6566,12 +6579,12 @@ fn d19_submerge_is_co2() {
         steps += 1;
         if s19_mature_count(&w, "triticum_aestivum") == 1 {
             let c = co2(&w);
-            assert!(c < last, "co2 store falls while submerged");
+            assert!(c < last, "energy store falls while submerged");
             last = c;
         }
     }
     assert_eq!(s19_mature_count(&w, "triticum_aestivum"), 0, "wheat dies of CO2");
-    assert_eq!(steps, T_SUB, "CO2 capacity = T_SUB days at 1/day");
+    assert_eq!(steps, T_SUB, "energy capacity = 7 days at 1/day (= T_SUB)");
     assert_eq!(w.hydro_reject(0, 0), HydroReject::Submerged);
 
     // Cattail (1.524 m, takes_dissolved=1) under 1.7 m holds on dissolved CO2.
@@ -6579,13 +6592,13 @@ fn d19_submerge_is_co2() {
     c.set_climate(20.0, 1000.0);
     c.plant_taxon(0, 0, "typha_latifolia").unwrap();
     assert!(c.column_at(0, 0).occupants[0].takes_dissolved);
-    let d0 = c.dissolved_pool(0, 0, "co2");
+    let d0 = c.dissolved_pool(0, 0, "carbon"); // S19.1 amend: pool id carbon
     for _ in 0..(T_SUB + 5) {
         c.tick();
     }
     assert_eq!(s19_mature_count(&c, "typha_latifolia"), 1, "cattail holds while dissolved CO2 remains");
-    assert!(c.dissolved_pool(0, 0, "co2") < d0, "cattail draws dissolved CO2");
-    c.set_dissolved_pool(0, 0, "co2", 0.0);
+    assert!(c.dissolved_pool(0, 0, "carbon") < d0, "cattail draws dissolved carbon");
+    c.set_dissolved_pool(0, 0, "carbon", 0.0);
     for _ in 0..(T_SUB + 1) {
         c.tick();
     }
@@ -6650,4 +6663,164 @@ fn d19_seed_one_per_day() {
     assert_eq!(one, 1, "1-day step: one seed");
     assert!(three <= 3, "3-day step places at most 3 seeds, got {three}");
     assert_eq!(three, 3, "3-day step: one attempt per day");
+}
+
+// ---------------------------------------------------------------- S19.1
+
+fn s191_store(w: &World, id: &str) -> f64 {
+    w.store_of(0, 0, 0, id).unwrap()
+}
+
+/// D19.1: a plant holds water, energy, nitrogen. No co2 store.
+#[test]
+fn d191_no_co2_store() {
+    let mut w = World::new(1911, climate_sand_column());
+    w.set_climate(20.0, 1000.0);
+    w.plant_taxon(0, 0, "pinus_taeda").unwrap();
+    let ids: Vec<String> = w.column_at(0, 0).occupants[0].needs.iter().map(|n| n.id.clone()).collect();
+    assert_eq!(ids, vec!["water", "energy", "nitrogen"]);
+    assert!(w.store_of(0, 0, 0, "co2").is_none(), "no co2 store");
+    w.tick();
+    let v = w.query_tile(0, 0);
+    assert!(v.occupants[0].stores.iter().all(|(id, _, _)| id != "co2"));
+    assert!(!sim_core::NUTRIENT_IDS.contains(&"co2"));
+}
+
+/// D19.1: submerged pine loses energy (CO2 access 0); submerged cattail with dissolved
+/// carbon holds energy.
+#[test]
+fn d191_submerge_stops_fixation() {
+    let mut w = World::new(1912, saturated_column(0.0, 3.0));
+    w.set_climate(20.0, 1000.0);
+    let p = w.catalog().get("pinus_taeda").unwrap().clone();
+    w.plant_params(0, 0, &p, 0.1).unwrap();
+    let h = w.query_tile(0, 0).occupants[0].height_m;
+    assert!(h < 3.0, "pine under the pond: {h}");
+    let c = w.conditions(0, 0, 0);
+    assert!(c.submerged && !c.co2, "submerged pine: CO2 access 0");
+    let e0 = s191_store(&w, "energy").min(1e9);
+    w.tick();
+    let e1 = s191_store(&w, "energy");
+    w.tick();
+    let e2 = s191_store(&w, "energy");
+    assert!(e1 < e0 + 1e-12 && e2 < e1, "pine energy falls: {e0} {e1} {e2}");
+    assert!(!w.query_tile(0, 0).occupants[0].conditions.co2);
+
+    let mut c = World::new(1913, saturated_column(0.0, 1.7));
+    c.set_climate(20.0, 1000.0);
+    c.plant_taxon(0, 0, "typha_latifolia").unwrap();
+    assert!(c.column_at(0, 0).occupants[0].takes_dissolved);
+    assert!(c.conditions(0, 0, 0).submerged);
+    assert!(c.conditions(0, 0, 0).co2, "dissolved carbon gives CO2 access");
+    c.tick();
+    let ce1 = s191_store(&c, "energy");
+    let d1 = c.dissolved_pool(0, 0, "carbon");
+    for _ in 0..3 {
+        c.tick();
+    }
+    assert!(s191_store(&c, "energy") >= ce1 - 1e-12, "cattail energy holds");
+    assert!(c.dissolved_pool(0, 0, "carbon") < d1, "fixation draws dissolved carbon");
+}
+
+/// D19.1: waterlogged pine takes no nitrogen; waterlogged cattail keeps taking it.
+#[test]
+fn d191_waterlog_blocks_uptake() {
+    let run = |taxon: &str| {
+        let mut w = World::new(1914, climate_sand_column());
+        w.set_climate(20.0, 1000.0);
+        w.plant_taxon(0, 0, taxon).unwrap();
+        w.tick();
+        w.add_rain_at(0, 0, 0.5);
+        w.tick();
+        let half = s191_store(&w, "nitrogen") * 0.5;
+        w.set_store(0, 0, 0, "nitrogen", half);
+        w.add_rain_at(0, 0, 0.5);
+        assert!(w.column_at(0, 0).surface_water_m >= H_POND || w.column_at(0, 0).layers[0].theta >= Texture::Sand.porosity() - 1e-9);
+        let n0 = w.soil_pool(0, 0, "nitrogen");
+        let open = w.conditions(0, 0, 0).root_o2;
+        w.tick();
+        let n1 = w.soil_pool(0, 0, "nitrogen");
+        (open, n0, n1, s191_store(&w, "nitrogen"), half)
+    };
+    let (open, n0, n1, s, half) = run("pinus_taeda");
+    assert!(!open, "waterlogged pine: root O2 0");
+    assert_approx_eq(n1, n0, "pine takes no soil N");
+    assert!(s < half, "pine N store falls");
+    let (open, n0, n1, s, half) = run("typha_latifolia");
+    assert!(open, "cattail root O2 open (takes_dissolved)");
+    assert!(n1 < n0, "cattail uptake continues");
+    assert!(s > half, "cattail N store refills");
+}
+
+/// D19.1: light below L_min drains energy; the water store can be full.
+#[test]
+fn d191_dark_drains_energy() {
+    let mut w = World::new(1915, light_sand_column());
+    w.set_climate(20.0, 1000.0);
+    w.plant_taxon(0, 0, "lolium_perenne").unwrap();
+    // Two canopy layers (oak over pine) shade multiplicatively: grass below L_min.
+    w.plant_taxon(0, 0, "quercus_alba").unwrap();
+    w.plant_taxon(0, 0, "pinus_taeda").unwrap();
+    w.tick();
+    let slot = w
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .position(|o| o.taxon_id.as_deref() == Some("lolium_perenne"))
+        .unwrap();
+    assert!(!w.conditions(0, 0, slot).light, "grass below L_min: {:?}", w.column_at(0, 0).occupants[slot].last_light);
+    let e0 = w.store_of(0, 0, slot, "energy").unwrap();
+    w.set_store(0, 0, slot, "water", 1e9); // clamps to capacity: full
+    w.tick();
+    let slot = w
+        .column_at(0, 0)
+        .occupants
+        .iter()
+        .position(|o| o.taxon_id.as_deref() == Some("lolium_perenne"))
+        .unwrap();
+    let e1 = w.store_of(0, 0, slot, "energy").unwrap();
+    assert!(e1 < e0, "energy falls in the dark: {e0} -> {e1}");
+    let v = w.query_tile(0, 0);
+    let g = v.occupants.iter().find(|o| o.slot == slot).unwrap();
+    let wf = g.stores.iter().find(|(id, _, _)| id == "water").unwrap().1;
+    assert!(wf > 0.99, "water store full: {wf}");
+    assert!(!g.conditions.light);
+}
+
+/// D19.1: empty water, energy or nitrogen kills; the others can be full.
+#[test]
+fn d191_dies_when_any_store_empty() {
+    for id in ["water", "energy", "nitrogen"] {
+        let mut w = World::new(1916, climate_sand_column());
+        w.set_climate(20.0, 1000.0);
+        w.plant_taxon(0, 0, "pinus_taeda").unwrap();
+        w.tick();
+        assert_eq!(s19_mature_count(&w, "pinus_taeda"), 1, "{id}: alive");
+        for other in ["water", "energy", "nitrogen"] {
+            if other != id {
+                w.set_store(0, 0, 0, other, 1e9);
+            }
+        }
+        w.set_store(0, 0, 0, id, 0.0);
+        w.tick();
+        assert_eq!(s19_mature_count(&w, "pinus_taeda"), 0, "empty {id} kills");
+    }
+}
+
+/// D19.1: root O2 is a condition, not a store; no oxygen id on the plant.
+#[test]
+fn d191_root_o2_is_not_a_store() {
+    let mut w = World::new(1917, climate_sand_column());
+    w.set_climate(20.0, 1000.0);
+    w.plant_taxon(0, 0, "pinus_taeda").unwrap();
+    w.plant_taxon(0, 0, "typha_latifolia").unwrap();
+    w.tick();
+    for o in &w.column_at(0, 0).occupants {
+        for n in &o.needs {
+            let id = n.id.to_ascii_lowercase();
+            assert!(!id.contains("o2") && !id.contains("oxygen"), "no oxygen store: {id}");
+        }
+    }
+    assert!(sim_core::CONDITION_FLAGS.contains(&"root O2"));
+    assert!(!sim_core::NUTRIENT_IDS.iter().any(|i| i.contains("o2") || i.contains("oxygen")));
 }

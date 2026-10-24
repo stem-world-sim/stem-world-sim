@@ -47,6 +47,11 @@
 //! water → soil, soil-pool nutrients → their pool, air nutrients → air. Energy is not returned.
 //! Sources: SoilWater (hydro), Light (canopy light ≥ L_min), Air (world pool; when submerged only via the
 //! tile dissolved pool if takes_dissolved), SoilPool (tile pool keyed by nutrient id; nitrogen this sprint).
+//! S19.1: stores are water, energy, nitrogen (no co2 store). Conditions are computed each step, not
+//! stored: L (light ≥ L_min), CO2 (air; submerged only via the tile carbon pool if takes_dissolved),
+//! root O2 (not waterlogged, or takes_dissolved; catalog plants only), T (envelope). Fixation (energy
+//! recharge) needs L, CO2, T and a non-empty water store; submerged fixation draws the carbon pool 1:1.
+//! Root O2 closed → no soil water or soil-pool uptake that step. Respiration (energy use) every step.
 
 /// Absolute / relative tolerance for water-mass comparisons (f64).
 use smallvec::SmallVec;
@@ -83,29 +88,28 @@ pub const SINK_PER_DAY: f64 = 1.0 / N_ET as f64;
 /// S19 nutrient ids (data, not branches).
 pub const NUT_WATER: &str = "water";
 pub const NUT_ENERGY: &str = "energy";
-pub const NUT_CO2: &str = "co2";
 pub const NUT_NITROGEN: &str = "nitrogen";
 /// S19 nutrient ids wired this sprint (display/key order).
-pub const NUTRIENT_IDS: [&str; 4] = [NUT_WATER, NUT_ENERGY, NUT_CO2, NUT_NITROGEN];
+pub const NUTRIENT_IDS: [&str; 3] = [NUT_WATER, NUT_ENERGY, NUT_NITROGEN];
+/// S19.1 condition flags (computed each step, not stored on the plant).
+pub const CONDITION_FLAGS: [&str; 4] = ["L", "CO2", "root O2", "T"];
+/// S19.1 tile dissolved-carbon pool id (a tile pool, not a plant store).
+pub const POOL_CARBON: &str = "carbon";
 /// Store capacity in days of use at height_frac = 1 (capacity = use·(days − 1 + height_frac)). S19.
 /// Water: T_WILT legacy sink batches of N_ET days each (same drought tolerance in time).
 pub const CAP_DAYS_WATER: f64 = (T_WILT as u64 * N_ET) as f64;
 pub const CAP_DAYS_ENERGY: f64 = T_DARK as f64;
-pub const CAP_DAYS_CO2: f64 = T_SUB as f64;
 pub const CAP_DAYS_NITROGEN: f64 = 30.0;
-/// Energy and CO2 use per day (store units). S19.
+/// Energy use (respiration) per day (store units). S19/S19.1.
 pub const USE_ENERGY: f64 = 1.0;
-pub const USE_CO2: f64 = 1.0;
 /// Nitrogen use per day by catalog fertility. S19.
 pub const N_USE_LOW: f64 = 0.02;
 pub const N_USE_MODERATE: f64 = 0.05;
 pub const N_USE_HIGH: f64 = 0.10;
 /// Initial soil nitrogen per tile (store units). S19.
 pub const SOIL_N0: f64 = 50.0;
-/// Initial dissolved CO2 per tile (store units). S19.
-pub const DISSOLVED_CO2_0: f64 = 30.0;
-/// Initial world air CO2 (effectively unbounded). S19.
-pub const AIR_CO2_0: f64 = 1.0e9;
+/// Initial tile dissolved-carbon pool (store units). S19.1.
+pub const DISSOLVED_CARBON_0: f64 = 30.0;
 
 /// Max occupants per cell. S06.
 pub const MAX_OCCUPANTS: usize = 8;
@@ -218,6 +222,33 @@ impl Texture {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OccupantKind {
     PlantStub,
+}
+
+/// S19.1 per-step conditions (gates). Computed each step; not stored on the plant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Conditions {
+    /// Canopy light at or above L_min (gates fixation).
+    pub light: bool,
+    /// CO2 access: air, or dissolved carbon when submerged and takes_dissolved (gates fixation).
+    pub co2: bool,
+    /// Root O2: root zone not waterlogged, or takes_dissolved (gates soil uptake).
+    pub root_o2: bool,
+    /// Air temperature inside the envelope (gates fixation).
+    pub temp: bool,
+    /// Fully submerged (pond >= height).
+    pub submerged: bool,
+}
+
+impl Conditions {
+    /// Short flags in CONDITION_FLAGS order: (flag, open).
+    pub fn flags(&self) -> [(&'static str, bool); 4] {
+        [
+            (CONDITION_FLAGS[0], self.light),
+            (CONDITION_FLAGS[1], self.co2),
+            (CONDITION_FLAGS[2], self.root_o2),
+            (CONDITION_FLAGS[3], self.temp),
+        ]
+    }
 }
 
 /// Where a nutrient store recharges from. S19.
@@ -481,6 +512,12 @@ fn cell_waterlogged(col: &Column) -> bool {
         }
     }
     false
+}
+
+/// S19.1 root O2: open unless the root zone is waterlogged and the plant cannot take
+/// dissolved gases. Catalog plants only; a bare PlantStub (no taxon traits) is not gated.
+fn root_o2_open(col: &Column, o: &Occupant) -> bool {
+    o.taxon_id.is_none() || o.takes_dissolved || !cell_waterlogged(col)
 }
 
 fn waterlog_limit(drain_ok: Option<&str>) -> u32 {
@@ -880,6 +917,8 @@ pub struct TileOccupantView {
     pub max_layer: Option<usize>,
     /// S19: per required nutrient (id, store / capacity, net change last step).
     pub stores: Vec<(String, f64, f64)>,
+    /// S19.1: this step's conditions (gates), computed on read, not stored on the plant.
+    pub conditions: Conditions,
 }
 
 /// S17.2: kernel stress thresholds, by counter, for read-only display.
@@ -1030,7 +1069,7 @@ pub struct Column {
     pub occupants: SmallVec<[Occupant; 1]>,
     /// S19 soil-bound nutrient pools keyed by id (nitrogen = SOIL_N0 initially).
     pub soil_pools: BTreeMap<String, f64>,
-    /// S19 dissolved nutrient pools keyed by id (co2 = DISSOLVED_CO2_0); usable while water is present.
+    /// Dissolved pools keyed by id (carbon = DISSOLVED_CARBON_0); fixation draws it when submerged. S19.1.
     pub dissolved: BTreeMap<String, f64>,
 }
 
@@ -1046,7 +1085,7 @@ impl Column {
             layers: layers.into(),
             occupants: SmallVec::new(),
             soil_pools: BTreeMap::from([(NUT_NITROGEN.to_string(), SOIL_N0)]),
-            dissolved: BTreeMap::from([(NUT_CO2.to_string(), DISSOLVED_CO2_0)]),
+            dissolved: BTreeMap::from([(POOL_CARBON.to_string(), DISSOLVED_CARBON_0)]),
         }
     }
 
@@ -1407,7 +1446,7 @@ pub struct World {
     seed_day_acc: f64,
     /// Evaporation multiplier (default 1; 0 = hydro-only world). S19.
     et_scale: f64,
-    /// World air pools by nutrient id (co2). S19.
+    /// World air pools by nutrient id (empty since S19.1: carbon is fixed into energy). S19.
     air: BTreeMap<String, f64>,
     /// Cumulative continuous-rain mass added (m·cells, A = 1). S18.
     rain_added_m: f64,
@@ -1447,7 +1486,7 @@ impl World {
             rain_per_day_m: 0.0,
             seed_day_acc: 0.0,
             et_scale: 1.0,
-            air: BTreeMap::from([(NUT_CO2.to_string(), AIR_CO2_0)]),
+            air: BTreeMap::new(),
             rain_added_m: 0.0,
         }
     }
@@ -1492,7 +1531,7 @@ impl World {
             rain_per_day_m: 0.0,
             seed_day_acc: 0.0,
             et_scale: 1.0,
-            air: BTreeMap::from([(NUT_CO2.to_string(), AIR_CO2_0)]),
+            air: BTreeMap::new(),
             rain_added_m: 0.0,
         }
     }
@@ -2040,6 +2079,11 @@ impl World {
         self.air.get(id).copied().unwrap_or(0.0)
     }
 
+    /// S19.1 conditions for occupant `slot` on (x,y), computed from current state.
+    pub fn conditions(&self, x: usize, y: usize, slot: usize) -> Conditions {
+        self.conditions_at(self.idx(x, y), slot)
+    }
+
     /// Add a required nutrient to occupant `slot` on (x,y). Test hook for data-only ids. S19.
     pub fn add_need(&mut self, x: usize, y: usize, slot: usize, need: Need) {
         let i = self.idx(x, y);
@@ -2203,6 +2247,7 @@ impl World {
                             (n.id.clone(), f, n.last_delta)
                         })
                         .collect(),
+                    conditions: self.conditions_at(self.idx(x, y), oi),
                 }
             })
             .collect();
@@ -2309,7 +2354,7 @@ impl World {
         enum Kill {
             Waterlog,
             #[allow(dead_code)]
-            Submerged, // S19: submergence kills via the CO2 store
+            Submerged, // S19.1: submergence kills via the energy store (CO2 access 0)
         }
         let mut kills: Vec<(usize, Kill)> = Vec::new();
         let occ_len = self.columns[i].occupants.len();
@@ -2338,7 +2383,7 @@ impl World {
             }
 
             // Waterlog counter (skip if drain_ok contains W).
-            // S19: full submergence is the CO2 store's job, not a waterlog count.
+            // S19.1: full submergence closes CO2 access (energy store), not a waterlog count.
             if immune_wl || h_surf >= height {
                 self.columns[i].occupants[oi].waterlog_steps = 0;
             } else if waterlogged {
@@ -2350,7 +2395,7 @@ impl World {
 
             let sub_steps = self.columns[i].occupants[oi].submerge_steps;
             let wl_steps = self.columns[i].occupants[oi].waterlog_steps;
-            // S19: submergence kills through the CO2 store, not a step count.
+            // S19.1: submergence kills through the energy store, not a step count.
             let _ = sub_steps;
             if !immune_wl && wl_steps >= wl_limit {
                 kills.push((oi, Kill::Waterlog));
@@ -2613,45 +2658,61 @@ impl World {
         }
     }
 
+    /// S19.1 conditions for occupant `oi` on tile index `i`, computed from current state.
+    pub(crate) fn conditions_at(&self, i: usize, oi: usize) -> Conditions {
+        let col = &self.columns[i];
+        let o = &col.occupants[oi];
+        let params = o.taxon_id.as_deref().and_then(|t| self.catalog.get(t).ok());
+        let (height_m, l_min) = match params {
+            Some(p) => (
+                effective_height_m(p) * o.height_frac.clamp(0.0, 1.0),
+                l_min_for_form(p.form),
+            ),
+            None => (f64::INFINITY, l_min_for_form(Form::Herb)),
+        };
+        let submerged = col.surface_water_m >= height_m;
+        let light = o.last_light.map_or(true, |l| l >= l_min);
+        let co2 = if !submerged {
+            true
+        } else {
+            o.takes_dissolved && col.dissolved.get(POOL_CARBON).copied().unwrap_or(0.0) > 0.0
+        };
+        let root_o2 = root_o2_open(col, o);
+        let temp = params.map_or(true, |p| climate_temp_reject(p, self.t_air_c) == ClimateReject::None);
+        Conditions { light, co2, root_o2, temp, submerged }
+    }
+
     fn apply_stores_at(&mut self, i: usize) {
         let dt = self.tick_dt;
-        let h_surf = self.columns[i].surface_water_m;
-        let mut deaths: Vec<(usize, Option<NutrientSource>)> = Vec::new();
+        let mut deaths: Vec<(usize, Option<Conditions>)> = Vec::new();
         for oi in 0..self.columns[i].occupants.len() {
             if !self.columns[i].occupants[oi].alive {
                 continue;
             }
-            // Occupant traits for source checks.
-            let (height_m, l_min) = {
-                let o = &self.columns[i].occupants[oi];
-                match o.taxon_id.as_deref().and_then(|t| self.catalog.get(t).ok()) {
-                    Some(p) => (
-                        effective_height_m(p) * o.height_frac.clamp(0.0, 1.0),
-                        l_min_for_form(p.form),
-                    ),
-                    None => (f64::INFINITY, l_min_for_form(Form::Herb)),
-                }
-            };
-            let submerged = h_surf >= height_m;
+            let cond = self.conditions_at(i, oi);
             let hf = self.columns[i].occupants[oi].height_frac;
             let band = self.columns[i].occupants[oi].band_scale;
-            let light = self.columns[i].occupants[oi].last_light;
-            let takes_dissolved = self.columns[i].occupants[oi].takes_dissolved;
             let water_taken = self.columns[i].occupants[oi].water_taken;
             self.columns[i].occupants[oi].water_taken = 0.0;
             let n_needs = self.columns[i].occupants[oi].needs.len();
             // A store already empty at step start (e.g. emptied externally) kills now,
             // before any recharge or spend this step.
-            let pre_empty = self.columns[i].occupants[oi]
+            if self.columns[i].occupants[oi]
                 .needs
                 .iter()
-                .find(|n| n.use_per_day > 0.0 && n.store <= 0.0)
-                .map(|n| n.source);
-            if pre_empty.is_some() {
-                deaths.push((oi, pre_empty));
+                .any(|n| n.use_per_day > 0.0 && n.store <= 0.0)
+            {
+                deaths.push((oi, Some(cond)));
                 continue;
             }
-            let mut empty: Option<NutrientSource> = None;
+            // Fixation also needs a non-empty water store (checked at step start).
+            let water_ok = self.columns[i].occupants[oi]
+                .needs
+                .iter()
+                .filter(|n| n.source == NutrientSource::SoilWater)
+                .all(|n| n.store > 0.0);
+            let fix_open = cond.light && cond.co2 && cond.temp && water_ok;
+            let mut empty = false;
             for ni in 0..n_needs {
                 let (id, source, use_d, cap, store) = {
                     let n = &self.columns[i].occupants[oi].needs[ni];
@@ -2666,56 +2727,61 @@ impl World {
                 };
                 let want = spend + (cap - store).max(0.0);
                 let recharge = match source {
+                    // Root O2 gates soil uptake (water extraction is gated in the hydro sink).
                     NutrientSource::SoilWater => water_taken,
                     NutrientSource::Light => {
-                        if light.map_or(true, |l| l >= l_min) {
-                            want
-                        } else {
+                        if !fix_open {
                             0.0
+                        } else if cond.submerged {
+                            // Submerged with dissolved access: fixation draws the carbon pool.
+                            let pool =
+                                self.columns[i].dissolved.entry(POOL_CARBON.to_string()).or_insert(0.0);
+                            let t = want.min(*pool).max(0.0);
+                            *pool -= t;
+                            t
+                        } else {
+                            want
                         }
                     }
                     NutrientSource::Air => {
-                        if !submerged {
-                            let pool = self.air.entry(id.clone()).or_insert(0.0);
-                            let t = want.min(*pool).max(0.0);
-                            *pool -= t;
-                            t
-                        } else if takes_dissolved && h_surf > 0.0 {
-                            let pool = self.columns[i].dissolved.entry(id.clone()).or_insert(0.0);
+                        let pool = self.air.entry(id.clone()).or_insert(0.0);
+                        let t = want.min(*pool).max(0.0);
+                        *pool -= t;
+                        t
+                    }
+                    NutrientSource::SoilPool => {
+                        if cond.root_o2 {
+                            let pool = self.columns[i].soil_pools.entry(id.clone()).or_insert(0.0);
                             let t = want.min(*pool).max(0.0);
                             *pool -= t;
                             t
                         } else {
                             0.0
                         }
-                    }
-                    NutrientSource::SoilPool => {
-                        let pool = self.columns[i].soil_pools.entry(id.clone()).or_insert(0.0);
-                        let t = want.min(*pool).max(0.0);
-                        *pool -= t;
-                        t
                     }
                 };
                 let next = (store + recharge - spend).min(cap);
                 let n = &mut self.columns[i].occupants[oi].needs[ni];
                 n.last_delta = next - store;
                 n.store = next.max(0.0);
-                if next <= 1e-12 * use_d.max(1e-12) && empty.is_none() {
-                    empty = Some(source);
+                if next <= 1e-12 * use_d.max(1e-12) {
+                    empty = true;
                 }
             }
-            if empty.is_some() {
-                deaths.push((oi, empty));
+            if empty {
+                deaths.push((oi, Some(cond)));
             }
         }
         if deaths.is_empty() {
             return;
         }
-        for (oi, src) in deaths.iter().rev() {
-            match src {
-                Some(NutrientSource::Light) => self.light_reject[i] = LightReject::Dark,
-                Some(NutrientSource::Air) => self.hydro_reject[i] = HydroReject::Submerged,
-                _ => {}
+        for (oi, cond) in deaths.iter().rev() {
+            if let Some(c) = cond {
+                if c.submerged && !c.co2 {
+                    self.hydro_reject[i] = HydroReject::Submerged;
+                } else if !c.light {
+                    self.light_reject[i] = LightReject::Dark;
+                }
             }
             let occ = self.columns[i].occupants.remove(*oi);
             self.return_stores(i, &occ);
@@ -3267,7 +3333,12 @@ impl World {
                         .find(|n| n.source == NutrientSource::SoilWater)
                         .map(|n| (n.capacity(o.height_frac) - n.store).max(0.0))
                         .unwrap_or(0.0);
-                    base + deficit
+                    // S19.1: root O2 closed (waterlogged, no dissolved access) → no soil uptake.
+                    if !root_o2_open(&self.columns[i], o) {
+                        0.0
+                    } else {
+                        base + deficit
+                    }
                 };
                 let root = root_access(&self.columns[i], &self.columns[i].occupants[oi]);
                 let mut taken = 0.0f64;
@@ -4238,7 +4309,12 @@ impl World {
                         .find(|n| n.source == NutrientSource::SoilWater)
                         .map(|n| (n.capacity(o.height_frac) - n.store).max(0.0))
                         .unwrap_or(0.0);
-                    base + deficit
+                    // S19.1: root O2 closed (waterlogged, no dissolved access) → no soil uptake.
+                    if !root_o2_open(&self.columns[i], o) {
+                        0.0
+                    } else {
+                        base + deficit
+                    }
                 };
                 let root = root_access(&self.columns[i], &self.columns[i].occupants[oi]);
                 let mut taken = 0.0f64;
