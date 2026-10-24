@@ -1,12 +1,12 @@
-taxon_id,name_norm,scientific,common_name,demo,form,height_m_mature,root_depth_m,root_habit,sla_m2_kg,t_min_c,t_max_c,rain_min_mm,rain_max_mm,texture_ok,drain_ok,phenology,dispersal
-agrostis_stolonifera,agrostis stolonifera,Agrostis stolonifera,Creeping bentgrass,1,herb,0.3,0.631,top,27.0317,4,45,200,1800,MO,WMD,evergreen,water
-dactylis_glomerata,dactylis glomerata,Dactylis glomerata,Orchard grass,1,herb,1.8,0.915,fibrous,40.805,5,30,200,1000,L,MD,,
-lolium_perenne,lolium perenne,Lolium perenne,Perennial ryegrass,1,herb,0.272,0.527915,top,22.953,4,35,500,2300,HM,MD,evergreen,animal
-oryza_sativa,oryza sativa,Oryza sativa,Rice,1,herb,1,,top,19.8,16,38,800,4000,H,W,,
-pinus_taeda,pinus taeda,Pinus taeda,Loblolly pine,1,tree,13.1,2,both,5.41833,10,29,900,2200,HML,WMD,evergreen,wind
-quercus_alba,quercus alba,Quercus alba,White oak,1,tree,20.1,1.5,both,15.0807,7,32,750,2000,M,MD,deciduous,
-rhizophora_mangle,rhizophora mangle,Rhizophora mangle,Red mangrove,1,tree,24,,both,5.3,10,38,1000,3000,H,W,evergreen,
-triticum_aestivum,triticum aestivum,Triticum aestivum,Bread wheat,1,herb,0.8,1.11,top,19.502,5,27,300,1600,MO,MD,deciduous,
-typha_latifolia,typha latifolia,Typha latifolia,Broadleaf cattail,1,herb,1.524,0.4293,top,11.546,6,30,300,4000,H,W,deciduous,water
-zea_mays,zea mays,Zea mays,Maize,1,herb,1.828,0.81,top,22.6,10,47,400,1800,MO,MD,,
-hilaria_jamesii,hilaria jamesii,Hilaria jamesii,Galleta,1,herb,0.26,1.36196,top,17.452,3,21,200,500,ML,D,,
+taxon_id,name_norm,scientific,common_name,demo,form,height_m_mature,root_depth_m,root_habit,sla_m2_kg,t_min_c,t_max_c,rain_min_mm,rain_max_mm,texture_ok,drain_ok,phenology,dispersal,fertility,takes_dissolved
+agrostis_stolonifera,agrostis stolonifera,Agrostis stolonifera,Creeping bentgrass,1,herb,0.3,0.631,top,27.0317,4,45,200,1800,MO,WMD,evergreen,water,moderate,0
+dactylis_glomerata,dactylis glomerata,Dactylis glomerata,Orchard grass,1,herb,1.8,0.915,fibrous,40.805,5,30,200,1000,L,MD,,moderate,0
+lolium_perenne,lolium perenne,Lolium perenne,Perennial ryegrass,1,herb,0.272,0.527915,top,22.953,4,35,500,2300,HM,MD,evergreen,animal,high,0
+oryza_sativa,oryza sativa,Oryza sativa,Rice,1,herb,1,,top,19.8,16,38,800,4000,H,W,,high,1
+pinus_taeda,pinus taeda,Pinus taeda,Loblolly pine,1,tree,13.1,2,both,5.41833,10,29,900,2200,HML,WMD,evergreen,wind,moderate,0
+quercus_alba,quercus alba,Quercus alba,White oak,1,tree,20.1,1.5,both,15.0807,7,32,750,2000,M,MD,deciduous,,moderate,0
+rhizophora_mangle,rhizophora mangle,Rhizophora mangle,Red mangrove,1,tree,24,,both,5.3,10,38,1000,3000,H,W,evergreen,,high,1
+triticum_aestivum,triticum aestivum,Triticum aestivum,Bread wheat,1,herb,0.8,1.11,top,19.502,5,27,300,1600,MO,MD,deciduous,,high,0
+typha_latifolia,typha latifolia,Typha latifolia,Broadleaf cattail,1,herb,1.524,0.4293,top,11.546,6,30,300,4000,H,W,deciduous,water,high,1
+zea_mays,zea mays,Zea mays,Maize,1,herb,1.828,0.81,top,22.6,10,47,400,1800,MO,MD,,high,0
+hilaria_jamesii,hilaria jamesii,Hilaria jamesii,Galleta,1,herb,0.26,1.36196,top,17.452,3,21,200,500,ML,D,,moderate,0
